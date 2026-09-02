@@ -79,9 +79,6 @@ class GradePortalApp:
                         row = hw_df[hw_df["Assignment"] == sel_hw].iloc[0]
                         img_bytes = bytes(row["Image"]) if pd.notna(row.get("Image")) and row["Image"] else None
 
-                        if img_bytes:
-                            st.image(img_bytes, caption="Attached Feedback Image", use_container_width=True)
-
                         pdf_buf = PDFGenerator.generate_student_report(
                             student["name"], sel_hw, row["Score"], row["Out Of"],
                             row["Percentage"], row["Report"], img_bytes
@@ -105,9 +102,6 @@ class GradePortalApp:
                     if sel_qz:
                         row_qz = qz_df[qz_df["Quiz"] == sel_qz].iloc[0]
                         img_bytes_qz = bytes(row_qz["Image"]) if pd.notna(row_qz.get("Image")) and row_qz["Image"] else None
-
-                        if img_bytes_qz:
-                            st.image(img_bytes_qz, caption="Attached Quiz Feedback Image", use_container_width=True)
 
                         pdf_buf_qz = PDFGenerator.generate_student_report(
                             student["name"], sel_qz, row_qz["Score"], row_qz["Out Of"],
