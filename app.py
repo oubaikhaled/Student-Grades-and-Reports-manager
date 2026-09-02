@@ -276,7 +276,7 @@ class GradePortalApp:
                     st.success(f"Feedback safely stored for {student_to_attach}!")
                     st.rerun()
 
-   def _admin_record_quizzes(self):
+       def _admin_record_quizzes(self):
         st.subheader("📝 Record External Quiz Grades")
         with st.expander("➕ Create a New Quiz"):
             with st.form("create_quiz_form"):
