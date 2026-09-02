@@ -335,7 +335,7 @@ class GradePortalApp:
 
             col1, col2 = st.columns([1, 4])
             with col1:
-                if st.button("💾 Save Quiz Grades & Text Reports", type="primary"):
+                if st.button("💾 Save Quiz Grades", type="primary"):
                     with self.db.get_connection() as conn:
                         with conn.cursor() as c:
                             for _, row in edited_df.iterrows():
