@@ -34,7 +34,7 @@ class PDFGenerator:
         arabic_style = ParagraphStyle(name='ArabicStyle', fontName=GLOBAL_FONT, fontSize=12, leading=18, alignment=2)
         return styles, arabic_style
 
-    @classmethod
+  @classmethod
     def generate_master_report(cls, homework_title, total_questions, grade_records):
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
@@ -42,9 +42,34 @@ class PDFGenerator:
         
         elements = [
             Paragraph(f"<b>Grade Report: {homework_title}</b>", styles["Title"]),
-            Paragraph(f"Total Questions: {total_questions} | Enrolled Students: {len(grade_records)}", styles["Normal"]),
+            Paragraph(f"Maximum Score / Total Questions: {total_questions} | Enrolled Students: {len(grade_records)}", styles["Normal"]),
             Spacer(1, 16)
         ]
+
+        # Changed "Correct Answers" to "Score" to fit both quizzes and homeworks
+        table_data = [["Student ID", "Student Name", "Score", "Out Of", "Percentage (%)"]]
+        for sid, name, score, percentage in grade_records:
+            score_disp = str(score) if score is not None else "-"
+            perc_disp = f"{percentage:.1f}%" if percentage is not None else "-"
+            table_data.append([str(sid), cls.fix_arabic(name), score_disp, str(total_questions), perc_disp])
+
+        t = Table(table_data, colWidths=[80, 200, 100, 60, 90])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('ALIGN', (1, 1), (1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, 1), (-1, -1), GLOBAL_FONT),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8F9F9")]),
+        ]))
+        
+        elements.append(t)
+        doc.build(elements)
+        buffer.seek(0)
+        return buffer
 
         table_data = [["Student ID", "Student Name", "Correct Answers", "Total", "Percentage (%)"]]
         for sid, name, score, percentage in grade_records:
