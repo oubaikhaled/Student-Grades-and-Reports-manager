@@ -34,7 +34,7 @@ class PDFGenerator:
         arabic_style = ParagraphStyle(name='ArabicStyle', fontName=GLOBAL_FONT, fontSize=12, leading=18, alignment=2)
         return styles, arabic_style
 
-  @classmethod
+    @classmethod
     def generate_master_report(cls, homework_title, total_questions, grade_records):
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
