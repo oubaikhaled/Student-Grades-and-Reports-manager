@@ -8,7 +8,6 @@ from auth import AuthManager
 
 st.set_page_config(page_title="Eng.Mahmoud Adel Grade Portal", layout="wide")
 
-
 class GradePortalApp:
     def __init__(self):
         self.db = DatabaseManager(st.secrets["DATABASE_URL"])
@@ -99,15 +98,13 @@ class GradePortalApp:
                 if qz_df.empty:
                     st.info("No quiz grades recorded yet.")
                 else:
-                    st.dataframe(qz_df[["Quiz", "Score", "Out Of", "Percentage"]], hide_index=True,
-                                 use_container_width=True)
+                    st.dataframe(qz_df[["Quiz", "Score", "Out Of", "Percentage"]], hide_index=True, use_container_width=True)
 
                     st.markdown("**📄 Download Feedback Report**")
                     sel_qz = st.selectbox("Select Quiz", qz_df["Quiz"].tolist(), key=f"dl_qz_{student['id']}")
                     if sel_qz:
                         row_qz = qz_df[qz_df["Quiz"] == sel_qz].iloc[0]
-                        img_bytes_qz = bytes(row_qz["Image"]) if pd.notna(row_qz.get("Image")) and row_qz[
-                            "Image"] else None
+                        img_bytes_qz = bytes(row_qz["Image"]) if pd.notna(row_qz.get("Image")) and row_qz["Image"] else None
 
                         if img_bytes_qz:
                             st.image(img_bytes_qz, caption="Attached Quiz Feedback Image", use_container_width=True)
@@ -128,7 +125,7 @@ class GradePortalApp:
         st.sidebar.button("🚪 Logout", on_click=self.auth.logout, type="primary")
         st.title("📚 Homework & Grade Manager")
         menu = st.sidebar.radio("Navigation",
-                                ["Manage Homeworks", "Record Quiz Grades",
+                                ["Manage Homeworks", "Record Quiz Grades", 
                                  "Manage Students", "WhatsApp Parents"])
 
         if menu == "Manage Homeworks":
@@ -142,7 +139,7 @@ class GradePortalApp:
 
     def _admin_manage_homeworks(self):
         st.subheader("📝 Manage Homeworks")
-
+        
         with st.expander("➕ Create a New Homework"):
             with st.form("new_homework_form"):
                 title = st.text_input("Homework Title", placeholder="e.g. Homework 54").strip()
@@ -161,9 +158,8 @@ class GradePortalApp:
                                     c.execute("SELECT id FROM students")
                                     sids = c.fetchall()
                                     for (sid,) in sids:
-                                        c.execute(
-                                            "INSERT INTO homework_grades (homework_id, student_id) VALUES (%s, %s)",
-                                            (hw_id, sid))
+                                        c.execute("INSERT INTO homework_grades (homework_id, student_id) VALUES (%s, %s)",
+                                                  (hw_id, sid))
                                     conn.commit()
                                     st.success(f"Successfully created '{title}' with {len(sids)} students enrolled!")
                                     st.rerun()
@@ -204,8 +200,7 @@ class GradePortalApp:
             column_config={
                 "id": st.column_config.TextColumn("Student ID", disabled=True),
                 "name": st.column_config.TextColumn("Student Name", disabled=True),
-                "correct_answers": st.column_config.NumberColumn("Correct Answers", min_value=0, max_value=total_q,
-                                                                 step=1),
+                "correct_answers": st.column_config.NumberColumn("Correct Answers", min_value=0, max_value=total_q, step=1),
                 "report": st.column_config.TextColumn("Feedback Report")
             }
         )
@@ -276,7 +271,7 @@ class GradePortalApp:
                     st.success(f"Feedback safely stored for {student_to_attach}!")
                     st.rerun()
 
-       def _admin_record_quizzes(self):
+    def _admin_record_quizzes(self):
         st.subheader("📝 Record External Quiz Grades")
         with st.expander("➕ Create a New Quiz"):
             with st.form("create_quiz_form"):
@@ -405,7 +400,7 @@ class GradePortalApp:
 
     def _admin_manage_students(self):
         st.subheader("👥 Manage Registered Students")
-
+        
         with st.expander("➕ Add a New Student"):
             with st.form("add_student_form"):
                 st.caption("Parent Phone is required so parents can log in to view grades.")
@@ -417,7 +412,7 @@ class GradePortalApp:
                 with col2:
                     s_phone = st.text_input("Student Phone (Optional)", placeholder="e.g. 011...")
                     s_parent = st.text_input("Parent Phone (Required)", placeholder="e.g. 010...")
-
+                
                 if st.form_submit_button("Add Student", type="primary"):
                     if not s_id or not s_name or not s_parent:
                         st.error("Student ID, Name, and Parent Phone are required fields.")
@@ -429,26 +424,22 @@ class GradePortalApp:
                                         INSERT INTO students (id, name, phone, phone_parent, region)
                                         VALUES (%s, %s, %s, %s, %s)
                                     """, (s_id, s_name, s_phone, s_parent, s_region))
-
+                                    
                                     # Enroll new student into existing homeworks and quizzes
                                     c.execute("SELECT homework_id FROM homeworks")
                                     for (hw_id,) in c.fetchall():
-                                        c.execute(
-                                            "INSERT INTO homework_grades (homework_id, student_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                                            (hw_id, s_id))
-
+                                        c.execute("INSERT INTO homework_grades (homework_id, student_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (hw_id, s_id))
+                                        
                                     c.execute("SELECT quiz_id FROM quizzes")
                                     for (q_id,) in c.fetchall():
-                                        c.execute(
-                                            "INSERT INTO quiz_grades (quiz_id, student_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                                            (q_id, s_id))
-
+                                        c.execute("INSERT INTO quiz_grades (quiz_id, student_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (q_id, s_id))
+                                        
                                     conn.commit()
                             st.success(f"Successfully registered {s_name}!")
                             st.rerun()
                         except psycopg2.IntegrityError:
                             st.error(f"A student with ID '{s_id}' already exists in the system.")
-
+                            
         st.divider()
         st.subheader("📋 Registered Students List")
         df = self.db.fetch_dataframe("SELECT id, name, phone, phone_parent, region FROM students ORDER BY name ASC")
@@ -457,12 +448,11 @@ class GradePortalApp:
     def _admin_whatsapp_parents(self):
         st.subheader("💬 WhatsApp & Report Broadcasting")
         st.caption("Bulk download PDFs and message parents directly for graded assignments.")
-
+        
         type_choice = st.radio("Select Assignment Type", ["Homework", "Quiz"], horizontal=True)
-
+        
         if type_choice == "Homework":
-            hw_df = self.db.fetch_dataframe(
-                "SELECT homework_id, title, total_questions FROM homeworks ORDER BY homework_id DESC")
+            hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions FROM homeworks ORDER BY homework_id DESC")
             if hw_df.empty:
                 st.info("No homeworks found.")
                 return
@@ -470,7 +460,7 @@ class GradePortalApp:
             hw_row = hw_df[hw_df["title"] == sel_title].iloc[0]
             item_id = int(hw_row["homework_id"])
             total_q = int(hw_row["total_questions"])
-
+            
             grades_df = self.db.fetch_dataframe("""
                 SELECT s.id, s.name, s.phone_parent, g.correct_answers as score, g.percentage, g.report, g.report_image 
                 FROM students s
@@ -478,7 +468,7 @@ class GradePortalApp:
                 WHERE g.homework_id = %s AND g.correct_answers IS NOT NULL
                 ORDER BY s.name ASC
             """, (item_id,))
-
+            
         else:
             qz_df = self.db.fetch_dataframe("SELECT quiz_id, title, max_score FROM quizzes ORDER BY quiz_id DESC")
             if qz_df.empty:
@@ -488,7 +478,7 @@ class GradePortalApp:
             qz_row = qz_df[qz_df["title"] == sel_title].iloc[0]
             item_id = int(qz_row["quiz_id"])
             total_q = float(qz_row["max_score"])
-
+            
             grades_df = self.db.fetch_dataframe("""
                 SELECT s.id, s.name, s.phone_parent, g.score, g.percentage, g.report, g.report_image 
                 FROM students s
@@ -496,48 +486,46 @@ class GradePortalApp:
                 WHERE g.quiz_id = %s AND g.score IS NOT NULL
                 ORDER BY s.name ASC
             """, (item_id,))
-
+            
         if grades_df.empty:
             st.warning(f"No grades have been recorded for '{sel_title}' yet.")
             return
-
+            
         st.success(f"Found {len(grades_df)} students with recorded grades.")
         st.divider()
-
+        
         for _, row in grades_df.iterrows():
             col1, col2, col3, col4 = st.columns([3, 2, 3, 3])
-
+            
             col1.markdown(f"**{row['name']}**")
             col2.write(f"Score: **{row['score']}** / {total_q}")
-
+            
             with col3:
-                img_bytes = bytes(row["report_image"]) if pd.notna(row.get("report_image")) and row[
-                    "report_image"] else None
+                img_bytes = bytes(row["report_image"]) if pd.notna(row.get("report_image")) and row["report_image"] else None
                 pdf_buf = PDFGenerator.generate_student_report(
-                    row["name"], sel_title, row["score"], total_q,
+                    row["name"], sel_title, row["score"], total_q, 
                     row["percentage"], row.get("report"), img_bytes
                 )
-
+                    
                 st.download_button(
-                    label="📄 Download Report",
+                    label="📄 Download Report", 
                     data=pdf_buf,
                     file_name=f"{row['name']}_{sel_title}.pdf".replace(" ", "_"),
-                    mime="application/pdf",
+                    mime="application/pdf", 
                     key=f"dl_{type_choice}_{row['id']}",
                     use_container_width=True
                 )
-
+                
             with col4:
                 raw_phone = str(row["phone_parent"]).strip()
                 formatted_phone = "2" + raw_phone if raw_phone.startswith("0") else raw_phone
                 wa_msg = f"Hello, the {type_choice.lower()} report for '{sel_title}' for {row['name']} is ready on the Eng. Mahmoud Adel portal. Attached is the PDF."
                 encoded_msg = urllib.parse.quote(wa_msg)
                 wa_url = f"https://wa.me/{formatted_phone}?text={encoded_msg}"
-
+                
                 st.link_button("💬 Send WhatsApp", wa_url, key=f"wa_{type_choice}_{row['id']}", use_container_width=True)
-
+            
             st.divider()
-
 
 if __name__ == "__main__":
     app = GradePortalApp()
