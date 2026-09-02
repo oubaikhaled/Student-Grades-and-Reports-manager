@@ -1,6 +1,7 @@
 streamlit
 pandas
-reportlab
-openpyxl
 psycopg2-binary
+reportlab
 arabic-reshaper
+python-bidi
+openpyxl
