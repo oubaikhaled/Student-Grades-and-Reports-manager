@@ -276,7 +276,7 @@ class GradePortalApp:
                     st.success(f"Feedback safely stored for {student_to_attach}!")
                     st.rerun()
 
-    def _admin_record_quizzes(self):
+   def _admin_record_quizzes(self):
         st.subheader("📝 Record External Quiz Grades")
         with st.expander("➕ Create a New Quiz"):
             with st.form("create_quiz_form"):
@@ -289,9 +289,8 @@ class GradePortalApp:
                         try:
                             with self.db.get_connection() as conn:
                                 with conn.cursor() as c:
-                                    c.execute(
-                                        "INSERT INTO quizzes (title, max_score) VALUES (%s, %s) RETURNING quiz_id",
-                                        (q_title, q_max))
+                                    c.execute("INSERT INTO quizzes (title, max_score) VALUES (%s, %s) RETURNING quiz_id",
+                                              (q_title, q_max))
                                     q_id = c.fetchone()[0]
                                     c.execute("SELECT id FROM students")
                                     for (sid,) in c.fetchall():
@@ -327,7 +326,7 @@ class GradePortalApp:
                 LEFT JOIN quiz_grades qg ON s.id = qg.student_id AND qg.quiz_id = %s 
                 ORDER BY s.name ASC
             """, (q_id,))
-
+            
             st.caption(f"Maximum Score: **{q_max}** | Edit 'Final Score' and 'Feedback Report' below.")
             edited_df = st.data_editor(
                 grades_df, hide_index=True, use_container_width=True,
@@ -339,26 +338,35 @@ class GradePortalApp:
                 }
             )
 
-            if st.button("💾 Save Quiz Grades & Text Reports", type="primary"):
-                with self.db.get_connection() as conn:
-                    with conn.cursor() as c:
-                        for _, row in edited_df.iterrows():
-                            score = row["score"]
-                            rep_val = row["report"] if pd.notna(row.get("report")) else None
-                            if pd.notna(score):
-                                c.execute("""
-                                    INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report) VALUES (%s, %s, %s, %s, %s)
-                                    ON CONFLICT (quiz_id, student_id) DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
-                                """, (
-                                    q_id, str(row["id"]), float(score),
-                                    (float(score) / q_max) * 100.0 if q_max > 0 else 0, rep_val))
-                            else:
-                                c.execute(
-                                    "UPDATE quiz_grades SET score = NULL, percentage = NULL, report = %s WHERE quiz_id = %s AND student_id = %s",
-                                    (rep_val, q_id, str(row["id"])))
-                        conn.commit()
-                st.success("Quiz grades & Text saved!")
-                st.rerun()
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                if st.button("💾 Save Quiz Grades & Text Reports", type="primary"):
+                    with self.db.get_connection() as conn:
+                        with conn.cursor() as c:
+                            for _, row in edited_df.iterrows():
+                                score = row["score"]
+                                rep_val = row["report"] if pd.notna(row.get("report")) else None
+                                if pd.notna(score):
+                                    c.execute("""
+                                        INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report) VALUES (%s, %s, %s, %s, %s)
+                                        ON CONFLICT (quiz_id, student_id) DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
+                                    """, (
+                                    q_id, str(row["id"]), float(score), (float(score) / q_max) * 100.0 if q_max > 0 else 0, rep_val))
+                                else:
+                                    c.execute(
+                                        "UPDATE quiz_grades SET score = NULL, percentage = NULL, report = %s WHERE quiz_id = %s AND student_id = %s",
+                                        (rep_val, q_id, str(row["id"])))
+                            conn.commit()
+                    st.success("Quiz grades & Text saved!")
+                    st.rerun()
+
+            with col2:
+                pdf_data = [(r["id"], r["name"], r["score"] if pd.notna(r["score"]) else None,
+                             (float(r["score"]) / q_max) * 100 if pd.notna(r["score"]) else None) for
+                            _, r in edited_df.iterrows()]
+                pdf_buf = PDFGenerator.generate_master_report(sel_q, q_max, pdf_data)
+                st.download_button("📄 Download Master Report (PDF)", data=pdf_buf,
+                                   file_name=f"{sel_q.replace(' ', '_')}_Master.pdf", mime="application/pdf")
 
             st.divider()
             st.subheader("📝 Individual Feedback & Attachments")
