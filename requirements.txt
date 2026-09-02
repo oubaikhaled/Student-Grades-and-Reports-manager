@@ -1,0 +1,6 @@
+streamlit
+pandas
+reportlab
+openpyxl
+psycopg2-binary
+arabic-reshaper
