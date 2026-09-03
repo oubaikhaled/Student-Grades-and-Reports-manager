@@ -41,7 +41,8 @@ class DatabaseManager:
     def init_db(self):
         with self.get_connection() as conn:
             with conn.cursor() as c:
-                c.execute("CREATE TABLE IF NOT EXISTS students (id TEXT PRIMARY KEY, name TEXT, phone TEXT, phone_parent TEXT, region TEXT)")
+                # Added group_number to students
+                c.execute("CREATE TABLE IF NOT EXISTS students (id TEXT PRIMARY KEY, name TEXT, phone TEXT, phone_parent TEXT, region TEXT, group_number TEXT)")
                 c.execute("CREATE TABLE IF NOT EXISTS homeworks (homework_id SERIAL PRIMARY KEY, title TEXT UNIQUE, total_questions INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
                 c.execute("CREATE TABLE IF NOT EXISTS homework_grades (grade_id SERIAL PRIMARY KEY, homework_id INTEGER, student_id TEXT, correct_answers INTEGER, percentage REAL, report TEXT, report_image BYTEA, FOREIGN KEY (homework_id) REFERENCES homeworks (homework_id), FOREIGN KEY (student_id) REFERENCES students (id), UNIQUE (homework_id, student_id))")
                 c.execute("CREATE TABLE IF NOT EXISTS quizzes (quiz_id SERIAL PRIMARY KEY, title TEXT UNIQUE, max_score REAL DEFAULT 10.0)")
@@ -53,6 +54,7 @@ class DatabaseManager:
                     c.execute("ALTER TABLE homework_grades ADD COLUMN IF NOT EXISTS report_image BYTEA;")
                     c.execute("ALTER TABLE quiz_grades ADD COLUMN IF NOT EXISTS report TEXT;")
                     c.execute("ALTER TABLE quiz_grades ADD COLUMN IF NOT EXISTS report_image BYTEA;")
+                    c.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS group_number TEXT;")
                 except Exception:
                     conn.rollback()
 
@@ -61,7 +63,8 @@ class DatabaseManager:
                     try:
                         df_data = pd.read_excel(EXCEL_FILE, sheet_name="Data")
                         for _, row in df_data.iterrows():
-                            c.execute("INSERT INTO students (id, name, phone, phone_parent, region) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING", (str(row["id"]), str(row["name"]), str(row.get("phone", "")), str(row.get("phone_parent", "")), str(row.get("region", ""))))
+                            c.execute("INSERT INTO students (id, name, phone, phone_parent, region, group_number) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING", 
+                                      (str(row["id"]), str(row["name"]), str(row.get("phone", "")), str(row.get("phone_parent", "")), str(row.get("region", "")), str(row.get("group_number", ""))))
                     except Exception as e:
                         st.error(f"Error seeding data from Excel: {e}")
                 conn.commit()
