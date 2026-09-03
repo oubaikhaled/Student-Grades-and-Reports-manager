@@ -201,7 +201,7 @@ class GradePortalApp:
 
         col1, col2 = st.columns([1, 4])
         with col1:
-            if st.button("💾 Save Grades", type="primary"):
+            if st.button("💾 Save Grades & Text Reports", type="primary"):
                 with self.db.get_connection() as conn:
                     with conn.cursor() as c:
                         for _, row in edited_df.iterrows():
@@ -329,7 +329,7 @@ class GradePortalApp:
 
             col1, col2 = st.columns([1, 4])
             with col1:
-                if st.button("💾 Save Quiz Grades", type="primary"):
+                if st.button("💾 Save Quiz Grades & Text Reports", type="primary"):
                     with self.db.get_connection() as conn:
                         with conn.cursor() as c:
                             for _, row in edited_df.iterrows():
@@ -406,6 +406,7 @@ class GradePortalApp:
                 with col2:
                     s_phone = st.text_input("Student Phone (Optional)", placeholder="e.g. 011...")
                     s_parent = st.text_input("Parent Phone (Required)", placeholder="e.g. 010...")
+                    s_group = st.text_input("Group Number (Optional)", placeholder="e.g. G1").strip()
                 
                 if st.form_submit_button("Add Student", type="primary"):
                     if not s_id or not s_name or not s_parent:
@@ -415,9 +416,9 @@ class GradePortalApp:
                             with self.db.get_connection() as conn:
                                 with conn.cursor() as c:
                                     c.execute("""
-                                        INSERT INTO students (id, name, phone, phone_parent, region)
-                                        VALUES (%s, %s, %s, %s, %s)
-                                    """, (s_id, s_name, s_phone, s_parent, s_region))
+                                        INSERT INTO students (id, name, phone, phone_parent, region, group_number)
+                                        VALUES (%s, %s, %s, %s, %s, %s)
+                                    """, (s_id, s_name, s_phone, s_parent, s_region, s_group))
                                     
                                     # Enroll new student into existing homeworks and quizzes
                                     c.execute("SELECT homework_id FROM homeworks")
@@ -429,14 +430,22 @@ class GradePortalApp:
                                         c.execute("INSERT INTO quiz_grades (quiz_id, student_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (q_id, s_id))
                                         
                                     conn.commit()
-                            st.success(f"Successfully registered {s_name}!")
+                            st.success(f"Successfully registered {s_name} in group '{s_group}'!")
                             st.rerun()
                         except psycopg2.IntegrityError:
                             st.error(f"A student with ID '{s_id}' already exists in the system.")
                             
         st.divider()
         st.subheader("📋 Registered Students List")
-        df = self.db.fetch_dataframe("SELECT id, name, phone, phone_parent, region FROM students ORDER BY name ASC")
+        df = self.db.fetch_dataframe("SELECT id, name, phone, phone_parent, region, group_number FROM students ORDER BY name ASC")
+        
+        # Group Filter
+        available_groups = [g for g in df['group_number'].dropna().unique() if str(g).strip()]
+        if available_groups:
+            selected_group = st.selectbox("Filter by Group", ["All"] + sorted(available_groups))
+            if selected_group != "All":
+                df = df[df['group_number'] == selected_group]
+
         st.dataframe(df, use_container_width=True, hide_index=True)
 
     def _admin_whatsapp_parents(self):
@@ -456,7 +465,7 @@ class GradePortalApp:
             total_q = int(hw_row["total_questions"])
             
             grades_df = self.db.fetch_dataframe("""
-                SELECT s.id, s.name, s.phone_parent, g.correct_answers as score, g.percentage, g.report, g.report_image 
+                SELECT s.id, s.name, s.phone_parent, s.group_number, g.correct_answers as score, g.percentage, g.report, g.report_image 
                 FROM students s
                 JOIN homework_grades g ON s.id = g.student_id
                 WHERE g.homework_id = %s AND g.correct_answers IS NOT NULL
@@ -474,7 +483,7 @@ class GradePortalApp:
             total_q = float(qz_row["max_score"])
             
             grades_df = self.db.fetch_dataframe("""
-                SELECT s.id, s.name, s.phone_parent, g.score, g.percentage, g.report, g.report_image 
+                SELECT s.id, s.name, s.phone_parent, s.group_number, g.score, g.percentage, g.report, g.report_image 
                 FROM students s
                 JOIN quiz_grades g ON s.id = g.student_id
                 WHERE g.quiz_id = %s AND g.score IS NOT NULL
@@ -485,7 +494,14 @@ class GradePortalApp:
             st.warning(f"No grades have been recorded for '{sel_title}' yet.")
             return
             
-        st.success(f"Found {len(grades_df)} students with recorded grades.")
+        # Group Filter for WhatsApp Broadcasting
+        available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
+        if available_groups:
+            filter_group = st.selectbox("Filter Broadcasting by Group", ["All"] + sorted(available_groups))
+            if filter_group != "All":
+                grades_df = grades_df[grades_df['group_number'] == filter_group]
+
+        st.success(f"Found {len(grades_df)} students with recorded grades in this selection.")
         st.divider()
         
         for _, row in grades_df.iterrows():
