@@ -46,7 +46,6 @@ class PDFGenerator:
             Spacer(1, 16)
         ]
 
-        # Changed "Correct Answers" to "Score" to fit both quizzes and homeworks
         table_data = [["Student ID", "Student Name", "Score", "Out Of", "Percentage (%)"]]
         for sid, name, score, percentage in grade_records:
             score_disp = str(score) if score is not None else "-"
@@ -61,30 +60,6 @@ class PDFGenerator:
             ('ALIGN', (1, 1), (1, -1), 'RIGHT'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTNAME', (0, 1), (-1, -1), GLOBAL_FONT),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8F9F9")]),
-        ]))
-        
-        elements.append(t)
-        doc.build(elements)
-        buffer.seek(0)
-        return buffer
-
-        table_data = [["Student ID", "Student Name", "Correct Answers", "Total", "Percentage (%)"]]
-        for sid, name, score, percentage in grade_records:
-            score_disp = str(score) if score is not None else "-"
-            perc_disp = f"{percentage:.1f}%" if percentage is not None else "-"
-            table_data.append([str(sid), cls.fix_arabic(name), score_disp, str(total_questions), perc_disp])
-
-        t = Table(table_data, colWidths=[80, 200, 100, 60, 90])
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('ALIGN', (1, 1), (1, -1), 'RIGHT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTNAME', (0, 1), (-1, -1), GLOBAL_FONT), # Now uses the dynamic font variable
             ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
             ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8F9F9")]),
@@ -120,16 +95,21 @@ class PDFGenerator:
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTNAME', (0, 1), (-1, -1), GLOBAL_FONT), # Now uses the dynamic font variable
+            ('FONTNAME', (0, 1), (-1, -1), GLOBAL_FONT),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
         ]))
         
         elements.extend([t, Spacer(1, 24)])
+        
+        # Split by newline, reshape Arabic safely per line, then join with HTML <br/> tags
+        raw_report = str(report_text) if pd.notna(report_text) and str(report_text).strip() else "No feedback provided."
+        formatted_report = "<br/>".join([cls.fix_arabic(line) for line in raw_report.split('\n')])
+        
         elements.extend([
             Paragraph("<b>Teacher's Report:</b>", styles["Normal"]),
             Spacer(1, 8),
-            Paragraph(cls.fix_arabic(str(report_text) if pd.notna(report_text) and str(report_text).strip() else "No feedback provided."), arabic_style)
+            Paragraph(formatted_report, arabic_style)
         ])
 
         if image_bytes:
