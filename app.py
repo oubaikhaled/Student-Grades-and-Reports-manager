@@ -559,7 +559,7 @@ class GradePortalApp:
                     use_container_width=True
                 )
                 
-           with col4:
+            with col4:
                 raw_phone = str(row["phone_parent"]).strip()
                 formatted_phone = "2" + raw_phone if raw_phone.startswith("0") else raw_phone
                 
