@@ -580,9 +580,7 @@ class GradePortalApp:
                 encoded_msg = urllib.parse.quote(wa_msg.encode('utf-8'))
                 wa_url = f"https://wa.me/{formatted_phone}?text={encoded_msg}"
                 
-                # urllib.parse.quote safely encodes the Arabic letters and emojis into a web link
-                encoded_msg = urllib.parse.quote(wa_msg)
-                wa_url = f"https://wa.me/{formatted_phone}?text={encoded_msg}"
+                
                 
                 st.link_button("💬 Send WhatsApp", wa_url, key=f"wa_{type_choice}_{row['id']}", use_container_width=True)
             
