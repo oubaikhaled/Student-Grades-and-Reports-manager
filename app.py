@@ -5,7 +5,7 @@ import psycopg2
 from database import DatabaseManager
 from pdf_utils import PDFGenerator
 from auth import AuthManager
-
+import emoji
 st.set_page_config(page_title="Eng.Mahmoud Adel Grade Portal", layout="wide")
 
 class GradePortalApp:
@@ -559,31 +559,26 @@ class GradePortalApp:
                     use_container_width=True
                 )
                 
-            with col4:
+           with col4:
                 raw_phone = str(row["phone_parent"]).strip()
                 formatted_phone = "2" + raw_phone if raw_phone.startswith("0") else raw_phone
                 
-                # Automatically use "Quiz" or "Homework" based on the selected tab
                 type_ar = "Quiz" if type_choice == "Quiz" else "Homework"
                 
-                # Triple quotes or explicit newline characters (\n) maintain the line breaks
-                # Using Unicode escapes (\U...) prevents file encoding corruption
-               # Using universally supported 16-bit (2-byte) emojis (\u2705 = ✅, \u2B50 = ⭐)
-                wa_msg = (
-                    f"\u2705 درجة الـ {sel_title}\n\n"
+                # Using the emoji library to generate the symbols dynamically at runtime
+                wa_msg = emoji.emojize(
+                    f":bar_chart: درجة الـ {sel_title}\n\n"
                     f"ولي الأمر الكريم،\n"
                     f"نحيط حضرتكم علمًا بأن الطالب {row['name']} حصل على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
-                    f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. \u2B50\n\n"
+                    f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. :glowing_star:\n\n"
                     f"Mathematics Team – Mahmoud Adel"
                 )
                 
-                # Use standard quote without .encode() to avoid double-encoding issues in the browser
                 encoded_msg = urllib.parse.quote(wa_msg)
                 wa_url = f"https://wa.me/{formatted_phone}?text={encoded_msg}"
                 
-                
-                
                 st.link_button("💬 Send WhatsApp", wa_url, key=f"wa_{type_choice}_{row['id']}", use_container_width=True)
+                
             
             st.divider()
 if __name__ == "__main__":
