@@ -182,11 +182,21 @@ class GradePortalApp:
                 except Exception as e:
                     st.error(f"Error: {e}")
 
+        # Added s.group_number to the query
         grades_df = self.db.fetch_dataframe("""
-            SELECT s.id, s.name, g.correct_answers, g.report 
+            SELECT s.id, s.name, s.group_number, g.correct_answers, g.report 
             FROM students s
             LEFT JOIN homework_grades g ON s.id = g.student_id AND g.homework_id = %s ORDER BY s.name ASC
         """, (hw_id,))
+
+        # Group Filter for Grading and PDF Generation
+        current_group_label = "All Groups"
+        available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
+        if available_groups:
+            filter_group = st.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups), key="hw_grp_filter")
+            current_group_label = filter_group
+            if filter_group != "All Groups":
+                grades_df = grades_df[grades_df['group_number'] == filter_group]
 
         st.caption(f"Total Questions: **{total_q}** | Edit 'Correct Answers' and 'Feedback Report' below.")
         edited_df = st.data_editor(
@@ -194,6 +204,7 @@ class GradePortalApp:
             column_config={
                 "id": st.column_config.TextColumn("Student ID", disabled=True),
                 "name": st.column_config.TextColumn("Student Name", disabled=True),
+                "group_number": st.column_config.TextColumn("Group", disabled=True),
                 "correct_answers": st.column_config.NumberColumn("Correct Answers", min_value=0, max_value=total_q, step=1),
                 "report": st.column_config.TextColumn("Feedback Report")
             }
@@ -226,9 +237,11 @@ class GradePortalApp:
             pdf_data = [(r["id"], r["name"], r["correct_answers"] if pd.notna(r["correct_answers"]) else None,
                          (float(r["correct_answers"]) / total_q) * 100 if pd.notna(r["correct_answers"]) else None) for
                         _, r in edited_df.iterrows()]
-            pdf_buf = PDFGenerator.generate_master_report(sel_hw_title, total_q, pdf_data)
+            
+            # Master report dynamically reflects the selected group
+            pdf_buf = PDFGenerator.generate_master_report(f"{sel_hw_title} ({current_group_label})", total_q, pdf_data)
             st.download_button("📄 Download Master Report (PDF)", data=pdf_buf,
-                               file_name=f"{sel_hw_title.replace(' ', '_')}_Master.pdf", mime="application/pdf")
+                               file_name=f"{sel_hw_title.replace(' ', '_')}_{current_group_label.replace(' ', '_')}_Master.pdf", mime="application/pdf")
 
         st.divider()
         st.subheader("📝 Individual Feedback & Attachments")
@@ -309,19 +322,30 @@ class GradePortalApp:
                     except Exception as e:
                         st.error(f"Error: {e}")
 
+            # Added s.group_number to the query
             grades_df = self.db.fetch_dataframe("""
-                SELECT s.id, s.name, qg.score, qg.report 
+                SELECT s.id, s.name, s.group_number, qg.score, qg.report 
                 FROM students s 
                 LEFT JOIN quiz_grades qg ON s.id = qg.student_id AND qg.quiz_id = %s 
                 ORDER BY s.name ASC
             """, (q_id,))
             
+            # Group Filter for Grading and PDF Generation
+            current_group_label = "All Groups"
+            available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
+            if available_groups:
+                filter_group = st.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups), key="qz_grp_filter")
+                current_group_label = filter_group
+                if filter_group != "All Groups":
+                    grades_df = grades_df[grades_df['group_number'] == filter_group]
+
             st.caption(f"Maximum Score: **{q_max}** | Edit 'Final Score' and 'Feedback Report' below.")
             edited_df = st.data_editor(
                 grades_df, hide_index=True, use_container_width=True,
                 column_config={
                     "id": st.column_config.TextColumn("Student ID", disabled=True),
                     "name": st.column_config.TextColumn("Student Name", disabled=True),
+                    "group_number": st.column_config.TextColumn("Group", disabled=True),
                     "score": st.column_config.NumberColumn("Final Score", min_value=0.0, max_value=q_max),
                     "report": st.column_config.TextColumn("Feedback Report")
                 }
@@ -353,9 +377,11 @@ class GradePortalApp:
                 pdf_data = [(r["id"], r["name"], r["score"] if pd.notna(r["score"]) else None,
                              (float(r["score"]) / q_max) * 100 if pd.notna(r["score"]) else None) for
                             _, r in edited_df.iterrows()]
-                pdf_buf = PDFGenerator.generate_master_report(sel_q, q_max, pdf_data)
+                
+                # Master report dynamically reflects the selected group
+                pdf_buf = PDFGenerator.generate_master_report(f"{sel_q} ({current_group_label})", q_max, pdf_data)
                 st.download_button("📄 Download Master Report (PDF)", data=pdf_buf,
-                                   file_name=f"{sel_q.replace(' ', '_')}_Master.pdf", mime="application/pdf")
+                                   file_name=f"{sel_q.replace(' ', '_')}_{current_group_label.replace(' ', '_')}_Master.pdf", mime="application/pdf")
 
             st.divider()
             st.subheader("📝 Individual Feedback & Attachments")
@@ -391,7 +417,6 @@ class GradePortalApp:
                                 conn.commit()
                         st.success(f"Feedback safely stored for {student_to_attach}!")
                         st.rerun()
-
     def _admin_manage_students(self):
         st.subheader("👥 Manage Registered Students")
         
