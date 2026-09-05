@@ -562,7 +562,20 @@ class GradePortalApp:
             with col4:
                 raw_phone = str(row["phone_parent"]).strip()
                 formatted_phone = "2" + raw_phone if raw_phone.startswith("0") else raw_phone
-                wa_msg = f"Hello, the {type_choice.lower()} report for '{sel_title}' for {row['name']} is ready on the Eng. Mahmoud Adel portal. Attached is the PDF."
+                
+                # Automatically use "Quiz" or "Homework" based on the selected tab
+                type_ar = "Quiz" if type_choice == "Quiz" else "Homework"
+                
+                # Triple quotes or explicit newline characters (\n) maintain the line breaks
+                wa_msg = (
+                    f"📊 درجة الـ {sel_title}\n\n"
+                    f"ولي الأمر الكريم،\n"
+                    f"نحيط حضرتكم علمًا بأن الطالب {row['name']} حصل على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
+                    f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. 🌟\n\n"
+                    f"Mathematics Team – Mahmoud Adel"
+                )
+                
+                # urllib.parse.quote safely encodes the Arabic letters and emojis into a web link
                 encoded_msg = urllib.parse.quote(wa_msg)
                 wa_url = f"https://wa.me/{formatted_phone}?text={encoded_msg}"
                 
