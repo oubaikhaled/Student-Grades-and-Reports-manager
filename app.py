@@ -567,13 +567,18 @@ class GradePortalApp:
                 type_ar = "Quiz" if type_choice == "Quiz" else "Homework"
                 
                 # Triple quotes or explicit newline characters (\n) maintain the line breaks
+                # Using Unicode escapes (\U...) prevents file encoding corruption
                 wa_msg = (
-                    f"📊 درجة الـ {sel_title}\n\n"
+                    f"\U0001F4CA درجة الـ {sel_title}\n\n"
                     f"ولي الأمر الكريم،\n"
                     f"نحيط حضرتكم علمًا بأن الطالب {row['name']} حصل على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
-                    f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. 🌟\n\n"
+                    f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. \U0001F31F\n\n"
                     f"Mathematics Team – Mahmoud Adel"
                 )
+                
+                # Explicitly force UTF-8 byte encoding before quoting for the URL
+                encoded_msg = urllib.parse.quote(wa_msg.encode('utf-8'))
+                wa_url = f"https://wa.me/{formatted_phone}?text={encoded_msg}"
                 
                 # urllib.parse.quote safely encodes the Arabic letters and emojis into a web link
                 encoded_msg = urllib.parse.quote(wa_msg)
