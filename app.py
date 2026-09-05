@@ -452,6 +452,7 @@ class GradePortalApp:
         st.subheader("💬 WhatsApp & Report Broadcasting")
         st.caption("Bulk download PDFs and message parents directly for graded assignments.")
         
+        # 1. Select Assignment Type
         type_choice = st.radio("Select Assignment Type", ["Homework", "Quiz"], horizontal=True)
         
         if type_choice == "Homework":
@@ -459,6 +460,8 @@ class GradePortalApp:
             if hw_df.empty:
                 st.info("No homeworks found.")
                 return
+            
+            # 2. Select Specific Homework
             sel_title = st.selectbox("Select Homework", hw_df["title"].tolist())
             hw_row = hw_df[hw_df["title"] == sel_title].iloc[0]
             item_id = int(hw_row["homework_id"])
@@ -469,7 +472,7 @@ class GradePortalApp:
                 FROM students s
                 JOIN homework_grades g ON s.id = g.student_id
                 WHERE g.homework_id = %s AND g.correct_answers IS NOT NULL
-                ORDER BY s.name ASC
+                ORDER BY s.group_number ASC, s.name ASC
             """, (item_id,))
             
         else:
@@ -477,6 +480,8 @@ class GradePortalApp:
             if qz_df.empty:
                 st.info("No quizzes found.")
                 return
+                
+            # 2. Select Specific Quiz
             sel_title = st.selectbox("Select Quiz", qz_df["title"].tolist())
             qz_row = qz_df[qz_df["title"] == sel_title].iloc[0]
             item_id = int(qz_row["quiz_id"])
@@ -487,27 +492,30 @@ class GradePortalApp:
                 FROM students s
                 JOIN quiz_grades g ON s.id = g.student_id
                 WHERE g.quiz_id = %s AND g.score IS NOT NULL
-                ORDER BY s.name ASC
+                ORDER BY s.group_number ASC, s.name ASC
             """, (item_id,))
             
         if grades_df.empty:
             st.warning(f"No grades have been recorded for '{sel_title}' yet.")
             return
             
-        # Group Filter for WhatsApp Broadcasting
+        # 3. Select Specific Group
         available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
         if available_groups:
-            filter_group = st.selectbox("Filter Broadcasting by Group", ["All"] + sorted(available_groups))
-            if filter_group != "All":
+            filter_group = st.selectbox("Filter Broadcasting by Group", ["All Groups"] + sorted(available_groups))
+            if filter_group != "All Groups":
                 grades_df = grades_df[grades_df['group_number'] == filter_group]
 
         st.success(f"Found {len(grades_df)} students with recorded grades in this selection.")
         st.divider()
         
+        # Display the filtered students
         for _, row in grades_df.iterrows():
             col1, col2, col3, col4 = st.columns([3, 2, 3, 3])
             
-            col1.markdown(f"**{row['name']}**")
+            group_label = f" *(Group: {row['group_number']})*" if pd.notna(row['group_number']) and str(row['group_number']).strip() else ""
+            col1.markdown(f"**{row['name']}**{group_label}")
+            
             col2.write(f"Score: **{row['score']}** / {total_q}")
             
             with col3:
@@ -536,7 +544,6 @@ class GradePortalApp:
                 st.link_button("💬 Send WhatsApp", wa_url, key=f"wa_{type_choice}_{row['id']}", use_container_width=True)
             
             st.divider()
-
 if __name__ == "__main__":
     app = GradePortalApp()
     app.run()
