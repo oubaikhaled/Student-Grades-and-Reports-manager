@@ -169,7 +169,35 @@ class GradePortalApp:
         st.caption("Existing Homeworks")
         st.dataframe(hw_df, hide_index=True, use_container_width=True)
         
-       with st.expander("⚠️ Delete Homework"):
+        with st.expander("⚠️ Delete Homework"):
+            hw_options = hw_df.apply(lambda x: f"{x['title']} (ID: {x['homework_id']})", axis=1).tolist()
+            del_sel = st.selectbox("Select Homework to Delete", hw_options)
+            
+            if st.button("🚨 Delete Homework"):
+                # Everything below this line is now strictly indented inside the button click
+                hw_id = del_sel.split("(ID: ")[1].replace(")", "")
+                try:
+                    with self.db.get_connection() as conn:
+                        with conn.cursor() as c:
+                            c.execute("DELETE FROM homework_grades WHERE homework_id = %s", (hw_id,))
+                            c.execute("DELETE FROM homeworks WHERE homework_id = %s", (hw_id,))
+                        conn.commit()
+                    st.success("Homework deleted!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to delete. Error: {e}")
+                        
+        st.divider()
+        
+        hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions, video_link FROM homeworks ORDER BY homework_id DESC")
+        if hw_df.empty:
+            st.info("No homeworks created yet.")
+            return
+            
+        st.caption("Existing Homeworks")
+        st.dataframe(hw_df, hide_index=True, use_container_width=True)
+        
+         with st.expander("⚠️ Delete Homework"):
             hw_options = hw_df.apply(lambda x: f"{x['title']} (ID: {x['homework_id']})", axis=1).tolist()
             del_sel = st.selectbox("Select Homework to Delete", hw_options)
             
