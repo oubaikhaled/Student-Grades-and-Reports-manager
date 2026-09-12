@@ -530,9 +530,22 @@ class GradePortalApp:
         type_choice = st.radio("Select Assignment Type", ["Homework", "Quiz"], horizontal=True)
         
         if type_choice == "Homework":
-            hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions FROM homeworks ORDER BY homework_id DESC")
-            if hw_df.empty:
-                st.info("No homeworks found.")
+           # Ensure video_link is fetched from the database
+            hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions, video_link FROM homeworks ORDER BY homework_id DESC")
+            
+            # ... [existing dropdown logic] ...
+            
+            # Safely extract the link for the selected homework
+            vid_link = hw_row["video_link"] if "video_link" in hw_row and pd.notna(hw_row["video_link"]) and str(hw_row["video_link"]).strip() else None
+
+            # ... [existing grades_df fetch logic] ...
+
+            # Pass the video_link to the PDF generator (this ignores WhatsApp entirely)
+            pdf_buf = PDFGenerator.generate_student_report(
+                row["name"], sel_title, row["score"], total_q, 
+                row["percentage"], row.get("report"), img_bytes,
+                video_link=vid_link if type_choice == "Homework" else None
+            )
                 return
             
             sel_title = st.selectbox("Select Homework", hw_df["title"].tolist())
