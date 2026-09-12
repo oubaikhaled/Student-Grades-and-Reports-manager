@@ -138,16 +138,13 @@ class GradePortalApp:
         with st.form("add_homework_form"):
             title = st.text_input("Homework Title")
             total_q = st.number_input("Total Questions (Max Score)", min_value=1, step=1)
-            
-            # 1. New optional video link field
-            video_link = st.text_input("Homework Video Link (Optional)", placeholder="https://youtube.com/... ")
+            video_link = st.text_input("Homework Video Link (Optional)", placeholder="https://youtube.com/...")
             
             if st.form_submit_button("➕ Add Homework", type="primary"):
                 if not title.strip():
                     st.error("Title cannot be empty.")
                 else:
                     try:
-                        # 2. Convert empty strings to None so PostgreSQL stores it as a clean NULL
                         clean_link = video_link.strip() if video_link.strip() else None
                         
                         with self.db.get_connection() as conn:
@@ -162,22 +159,32 @@ class GradePortalApp:
                     except Exception as e:
                         st.error(f"Failed to add homework. Error: {e}")
                         
-      
         st.divider()
-        st.subheader("📊 Enter Grades & Feedback")
-        sel_hw_title = st.selectbox("Select Homework Assignment", hw_df["title"].tolist(), key="sel_hw")
-        hw_row = hw_df[hw_df["title"] == sel_hw_title].iloc[0]
-        hw_id, total_q = int(hw_row["homework_id"]), int(hw_row["total_questions"])
-
-        with st.expander("⚠️ Danger Zone: Delete Homework"):
-            if st.button("🚨 Yes, Delete This Homework"):
+        
+        hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions, video_link FROM homeworks ORDER BY homework_id DESC")
+        if hw_df.empty:
+            st.info("No homeworks created yet.")
+            return
+            
+        st.caption("Existing Homeworks")
+        st.dataframe(hw_df, hide_index=True, use_container_width=True)
+        
+        with st.expander("⚠️ Delete Homework"):
+            hw_options = hw_df.apply(lambda x: f"{x['title']} (ID: {x['homework_id']})", axis=1).tolist()
+            del_sel = st.selectbox("Select Homework to Delete", hw_options)
+            
+            if st.button("🚨 Delete Homework"):
+                hw_id = del_sel.split("(ID: ")[1].replace(")", "")
                 try:
-                    self.db.execute_query("DELETE FROM homework_grades WHERE homework_id = %s", (hw_id,))
-                    self.db.execute_query("DELETE FROM homeworks WHERE homework_id = %s", (hw_id,))
-                    st.success(f"'{sel_hw_title}' deleted!")
+                    with self.db.get_connection() as conn:
+                        with conn.cursor() as c:
+                            c.execute("DELETE FROM homework_grades WHERE homework_id = %s", (hw_id,))
+                            c.execute("DELETE FROM homeworks WHERE homework_id = %s", (hw_id,))
+                        conn.commit()
+                    st.success("Homework deleted!")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(f"Failed to delete. Error: {e}")
 
         # Added s.group_number to the query
         grades_df = self.db.fetch_dataframe("""
