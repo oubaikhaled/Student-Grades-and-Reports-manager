@@ -419,47 +419,47 @@ class GradePortalApp:
                         st.success(f"Feedback safely stored for {student_to_attach}!")
                         st.rerun()
     def _admin_manage_students(self):
-        st.subheader("👥 Manage Registered Students")
+        st.subheader("👥 Manage Students")
         
-        with st.expander("➕ Add a New Student"):
-            with st.form("add_student_form"):
-                st.caption("Parent Phone is required so parents can log in to view grades.")
-                col1, col2 = st.columns(2)
-                with col1:
-                    s_id = st.text_input("Student ID (Unique)", placeholder="e.g. 101").strip()
-                    s_name = st.text_input("Student Name", placeholder="Full Name").strip()
-                    s_region = st.text_input("Region (Optional)", placeholder="e.g. Maadi")
-                with col2:
-                    s_phone = st.text_input("Student Phone (Optional)", placeholder="e.g. 011...")
-                    s_parent = st.text_input("Parent Phone (Required)", placeholder="e.g. 010...")
-                    s_group = st.text_input("Group Number (Optional)", placeholder="e.g. G1").strip()
+        # Fetch current students
+        students_df = self.db.fetch_dataframe("SELECT id, name, phone, phone_parent, group_number FROM students ORDER BY name ASC")
+        
+        if students_df.empty:
+            st.info("No students registered yet.")
+            return
+
+        st.caption("Current Enrolled Students")
+        st.dataframe(students_df, hide_index=True, use_container_width=True)
+        
+        st.divider()
+        
+        # Danger Zone for Deletion
+        with st.expander("⚠️ Danger Zone: Delete Student"):
+            st.warning("Deleting a student will permanently remove all their recorded homework and quiz grades. This action cannot be undone.")
+            
+            # Create a user-friendly dropdown formatted as "Student Name (Group)"
+            student_options = students_df.apply(lambda x: f"{x['name']} (ID: {x['id']})", axis=1).tolist()
+            selected_student_label = st.selectbox("Select Student to Delete", student_options)
+            
+            if st.button("🚨 Yes, Permanently Delete Student"):
+                # Extract the ID from the selected string
+                student_id = selected_student_label.split("(ID: ")[1].replace(")", "")
                 
-                if st.form_submit_button("Add Student", type="primary"):
-                    if not s_id or not s_name or not s_parent:
-                        st.error("Student ID, Name, and Parent Phone are required fields.")
-                    else:
-                        try:
-                            with self.db.get_connection() as conn:
-                                with conn.cursor() as c:
-                                    c.execute("""
-                                        INSERT INTO students (id, name, phone, phone_parent, region, group_number)
-                                        VALUES (%s, %s, %s, %s, %s, %s)
-                                    """, (s_id, s_name, s_phone, s_parent, s_region, s_group))
-                                    
-                                    # Enroll new student into existing homeworks and quizzes
-                                    c.execute("SELECT homework_id FROM homeworks")
-                                    for (hw_id,) in c.fetchall():
-                                        c.execute("INSERT INTO homework_grades (homework_id, student_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (hw_id, s_id))
-                                        
-                                    c.execute("SELECT quiz_id FROM quizzes")
-                                    for (q_id,) in c.fetchall():
-                                        c.execute("INSERT INTO quiz_grades (quiz_id, student_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (q_id, s_id))
-                                        
-                                    conn.commit()
-                            st.success(f"Successfully registered {s_name} in group '{s_group}'!")
-                            st.rerun()
-                        except psycopg2.IntegrityError:
-                            st.error(f"A student with ID '{s_id}' already exists in the system.")
+                try:
+                    with self.db.get_connection() as conn:
+                        with conn.cursor() as c:
+                            # 1. Delete associated grades first to prevent foreign key constraint errors
+                            c.execute("DELETE FROM homework_grades WHERE student_id = %s", (student_id,))
+                            c.execute("DELETE FROM quiz_grades WHERE student_id = %s", (student_id,))
+                            
+                            # 2. Delete the student
+                            c.execute("DELETE FROM students WHERE id = %s", (student_id,))
+                        conn.commit()
+                        
+                    st.success(f"Student successfully deleted!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to delete student. Error: {e}")
                             
         st.divider()
         st.subheader("📋 Registered Students List")
