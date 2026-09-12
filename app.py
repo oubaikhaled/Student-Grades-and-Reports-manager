@@ -2,6 +2,7 @@ import urllib.parse
 import streamlit as st
 import pandas as pd
 import psycopg2
+import re
 from database import DatabaseManager
 from pdf_utils import PDFGenerator
 from auth import AuthManager
