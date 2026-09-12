@@ -537,30 +537,18 @@ class GradePortalApp:
         type_choice = st.radio("Select Assignment Type", ["Homework", "Quiz"], horizontal=True)
         
         if type_choice == "Homework":
-           # Ensure video_link is fetched from the database
             hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions, video_link FROM homeworks ORDER BY homework_id DESC")
-            
-            # ... [existing dropdown logic] ...
-            
-            # Safely extract the link for the selected homework
-            vid_link = hw_row["video_link"] if "video_link" in hw_row and pd.notna(hw_row["video_link"]) and str(hw_row["video_link"]).strip() else None
-
-            # ... [existing grades_df fetch logic] ...
-
-            # Pass the video_link to the PDF generator (this ignores WhatsApp entirely)
-            pdf_buf = PDFGenerator.generate_student_report(
-                row["name"], sel_title, row["score"], total_q, 
-                row["percentage"], row.get("report"), img_bytes,
-                video_link=vid_link if type_choice == "Homework" else None
-            )
-             return
+            if hw_df.empty:
+                st.info("No homeworks found.")
+                return
             
             sel_title = st.selectbox("Select Homework", hw_df["title"].tolist())
             hw_row = hw_df[hw_df["title"] == sel_title].iloc[0]
             item_id = int(hw_row["homework_id"])
             total_q = int(hw_row["total_questions"])
             
-            # Added s.phone to the SELECT query
+            vid_link = hw_row["video_link"] if "video_link" in hw_row and pd.notna(hw_row["video_link"]) and str(hw_row["video_link"]).strip() else None
+            
             grades_df = self.db.fetch_dataframe("""
                 SELECT s.id, s.name, s.phone, s.phone_parent, s.group_number, g.correct_answers as score, g.percentage, g.report, g.report_image 
                 FROM students s
@@ -579,8 +567,8 @@ class GradePortalApp:
             qz_row = qz_df[qz_df["title"] == sel_title].iloc[0]
             item_id = int(qz_row["quiz_id"])
             total_q = float(qz_row["max_score"])
+            vid_link = None
             
-            # Added s.phone to the SELECT query
             grades_df = self.db.fetch_dataframe("""
                 SELECT s.id, s.name, s.phone, s.phone_parent, s.group_number, g.score, g.percentage, g.report, g.report_image 
                 FROM students s
@@ -602,7 +590,6 @@ class GradePortalApp:
         st.success(f"Found {len(grades_df)} students with recorded grades in this selection.")
         st.divider()
         
-        # Helper function to prevent redundant code for cleaning numbers
         def clean_number(p_str):
             if pd.isna(p_str) or str(p_str).strip() in ["", "None", "nan"]: return None
             c_phone = re.sub(r'\D', '', str(p_str))
@@ -613,19 +600,18 @@ class GradePortalApp:
             return c_phone
         
         for _, row in grades_df.iterrows():
-            # Widened col4 slightly to comfortably fit two buttons side-by-side
             col1, col2, col3, col4 = st.columns([3, 2, 2, 4]) 
             
             group_label = f" *(Group: {row['group_number']})*" if pd.notna(row['group_number']) and str(row['group_number']).strip() else ""
             col1.markdown(f"**{row['name']}**{group_label}")
-            
             col2.write(f"Score: **{row['score']}** / {total_q}")
             
             with col3:
                 img_bytes = bytes(row["report_image"]) if pd.notna(row.get("report_image")) and row["report_image"] else None
                 pdf_buf = PDFGenerator.generate_student_report(
                     row["name"], sel_title, row["score"], total_q, 
-                    row["percentage"], row.get("report"), img_bytes
+                    row["percentage"], row.get("report"), img_bytes,
+                    video_link=vid_link
                 )
                     
                 st.download_button(
@@ -640,7 +626,6 @@ class GradePortalApp:
             with col4:
                 type_ar = "Quiz" if type_choice == "Quiz" else "Homework"
                 
-                # 1. Message designed for the Parents
                 wa_msg_parent = emoji.emojize(
                     f":bar_chart: درجة الـ {sel_title}\n\n"
                     f"ولي الأمر الكريم،\n"
@@ -650,7 +635,6 @@ class GradePortalApp:
                 )
                 encoded_msg_parent = urllib.parse.quote(wa_msg_parent)
                 
-                # 2. Message designed directly for the Student
                 wa_msg_student = emoji.emojize(
                     f":bar_chart: درجة الـ {sel_title}\n\n"
                     f"أهلاً بك يا {row['name']}،\n"
@@ -660,11 +644,9 @@ class GradePortalApp:
                 )
                 encoded_msg_student = urllib.parse.quote(wa_msg_student)
                 
-                # Clean phone numbers
                 parent_num = clean_number(row["phone_parent"])
                 student_num = clean_number(row["phone"])
                 
-                # 3. Route the correct message to the correct button
                 sub1, sub2 = st.columns(2)
                 with sub1:
                     if parent_num:
