@@ -71,7 +71,7 @@ class PDFGenerator:
         return buffer
 
     @classmethod
-    def generate_student_report(cls, student_name, homework_title, score, total_questions, percentage, report_text, image_bytes=None):
+    def generate_student_report(cls, student_name, homework_title, score, total_questions, percentage, report_text, image_bytes=None, video_link=None):
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
         styles, arabic_style = cls._get_base_styles()
@@ -119,6 +119,21 @@ class PDFGenerator:
                 elements.append(img)
             except Exception:
                 elements.append(Paragraph("(Error rendering attached image)", styles["Normal"]))
+
+        # ---------------------------------------------------------
+        # OPTIONAL VIDEO LINK SECTION
+        # ---------------------------------------------------------
+        if video_link:
+            clean_link = str(video_link).strip()
+            link_label = "لمشاهدة فيديو الشرح، اضغط هنا"
+            bidi_label = cls.fix_arabic(link_label)
+            
+            # Using ReportLab's HTML-like markup to create a centered, clickable link
+            link_html = f'<para align="center"><a href="{clean_link}" color="blue"><u>{bidi_label}</u></a></para>'
+            elements.extend([
+                Spacer(1, 24),
+                Paragraph(link_html, arabic_style)
+            ])
 
         doc.build(elements)
         buffer.seek(0)
