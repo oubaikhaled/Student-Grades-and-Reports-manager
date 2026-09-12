@@ -433,47 +433,78 @@ class GradePortalApp:
         
         st.divider()
         
+        student_options = students_df.apply(lambda x: f"{x['name']} (ID: {x['id']})", axis=1).tolist()
+        
+        # Edit Student Data
+        with st.expander("✏️ Edit Student Data"):
+            selected_edit_label = st.selectbox("Select Student to Edit", student_options, key="edit_student_sel")
+            
+            if selected_edit_label:
+                edit_id = selected_edit_label.split("(ID: ")[1].replace(")", "")
+                student_row = students_df[students_df['id'] == edit_id].iloc[0]
+                
+                with st.form("edit_student_form"):
+                    new_id = st.text_input("Student ID", value=str(student_row['id']))
+                    new_name = st.text_input("Student Name", value=str(student_row['name']))
+                    new_phone = st.text_input("Student Phone", value=str(student_row['phone']) if pd.notna(student_row['phone']) else "")
+                    new_parent_phone = st.text_input("Parent Phone", value=str(student_row['phone_parent']) if pd.notna(student_row['phone_parent']) else "")
+                    new_group = st.text_input("Group Number", value=str(student_row['group_number']) if pd.notna(student_row['group_number']) else "")
+                    
+                    if st.form_submit_button("💾 Save Changes", type="primary"):
+                        new_id = new_id.strip()
+                        if not new_name.strip() or not new_id:
+                            st.error("Student ID and Name cannot be empty.")
+                        else:
+                            try:
+                                with self.db.get_connection() as conn:
+                                    with conn.cursor() as c:
+                                        if new_id != edit_id:
+                                            # Check if the new ID is already taken by someone else
+                                            c.execute("SELECT id FROM students WHERE id = %s", (new_id,))
+                                            if c.fetchone():
+                                                st.error(f"The ID {new_id} is already assigned to another student.")
+                                                st.stop()
+                                                
+                                            # Safe transfer: Duplicate, migrate grades, delete old
+                                            c.execute("INSERT INTO students (id, name, phone, phone_parent, group_number) VALUES (%s, %s, %s, %s, %s)", 
+                                                      (new_id, new_name, new_phone, new_parent_phone, new_group))
+                                            c.execute("UPDATE homework_grades SET student_id = %s WHERE student_id = %s", (new_id, edit_id))
+                                            c.execute("UPDATE quiz_grades SET student_id = %s WHERE student_id = %s", (new_id, edit_id))
+                                            c.execute("DELETE FROM students WHERE id = %s", (edit_id,))
+                                        else:
+                                            # Standard update if ID did not change
+                                            c.execute("""
+                                                UPDATE students 
+                                                SET name = %s, phone = %s, phone_parent = %s, group_number = %s 
+                                                WHERE id = %s
+                                            """, (new_name, new_phone, new_parent_phone, new_group, edit_id))
+                                    conn.commit()
+                                st.success("Student details updated successfully!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to update student. Error: {e}")
+
         # Danger Zone for Deletion
         with st.expander("⚠️ Danger Zone: Delete Student"):
             st.warning("Deleting a student will permanently remove all their recorded homework and quiz grades. This action cannot be undone.")
             
-            # Create a user-friendly dropdown formatted as "Student Name (Group)"
-            student_options = students_df.apply(lambda x: f"{x['name']} (ID: {x['id']})", axis=1).tolist()
-            selected_student_label = st.selectbox("Select Student to Delete", student_options)
+            selected_delete_label = st.selectbox("Select Student to Delete", student_options, key="delete_student_sel")
             
             if st.button("🚨 Yes, Permanently Delete Student"):
-                # Extract the ID from the selected string
-                student_id = selected_student_label.split("(ID: ")[1].replace(")", "")
+                delete_id = selected_delete_label.split("(ID: ")[1].replace(")", "")
                 
                 try:
                     with self.db.get_connection() as conn:
                         with conn.cursor() as c:
-                            # 1. Delete associated grades first to prevent foreign key constraint errors
-                            c.execute("DELETE FROM homework_grades WHERE student_id = %s", (student_id,))
-                            c.execute("DELETE FROM quiz_grades WHERE student_id = %s", (student_id,))
-                            
-                            # 2. Delete the student
-                            c.execute("DELETE FROM students WHERE id = %s", (student_id,))
+                            c.execute("DELETE FROM homework_grades WHERE student_id = %s", (delete_id,))
+                            c.execute("DELETE FROM quiz_grades WHERE student_id = %s", (delete_id,))
+                            c.execute("DELETE FROM students WHERE id = %s", (delete_id,))
                         conn.commit()
                         
-                    st.success(f"Student successfully deleted!")
+                    st.success("Student successfully deleted!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to delete student. Error: {e}")
-                            
-        st.divider()
-        st.subheader("📋 Registered Students List")
-        df = self.db.fetch_dataframe("SELECT id, name, phone, phone_parent, region, group_number FROM students ORDER BY name ASC")
-        
-        # Group Filter
-        available_groups = [g for g in df['group_number'].dropna().unique() if str(g).strip()]
-        if available_groups:
-            selected_group = st.selectbox("Filter by Group", ["All"] + sorted(available_groups))
-            if selected_group != "All":
-                df = df[df['group_number'] == selected_group]
-
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
     def _admin_whatsapp_parents(self):
         st.subheader("💬 WhatsApp & Report Broadcasting")
         st.caption("Bulk download PDFs and message parents or students directly for graded assignments.")
