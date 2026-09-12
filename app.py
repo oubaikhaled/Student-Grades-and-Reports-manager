@@ -174,6 +174,7 @@ class GradePortalApp:
             del_sel = st.selectbox("Select Homework to Delete", hw_options)
             
             if st.button("🚨 Delete Homework"):
+                # EVERYTHING BELOW THIS LINE MUST BE INDENTED
                 hw_id = del_sel.split("(ID: ")[1].replace(")", "")
                 try:
                     with self.db.get_connection() as conn:
