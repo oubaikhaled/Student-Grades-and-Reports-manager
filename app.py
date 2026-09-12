@@ -169,7 +169,7 @@ class GradePortalApp:
         st.caption("Existing Homeworks")
         st.dataframe(hw_df, hide_index=True, use_container_width=True)
         
-        with st.expander("⚠️ Delete Homework"):
+            with st.expander("⚠️ Delete Homework"):
             hw_options = hw_df.apply(lambda x: f"{x['title']} (ID: {x['homework_id']})", axis=1).tolist()
             del_sel = st.selectbox("Select Homework to Delete", hw_options)
             
