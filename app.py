@@ -596,6 +596,7 @@ class GradePortalApp:
                     else:
                         st.button("🎓 N/A", disabled=True, key=f"wa_s_na_{type_choice}_{row['id']}", use_container_width=True)
             
-            st.divider()if __name__ == "__main__":
+            st.divider()
+    if __name__ == "__main__":
     app = GradePortalApp()
     app.run()
