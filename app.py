@@ -546,7 +546,7 @@ class GradePortalApp:
                 row["percentage"], row.get("report"), img_bytes,
                 video_link=vid_link if type_choice == "Homework" else None
             )
-                return
+             return
             
             sel_title = st.selectbox("Select Homework", hw_df["title"].tolist())
             hw_row = hw_df[hw_df["title"] == sel_title].iloc[0]
