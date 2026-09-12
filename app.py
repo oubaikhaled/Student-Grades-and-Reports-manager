@@ -456,13 +456,14 @@ class GradePortalApp:
         
         # Edit Student Data
         with st.expander("✏️ Edit Student Data"):
-            selected_edit_label = st.selectbox("Select Student to Edit", student_options, key="edit_student_sel")
+            # Updated unique key to bypass leftover duplicate errors
+            selected_edit_label = st.selectbox("Select Student to Edit", student_options, key="edit_student_sel_v2")
             
             if selected_edit_label:
                 edit_id = selected_edit_label.split("(ID: ")[1].replace(")", "")
                 student_row = students_df[students_df['id'] == edit_id].iloc[0]
                 
-                with st.form("edit_student_form"):
+                with st.form("edit_student_form_v2"):
                     new_id = st.text_input("Student ID", value=str(student_row['id']))
                     new_name = st.text_input("Student Name", value=str(student_row['name']))
                     new_phone = st.text_input("Student Phone", value=str(student_row['phone']) if pd.notna(student_row['phone']) else "")
@@ -478,20 +479,19 @@ class GradePortalApp:
                                 with self.db.get_connection() as conn:
                                     with conn.cursor() as c:
                                         if new_id != edit_id:
-                                            # Check if the new ID is already taken by someone else
+                                            # Check if the new ID is already taken
                                             c.execute("SELECT id FROM students WHERE id = %s", (new_id,))
                                             if c.fetchone():
                                                 st.error(f"The ID {new_id} is already assigned to another student.")
                                                 st.stop()
                                                 
-                                            # Safe transfer: Duplicate, migrate grades, delete old
+                                            # Safe transfer
                                             c.execute("INSERT INTO students (id, name, phone, phone_parent, group_number) VALUES (%s, %s, %s, %s, %s)", 
                                                       (new_id, new_name, new_phone, new_parent_phone, new_group))
                                             c.execute("UPDATE homework_grades SET student_id = %s WHERE student_id = %s", (new_id, edit_id))
                                             c.execute("UPDATE quiz_grades SET student_id = %s WHERE student_id = %s", (new_id, edit_id))
                                             c.execute("DELETE FROM students WHERE id = %s", (edit_id,))
                                         else:
-                                            # Standard update if ID did not change
                                             c.execute("""
                                                 UPDATE students 
                                                 SET name = %s, phone = %s, phone_parent = %s, group_number = %s 
@@ -507,7 +507,8 @@ class GradePortalApp:
         with st.expander("⚠️ Danger Zone: Delete Student"):
             st.warning("Deleting a student will permanently remove all their recorded homework and quiz grades. This action cannot be undone.")
             
-            selected_delete_label = st.selectbox("Select Student to Delete", student_options, key="delete_student_sel")
+            # Updated unique key to bypass leftover duplicate errors
+            selected_delete_label = st.selectbox("Select Student to Delete", student_options, key="delete_student_sel_v2")
             
             if st.button("🚨 Yes, Permanently Delete Student"):
                 delete_id = selected_delete_label.split("(ID: ")[1].replace(")", "")
@@ -524,27 +525,8 @@ class GradePortalApp:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to delete student. Error: {e}")
-        # Danger Zone for Deletion
-        with st.expander("⚠️ Danger Zone: Delete Student"):
-            st.warning("Deleting a student will permanently remove all their recorded homework and quiz grades. This action cannot be undone.")
-            
-            selected_delete_label = st.selectbox("Select Student to Delete", student_options, key="delete_student_sel")
-            
-            if st.button("🚨 Yes, Permanently Delete Student"):
-                delete_id = selected_delete_label.split("(ID: ")[1].replace(")", "")
-                
-                try:
-                    with self.db.get_connection() as conn:
-                        with conn.cursor() as c:
-                            c.execute("DELETE FROM homework_grades WHERE student_id = %s", (delete_id,))
-                            c.execute("DELETE FROM quiz_grades WHERE student_id = %s", (delete_id,))
-                            c.execute("DELETE FROM students WHERE id = %s", (delete_id,))
-                        conn.commit()
-                        
-                    st.success("Student successfully deleted!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to delete student. Error: {e}")
+                    
+                    
     def _admin_whatsapp_parents(self):
         st.subheader("💬 WhatsApp & Report Broadcasting")
         st.caption("Bulk download PDFs and message parents or students directly for graded assignments.")
