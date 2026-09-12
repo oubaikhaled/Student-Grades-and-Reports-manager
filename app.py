@@ -194,8 +194,8 @@ class GradePortalApp:
             st.info("No homeworks created yet.")
             return
             
-        st.caption("Existing Homeworks")
-        st.dataframe(hw_df, hide_index=True, use_container_width=True)
+            st.caption("Existing Homeworks")
+            st.dataframe(hw_df, hide_index=True, use_container_width=True)
         
          with st.expander("⚠️ Delete Homework"):
             hw_options = hw_df.apply(lambda x: f"{x['title']} (ID: {x['homework_id']})", axis=1).tolist()
