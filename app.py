@@ -7,6 +7,7 @@ from database import DatabaseManager
 from pdf_utils import PDFGenerator
 from auth import AuthManager
 import emoji
+
 st.set_page_config(page_title="Eng.Mahmoud Adel Grade Portal", layout="wide")
 
 class GradePortalApp:
@@ -16,7 +17,7 @@ class GradePortalApp:
         self.db.init_db()
 
     def run(self):
-        if not st.session_state.logged_in:
+        if 'logged_in' not in st.session_state or not st.session_state.logged_in:
             self._render_login()
         elif st.session_state.role == "parent":
             self._render_parent_portal()
@@ -165,17 +166,15 @@ class GradePortalApp:
         if hw_df.empty:
             st.info("No homeworks created yet.")
             return
+
+        st.subheader("📊 Enter Homework Grades & Feedback")
+        sel_hw_title = st.selectbox("Select Homework", hw_df["title"].tolist())
+        hw_row = hw_df[hw_df["title"] == sel_hw_title].iloc[0]
+        hw_id = int(hw_row["homework_id"])
+        total_q = int(hw_row["total_questions"])
             
-        st.caption("Existing Homeworks")
-        st.dataframe(hw_df, hide_index=True, use_container_width=True)
-        
-            with st.expander("⚠️ Delete Homework"):
-            hw_options = hw_df.apply(lambda x: f"{x['title']} (ID: {x['homework_id']})", axis=1).tolist()
-            del_sel = st.selectbox("Select Homework to Delete", hw_options)
-            
-            if st.button("🚨 Delete Homework"):
-                # Everything below this line is now strictly indented inside the button click
-                hw_id = del_sel.split("(ID: ")[1].replace(")", "")
+        with st.expander("⚠️ Danger Zone: Delete Homework"):
+            if st.button("🚨 Yes, Delete This Homework"):
                 try:
                     with self.db.get_connection() as conn:
                         with conn.cursor() as c:
@@ -187,34 +186,6 @@ class GradePortalApp:
                 except Exception as e:
                     st.error(f"Failed to delete. Error: {e}")
                         
-        st.divider()
-        
-        hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions, video_link FROM homeworks ORDER BY homework_id DESC")
-        if hw_df.empty:
-            st.info("No homeworks created yet.")
-            return
-            
-            st.caption("Existing Homeworks")
-            st.dataframe(hw_df, hide_index=True, use_container_width=True)
-        
-         with st.expander("⚠️ Delete Homework"):
-            hw_options = hw_df.apply(lambda x: f"{x['title']} (ID: {x['homework_id']})", axis=1).tolist()
-            del_sel = st.selectbox("Select Homework to Delete", hw_options)
-            
-            if st.button("🚨 Delete Homework"):
-                # Make sure these lines are indented exactly like this!
-                hw_id = del_sel.split("(ID: ")[1].replace(")", "")
-                try:
-                    with self.db.get_connection() as conn:
-                        with conn.cursor() as c:
-                            c.execute("DELETE FROM homework_grades WHERE homework_id = %s", (hw_id,))
-                            c.execute("DELETE FROM homeworks WHERE homework_id = %s", (hw_id,))
-                        conn.commit()
-                    st.success("Homework deleted!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to delete. Error: {e}")
-        # Added s.group_number to the query
         grades_df = self.db.fetch_dataframe("""
             SELECT s.id, s.name, s.group_number, g.correct_answers, g.report 
             FROM students s
@@ -261,7 +232,7 @@ class GradePortalApp:
                                 c.execute(
                                     "UPDATE homework_grades SET correct_answers = NULL, percentage = NULL, report = %s WHERE homework_id = %s AND student_id = %s",
                                     (rep_val, hw_id, str(row["id"])))
-                        conn.commit()
+                    conn.commit()
                 st.success("Grades & Text saved!")
                 st.rerun()
 
@@ -306,7 +277,7 @@ class GradePortalApp:
                                 c.execute(
                                     "UPDATE homework_grades SET report_image = %s WHERE homework_id = %s AND student_id = %s",
                                     (psycopg2.Binary(up_file.read()), hw_id, str(sel_sid)))
-                            conn.commit()
+                        conn.commit()
                     st.success(f"Feedback safely stored for {student_to_attach}!")
                     st.rerun()
 
@@ -354,7 +325,6 @@ class GradePortalApp:
                     except Exception as e:
                         st.error(f"Error: {e}")
 
-            # Added s.group_number to the query
             grades_df = self.db.fetch_dataframe("""
                 SELECT s.id, s.name, s.group_number, qg.score, qg.report 
                 FROM students s 
@@ -401,7 +371,7 @@ class GradePortalApp:
                                     c.execute(
                                         "UPDATE quiz_grades SET score = NULL, percentage = NULL, report = %s WHERE quiz_id = %s AND student_id = %s",
                                         (rep_val, q_id, str(row["id"])))
-                            conn.commit()
+                        conn.commit()
                     st.success("Quiz grades & Text saved!")
                     st.rerun()
 
@@ -446,9 +416,10 @@ class GradePortalApp:
                                     c.execute(
                                         "UPDATE quiz_grades SET report_image = %s WHERE quiz_id = %s AND student_id = %s",
                                         (psycopg2.Binary(up_file.read()), q_id, str(sel_sid)))
-                                conn.commit()
+                            conn.commit()
                         st.success(f"Feedback safely stored for {student_to_attach}!")
                         st.rerun()
+
     def _admin_manage_students(self):
         st.subheader("👥 Manage Students")
         
@@ -556,7 +527,6 @@ class GradePortalApp:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to delete student. Error: {e}")
-                    
                     
     def _admin_whatsapp_parents(self):
         st.subheader("💬 WhatsApp & Report Broadcasting")
