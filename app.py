@@ -598,5 +598,5 @@ class GradePortalApp:
             
             st.divider()
     if __name__ == "__main__":
-    app = GradePortalApp()
+        app = GradePortalApp()
     app.run()
