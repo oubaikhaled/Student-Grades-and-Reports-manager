@@ -570,30 +570,42 @@ class GradePortalApp:
                 
             with col4:
                 type_ar = "Quiz" if type_choice == "Quiz" else "Homework"
-                wa_msg = emoji.emojize(
+                
+                # 1. Message designed for the Parents
+                wa_msg_parent = emoji.emojize(
                     f":bar_chart: درجة الـ {sel_title}\n\n"
                     f"ولي الأمر الكريم،\n"
                     f"نحيط حضرتكم علمًا بأن الطالب {row['name']} حصل على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
                     f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. :glowing_star:\n\n"
                     f"Mathematics Team – Mahmoud Adel"
                 )
-                encoded_msg = urllib.parse.quote(wa_msg)
+                encoded_msg_parent = urllib.parse.quote(wa_msg_parent)
                 
-                # Apply the strict regex cleaner to both columns
+                # 2. Message designed directly for the Student
+                wa_msg_student = emoji.emojize(
+                    f":bar_chart: درجة الـ {sel_title}\n\n"
+                    f"أهلاً بك يا {row['name']}،\n"
+                    f"لقد حصلت على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
+                    f"استمر في المذاكرة والتدريب، ونتمنى لك دوام التفوق والنجاح! :glowing_star:\n\n"
+                    f"Mathematics Team – Mahmoud Adel"
+                )
+                encoded_msg_student = urllib.parse.quote(wa_msg_student)
+                
+                # Clean phone numbers
                 parent_num = clean_number(row["phone_parent"])
                 student_num = clean_number(row["phone"])
                 
-                # Split the WhatsApp column into two side-by-side buttons
+                # 3. Route the correct message to the correct button
                 sub1, sub2 = st.columns(2)
                 with sub1:
                     if parent_num:
-                        st.link_button("👨‍👩‍👦 Parent", f"https://api.whatsapp.com/send?phone={parent_num}&text={encoded_msg}", key=f"wa_p_{type_choice}_{row['id']}", use_container_width=True)
+                        st.link_button("👨‍👩‍👦 Parent", f"https://api.whatsapp.com/send?phone={parent_num}&text={encoded_msg_parent}", key=f"wa_p_{type_choice}_{row['id']}", use_container_width=True)
                     else:
                         st.button("👨‍👩‍👦 N/A", disabled=True, key=f"wa_p_na_{type_choice}_{row['id']}", use_container_width=True)
                         
                 with sub2:
                     if student_num:
-                        st.link_button("🎓 Student", f"https://api.whatsapp.com/send?phone={student_num}&text={encoded_msg}", key=f"wa_s_{type_choice}_{row['id']}", use_container_width=True)
+                        st.link_button("🎓 Student", f"https://api.whatsapp.com/send?phone={student_num}&text={encoded_msg_student}", key=f"wa_s_{type_choice}_{row['id']}", use_container_width=True)
                     else:
                         st.button("🎓 N/A", disabled=True, key=f"wa_s_na_{type_choice}_{row['id']}", use_container_width=True)
             
