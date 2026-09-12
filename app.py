@@ -175,17 +175,17 @@ class GradePortalApp:
             
             if st.button("🚨 Delete Homework"):
                 # EVERYTHING BELOW THIS LINE MUST BE INDENTED
-                hw_id = del_sel.split("(ID: ")[1].replace(")", "")
-                try:
-                    with self.db.get_connection() as conn:
-                        with conn.cursor() as c:
-                            c.execute("DELETE FROM homework_grades WHERE homework_id = %s", (hw_id,))
-                            c.execute("DELETE FROM homeworks WHERE homework_id = %s", (hw_id,))
-                        conn.commit()
-                    st.success("Homework deleted!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to delete. Error: {e}")
+                    hw_id = del_sel.split("(ID: ")[1].replace(")", "")
+                    try:
+                        with self.db.get_connection() as conn:
+                            with conn.cursor() as c:
+                                c.execute("DELETE FROM homework_grades WHERE homework_id = %s", (hw_id,))
+                                c.execute("DELETE FROM homeworks WHERE homework_id = %s", (hw_id,))
+                            conn.commit()
+                        st.success("Homework deleted!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to delete. Error: {e}")
 
         # Added s.group_number to the query
         grades_df = self.db.fetch_dataframe("""
