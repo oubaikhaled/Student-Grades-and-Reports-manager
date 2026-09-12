@@ -433,7 +433,26 @@ class GradePortalApp:
         
         st.divider()
         
-        student_options = students_df.apply(lambda x: f"{x['name']} (ID: {x['id']})", axis=1).tolist()
+        # Real-time search filter for expandability
+        st.subheader("🛠️ Modify Student Records")
+        search_term = st.text_input("🔍 Search Student by Name or ID", placeholder="Start typing to filter the dropdowns below...").strip()
+        
+        if search_term:
+            # Filter the dataframe dynamically (case-insensitive)
+            mask = (
+                students_df['name'].str.contains(search_term, case=False, na=False) |
+                students_df['id'].astype(str).str.contains(search_term, case=False, na=False)
+            )
+            filtered_df = students_df[mask]
+        else:
+            filtered_df = students_df
+
+        if filtered_df.empty:
+            st.warning("No students match your search criteria.")
+            return
+
+        # Generate options based ONLY on the filtered results
+        student_options = filtered_df.apply(lambda x: f"{x['name']} (ID: {x['id']})", axis=1).tolist()
         
         # Edit Student Data
         with st.expander("✏️ Edit Student Data"):
@@ -484,6 +503,27 @@ class GradePortalApp:
                             except Exception as e:
                                 st.error(f"Failed to update student. Error: {e}")
 
+        # Danger Zone for Deletion
+        with st.expander("⚠️ Danger Zone: Delete Student"):
+            st.warning("Deleting a student will permanently remove all their recorded homework and quiz grades. This action cannot be undone.")
+            
+            selected_delete_label = st.selectbox("Select Student to Delete", student_options, key="delete_student_sel")
+            
+            if st.button("🚨 Yes, Permanently Delete Student"):
+                delete_id = selected_delete_label.split("(ID: ")[1].replace(")", "")
+                
+                try:
+                    with self.db.get_connection() as conn:
+                        with conn.cursor() as c:
+                            c.execute("DELETE FROM homework_grades WHERE student_id = %s", (delete_id,))
+                            c.execute("DELETE FROM quiz_grades WHERE student_id = %s", (delete_id,))
+                            c.execute("DELETE FROM students WHERE id = %s", (delete_id,))
+                        conn.commit()
+                        
+                    st.success("Student successfully deleted!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to delete student. Error: {e}")
         # Danger Zone for Deletion
         with st.expander("⚠️ Danger Zone: Delete Student"):
             st.warning("Deleting a student will permanently remove all their recorded homework and quiz grades. This action cannot be undone.")
