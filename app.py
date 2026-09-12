@@ -133,40 +133,36 @@ class GradePortalApp:
             self._admin_whatsapp_parents()
 
     def _admin_manage_homeworks(self):
-        st.subheader("📝 Manage Homeworks")
+        st.subheader("📚 Manage Homeworks")
         
-        with st.expander("➕ Create a New Homework"):
-            with st.form("new_homework_form"):
-                title = st.text_input("Homework Title", placeholder="e.g. Homework 54").strip()
-                total_q = st.number_input("Total Number of Questions", min_value=1, value=50, step=1)
-                if st.form_submit_button("Create Homework"):
-                    if not title:
-                        st.error("Please enter a title.")
-                    else:
-                        try:
-                            with self.db.get_connection() as conn:
-                                with conn.cursor() as c:
-                                    c.execute(
-                                        "INSERT INTO homeworks (title, total_questions) VALUES (%s, %s) RETURNING homework_id",
-                                        (title, total_q))
-                                    hw_id = c.fetchone()[0]
-                                    c.execute("SELECT id FROM students")
-                                    sids = c.fetchall()
-                                    for (sid,) in sids:
-                                        c.execute("INSERT INTO homework_grades (homework_id, student_id) VALUES (%s, %s)",
-                                                  (hw_id, sid))
-                                    conn.commit()
-                                    st.success(f"Successfully created '{title}' with {len(sids)} students enrolled!")
-                                    st.rerun()
-                        except psycopg2.IntegrityError:
-                            st.error(f"A homework named '{title}' already exists.")
-
-        hw_df = self.db.fetch_dataframe(
-            "SELECT homework_id, title, total_questions FROM homeworks ORDER BY homework_id DESC")
-        if hw_df.empty:
-            st.info("No homeworks created yet.")
-            return
-
+        with st.form("add_homework_form"):
+            title = st.text_input("Homework Title")
+            total_q = st.number_input("Total Questions (Max Score)", min_value=1, step=1)
+            
+            # 1. New optional video link field
+            video_link = st.text_input("Homework Video Link (Optional)", placeholder="https://youtube.com/... ")
+            
+            if st.form_submit_button("➕ Add Homework", type="primary"):
+                if not title.strip():
+                    st.error("Title cannot be empty.")
+                else:
+                    try:
+                        # 2. Convert empty strings to None so PostgreSQL stores it as a clean NULL
+                        clean_link = video_link.strip() if video_link.strip() else None
+                        
+                        with self.db.get_connection() as conn:
+                            with conn.cursor() as c:
+                                c.execute(
+                                    "INSERT INTO homeworks (title, total_questions, video_link) VALUES (%s, %s, %s)", 
+                                    (title.strip(), total_q, clean_link)
+                                )
+                            conn.commit()
+                        st.success("Homework created successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to add homework. Error: {e}")
+                        
+      
         st.divider()
         st.subheader("📊 Enter Grades & Feedback")
         sel_hw_title = st.selectbox("Select Homework Assignment", hw_df["title"].tolist(), key="sel_hw")
