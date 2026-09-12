@@ -475,9 +475,8 @@ class GradePortalApp:
 
     def _admin_whatsapp_parents(self):
         st.subheader("💬 WhatsApp & Report Broadcasting")
-        st.caption("Bulk download PDFs and message parents directly for graded assignments.")
+        st.caption("Bulk download PDFs and message parents or students directly for graded assignments.")
         
-        # 1. Select Assignment Type
         type_choice = st.radio("Select Assignment Type", ["Homework", "Quiz"], horizontal=True)
         
         if type_choice == "Homework":
@@ -486,14 +485,14 @@ class GradePortalApp:
                 st.info("No homeworks found.")
                 return
             
-            # 2. Select Specific Homework
             sel_title = st.selectbox("Select Homework", hw_df["title"].tolist())
             hw_row = hw_df[hw_df["title"] == sel_title].iloc[0]
             item_id = int(hw_row["homework_id"])
             total_q = int(hw_row["total_questions"])
             
+            # Added s.phone to the SELECT query
             grades_df = self.db.fetch_dataframe("""
-                SELECT s.id, s.name, s.phone_parent, s.group_number, g.correct_answers as score, g.percentage, g.report, g.report_image 
+                SELECT s.id, s.name, s.phone, s.phone_parent, s.group_number, g.correct_answers as score, g.percentage, g.report, g.report_image 
                 FROM students s
                 JOIN homework_grades g ON s.id = g.student_id
                 WHERE g.homework_id = %s AND g.correct_answers IS NOT NULL
@@ -506,14 +505,14 @@ class GradePortalApp:
                 st.info("No quizzes found.")
                 return
                 
-            # 2. Select Specific Quiz
             sel_title = st.selectbox("Select Quiz", qz_df["title"].tolist())
             qz_row = qz_df[qz_df["title"] == sel_title].iloc[0]
             item_id = int(qz_row["quiz_id"])
             total_q = float(qz_row["max_score"])
             
+            # Added s.phone to the SELECT query
             grades_df = self.db.fetch_dataframe("""
-                SELECT s.id, s.name, s.phone_parent, s.group_number, g.score, g.percentage, g.report, g.report_image 
+                SELECT s.id, s.name, s.phone, s.phone_parent, s.group_number, g.score, g.percentage, g.report, g.report_image 
                 FROM students s
                 JOIN quiz_grades g ON s.id = g.student_id
                 WHERE g.quiz_id = %s AND g.score IS NOT NULL
@@ -524,7 +523,6 @@ class GradePortalApp:
             st.warning(f"No grades have been recorded for '{sel_title}' yet.")
             return
             
-        # 3. Select Specific Group
         available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
         if available_groups:
             filter_group = st.selectbox("Filter Broadcasting by Group", ["All Groups"] + sorted(available_groups))
@@ -534,9 +532,19 @@ class GradePortalApp:
         st.success(f"Found {len(grades_df)} students with recorded grades in this selection.")
         st.divider()
         
-        # Display the filtered students
+        # Helper function to prevent redundant code for cleaning numbers
+        def clean_number(p_str):
+            if pd.isna(p_str) or str(p_str).strip() in ["", "None", "nan"]: return None
+            c_phone = re.sub(r'\D', '', str(p_str))
+            if not c_phone: return None
+            if len(c_phone) == 10 and c_phone.startswith("1"): return "20" + c_phone
+            elif c_phone.startswith("0"): return "2" + c_phone
+            elif not c_phone.startswith("20"): return "20" + c_phone
+            return c_phone
+        
         for _, row in grades_df.iterrows():
-            col1, col2, col3, col4 = st.columns([3, 2, 3, 3])
+            # Widened col4 slightly to comfortably fit two buttons side-by-side
+            col1, col2, col3, col4 = st.columns([3, 2, 2, 4]) 
             
             group_label = f" *(Group: {row['group_number']})*" if pd.notna(row['group_number']) and str(row['group_number']).strip() else ""
             col1.markdown(f"**{row['name']}**{group_label}")
@@ -551,7 +559,7 @@ class GradePortalApp:
                 )
                     
                 st.download_button(
-                    label="📄 Download Report", 
+                    label="📄 Download", 
                     data=pdf_buf,
                     file_name=f"{row['name']}_{sel_title}.pdf".replace(" ", "_"),
                     mime="application/pdf", 
@@ -560,27 +568,34 @@ class GradePortalApp:
                 )
                 
             with col4:
-                raw_phone = str(row["phone_parent"]).strip()
-                formatted_phone = "2" + raw_phone if raw_phone.startswith("0") else raw_phone
-                
-                # Automatically use "Quiz" or "Homework" based on the selected tab
                 type_ar = "Quiz" if type_choice == "Quiz" else "Homework"
-                
-                # Triple quotes or explicit newline characters (\n) maintain the line breaks
-                wa_msg = (
-                    f"📊 درجة الـ {sel_title}\n\n"
+                wa_msg = emoji.emojize(
+                    f":bar_chart: درجة الـ {sel_title}\n\n"
                     f"ولي الأمر الكريم،\n"
                     f"نحيط حضرتكم علمًا بأن الطالب {row['name']} حصل على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
-                    f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. 🌟\n\n"
+                    f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. :glowing_star:\n\n"
                     f"Mathematics Team – Mahmoud Adel"
                 )
-                
-                # urllib.parse.quote safely encodes the Arabic letters and emojis into a web link
                 encoded_msg = urllib.parse.quote(wa_msg)
-                wa_url = f"https://wa.me/{formatted_phone}?text={encoded_msg}"
                 
-                st.link_button("💬 Send WhatsApp", wa_url, key=f"wa_{type_choice}_{row['id']}", use_container_width=True)
-            st.divider()
-if __name__ == "__main__":
+                # Apply the strict regex cleaner to both columns
+                parent_num = clean_number(row["phone_parent"])
+                student_num = clean_number(row["phone"])
+                
+                # Split the WhatsApp column into two side-by-side buttons
+                sub1, sub2 = st.columns(2)
+                with sub1:
+                    if parent_num:
+                        st.link_button("👨‍👩‍👦 Parent", f"https://api.whatsapp.com/send?phone={parent_num}&text={encoded_msg}", key=f"wa_p_{type_choice}_{row['id']}", use_container_width=True)
+                    else:
+                        st.button("👨‍👩‍👦 N/A", disabled=True, key=f"wa_p_na_{type_choice}_{row['id']}", use_container_width=True)
+                        
+                with sub2:
+                    if student_num:
+                        st.link_button("🎓 Student", f"https://api.whatsapp.com/send?phone={student_num}&text={encoded_msg}", key=f"wa_s_{type_choice}_{row['id']}", use_container_width=True)
+                    else:
+                        st.button("🎓 N/A", disabled=True, key=f"wa_s_na_{type_choice}_{row['id']}", use_container_width=True)
+            
+            st.divider()if __name__ == "__main__":
     app = GradePortalApp()
     app.run()
