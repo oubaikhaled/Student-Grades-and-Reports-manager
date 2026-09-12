@@ -423,6 +423,39 @@ class GradePortalApp:
     def _admin_manage_students(self):
         st.subheader("👥 Manage Students")
         
+        # --- RESTORED: ADD STUDENT FEATURE ---
+        with st.expander("➕ Add New Student", expanded=False):
+            with st.form("add_student_form"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    add_id = st.text_input("Student ID (Unique)")
+                    add_name = st.text_input("Student Name")
+                    add_group = st.text_input("Group Number (Optional)")
+                with col2:
+                    add_phone = st.text_input("Student Phone (Optional)", placeholder="010...")
+                    add_parent_phone = st.text_input("Parent Phone", placeholder="010...")
+                
+                if st.form_submit_button("💾 Register Student", type="primary"):
+                    if not add_id.strip() or not add_name.strip():
+                        st.error("Student ID and Name are required.")
+                    else:
+                        try:
+                            with self.db.get_connection() as conn:
+                                with conn.cursor() as c:
+                                    c.execute(
+                                        "INSERT INTO students (id, name, phone, phone_parent, group_number) VALUES (%s, %s, %s, %s, %s)",
+                                        (add_id.strip(), add_name.strip(), add_phone.strip(), add_parent_phone.strip(), add_group.strip())
+                                    )
+                                conn.commit()
+                            st.success(f"Student '{add_name}' added successfully!")
+                            st.rerun()
+                        except psycopg2.IntegrityError:
+                            st.error(f"Error: A student with ID '{add_id}' already exists.")
+                        except Exception as e:
+                            st.error(f"Failed to add student. Error: {e}")
+                            
+        st.divider()
+        
         # Fetch current students
         students_df = self.db.fetch_dataframe("SELECT id, name, phone, phone_parent, group_number FROM students ORDER BY name ASC")
         
@@ -458,7 +491,6 @@ class GradePortalApp:
         
         # Edit Student Data
         with st.expander("✏️ Edit Student Data"):
-            # Updated unique key to bypass leftover duplicate errors
             selected_edit_label = st.selectbox("Select Student to Edit", student_options, key="edit_student_sel_v2")
             
             if selected_edit_label:
@@ -509,7 +541,6 @@ class GradePortalApp:
         with st.expander("⚠️ Danger Zone: Delete Student"):
             st.warning("Deleting a student will permanently remove all their recorded homework and quiz grades. This action cannot be undone.")
             
-            # Updated unique key to bypass leftover duplicate errors
             selected_delete_label = st.selectbox("Select Student to Delete", student_options, key="delete_student_sel_v2")
             
             if st.button("🚨 Yes, Permanently Delete Student"):
@@ -526,8 +557,7 @@ class GradePortalApp:
                     st.success("Student successfully deleted!")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Failed to delete student. Error: {e}")
-                    
+                    st.error(f"Failed to delete student. Error: {e}")                
     def _admin_whatsapp_parents(self):
         st.subheader("💬 WhatsApp & Report Broadcasting")
         st.caption("Bulk download PDFs and message parents or students directly for graded assignments.")
