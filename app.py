@@ -169,24 +169,23 @@ class GradePortalApp:
         st.caption("Existing Homeworks")
         st.dataframe(hw_df, hide_index=True, use_container_width=True)
         
-        with st.expander("⚠️ Delete Homework"):
+       with st.expander("⚠️ Delete Homework"):
             hw_options = hw_df.apply(lambda x: f"{x['title']} (ID: {x['homework_id']})", axis=1).tolist()
             del_sel = st.selectbox("Select Homework to Delete", hw_options)
             
             if st.button("🚨 Delete Homework"):
-                # EVERYTHING BELOW THIS LINE MUST BE INDENTED
-                    hw_id = del_sel.split("(ID: ")[1].replace(")", "")
-                    try:
-                        with self.db.get_connection() as conn:
-                            with conn.cursor() as c:
-                                c.execute("DELETE FROM homework_grades WHERE homework_id = %s", (hw_id,))
-                                c.execute("DELETE FROM homeworks WHERE homework_id = %s", (hw_id,))
-                            conn.commit()
-                        st.success("Homework deleted!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to delete. Error: {e}")
-
+                # Make sure these lines are indented exactly like this!
+                hw_id = del_sel.split("(ID: ")[1].replace(")", "")
+                try:
+                    with self.db.get_connection() as conn:
+                        with conn.cursor() as c:
+                            c.execute("DELETE FROM homework_grades WHERE homework_id = %s", (hw_id,))
+                            c.execute("DELETE FROM homeworks WHERE homework_id = %s", (hw_id,))
+                        conn.commit()
+                    st.success("Homework deleted!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to delete. Error: {e}")
         # Added s.group_number to the query
         grades_df = self.db.fetch_dataframe("""
             SELECT s.id, s.name, s.group_number, g.correct_answers, g.report 
