@@ -125,7 +125,7 @@ class PDFGenerator:
         # ---------------------------------------------------------
         if video_link:
             clean_link = str(video_link).strip()
-            link_label = "لمشاهدة فيديو الشرح، اضغط هنا"
+            link_label = "لمشاهدة فيديو الواجب، اضغط هنا"
             bidi_label = cls.fix_arabic(link_label)
             
             # Using ReportLab's HTML-like markup to create a centered, clickable link
