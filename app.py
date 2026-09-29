@@ -354,23 +354,30 @@ class GradePortalApp:
                                 st.rerun()
                     st.divider()
 
-            # --- THE TABLE UI (Instant Native Dataframe) ---
+            # --- THE TABLE UI ---
             st.markdown("### 📋 Class Roster")
             
-            # Prepare a clean, blazing-fast dataframe for display
-            disp_df = filtered_df[['id', 'name', 'correct_answers']].copy()
-            disp_df['Status'] = disp_df['correct_answers'].apply(lambda x: '✅ Graded' if pd.notna(x) else '❌ Missing')
-            disp_df['Score'] = disp_df['correct_answers'].apply(lambda x: f"{int(x)} / {total_q}" if pd.notna(x) else "-")
+            h1, h2, h3, h4 = st.columns([1, 3, 2, 2])
+            h1.markdown("**ID**")
+            h2.markdown("**Name**")
+            h3.markdown("**Status**")
+            h4.markdown("**Action**")
+            st.divider()
             
-            st.dataframe(
-                disp_df[['id', 'name', 'Status', 'Score']], 
-                hide_index=True, 
-                use_container_width=True,
-                column_config={
-                    "id": "ID",
-                    "name": "Student Name"
-                }
-            )
+            for _, row in filtered_df.iterrows():
+                c1, c2, c3, c4 = st.columns([1, 3, 2, 2])
+                c1.write(row['id'])
+                c2.write(row['name'])
+                
+                has_score = pd.notna(row['correct_answers'])
+                if has_score:
+                    c3.success(f"✅ {int(row['correct_answers'])} / {total_q}")
+                else:
+                    c3.error("❌ Missing")
+                
+                if c4.button("✏️ Grade", key=f"btn_grade_hw_{row['id']}", use_container_width=True):
+                    st.session_state.active_hw_student = row['id']
+                    st.rerun()
 
             st.divider()
             
