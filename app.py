@@ -566,64 +566,64 @@ class GradePortalApp:
 
     def _admin_whatsapp_parents(self):
         st.subheader("💬 WhatsApp & Report Broadcasting")
-        st.caption("Bulk download PDFs and message parents or students directly for graded assignments.")
-
+        st.caption("Bulk download PDFs and message parents or students directly for graded or missing assignments.")
+        
         type_choice = st.radio("Select Assignment Type", ["Homework", "Quiz"], horizontal=True)
-
+        
         if type_choice == "Homework":
             hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions, video_link FROM homeworks ORDER BY homework_id DESC")
             if hw_df.empty:
                 st.info("No homeworks found.")
                 return
-
+            
             sel_title = st.selectbox("Select Homework", hw_df["title"].tolist())
             hw_row = hw_df[hw_df["title"] == sel_title].iloc[0]
             item_id = int(hw_row["homework_id"])
             total_q = int(hw_row["total_questions"])
-
+            
             vid_link = hw_row["video_link"] if "video_link" in hw_row and pd.notna(hw_row["video_link"]) and str(hw_row["video_link"]).strip() else None
-
+            
+            # Using LEFT JOIN to fetch ALL students, even those without grades
             grades_df = self.db.fetch_dataframe("""
                 SELECT s.id, s.name, s.phone, s.phone_parent, s.group_number, g.correct_answers as score, g.percentage, g.report, g.report_image 
                 FROM students s
-                JOIN homework_grades g ON s.id = g.student_id
-                WHERE g.homework_id = %s AND g.correct_answers IS NOT NULL
+                LEFT JOIN homework_grades g ON s.id = g.student_id AND g.homework_id = %s
                 ORDER BY s.group_number ASC, s.name ASC
             """, (item_id,))
-
+            
         else:
             qz_df = self.db.fetch_dataframe("SELECT quiz_id, title, max_score FROM quizzes ORDER BY quiz_id DESC")
             if qz_df.empty:
                 st.info("No quizzes found.")
                 return
-
+                
             sel_title = st.selectbox("Select Quiz", qz_df["title"].tolist())
             qz_row = qz_df[qz_df["title"] == sel_title].iloc[0]
             item_id = int(qz_row["quiz_id"])
             total_q = float(qz_row["max_score"])
             vid_link = None
-
+            
+            # Using LEFT JOIN to fetch ALL students, even those without grades
             grades_df = self.db.fetch_dataframe("""
                 SELECT s.id, s.name, s.phone, s.phone_parent, s.group_number, g.score, g.percentage, g.report, g.report_image 
                 FROM students s
-                JOIN quiz_grades g ON s.id = g.student_id
-                WHERE g.quiz_id = %s AND g.score IS NOT NULL
+                LEFT JOIN quiz_grades g ON s.id = g.student_id AND g.quiz_id = %s
                 ORDER BY s.group_number ASC, s.name ASC
             """, (item_id,))
-
+            
         if grades_df.empty:
-            st.warning(f"No grades have been recorded for '{sel_title}' yet.")
+            st.warning("No students found in the database.")
             return
-
+            
         available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
         if available_groups:
             filter_group = st.selectbox("Filter Broadcasting by Group", ["All Groups"] + sorted(available_groups))
             if filter_group != "All Groups":
                 grades_df = grades_df[grades_df['group_number'] == filter_group]
 
-        st.success(f"Found {len(grades_df)} students with recorded grades in this selection.")
+        st.success(f"Found {len(grades_df)} students in this selection.")
         st.divider()
-
+        
         def clean_number(p_str):
             if pd.isna(p_str) or str(p_str).strip() in ["", "None", "nan"]: return None
             c_phone = re.sub(r'\D', '', str(p_str))
@@ -632,68 +632,117 @@ class GradePortalApp:
             elif c_phone.startswith("0"): return "2" + c_phone
             elif not c_phone.startswith("20"): return "20" + c_phone
             return c_phone
-
+        
         for _, row in grades_df.iterrows():
             col1, col2, col3, col4 = st.columns([3, 2, 2, 4]) 
-
+            
             group_label = f" *(Group: {row['group_number']})*" if pd.notna(row['group_number']) and str(row['group_number']).strip() else ""
             col1.markdown(f"**{row['name']}**{group_label}")
-            col2.write(f"Score: **{row['score']}** / {total_q}")
-
+            
+            # Check if the student actually has a score submitted
+            has_score = pd.notna(row['score'])
+            
+            if has_score:
+                col2.write(f"Score: **{row['score']}** / {total_q}")
+            else:
+                col2.markdown("Score: ❌ **Missing**")
+            
             with col3:
-                img_bytes = bytes(row["report_image"]) if pd.notna(row.get("report_image")) and row["report_image"] else None
-                pdf_buf = PDFGenerator.generate_student_report(
-                    row["name"], sel_title, row["score"], total_q, 
-                    row["percentage"], row.get("report"), img_bytes,
-                    video_link=vid_link
-                )
-
-                st.download_button(
-                    label="📄 Download", 
-                    data=pdf_buf,
-                    file_name=f"{row['name']}_{sel_title}.pdf".replace(" ", "_"),
-                    mime="application/pdf", 
-                    key=f"dl_{type_choice}_{row['id']}",
-                    use_container_width=True
-                )
-
+                if has_score:
+                    img_bytes = bytes(row["report_image"]) if pd.notna(row.get("report_image")) and row["report_image"] else None
+                    pdf_buf = PDFGenerator.generate_student_report(
+                        row["name"], sel_title, row["score"], total_q, 
+                        row["percentage"], row.get("report"), img_bytes,
+                        video_link=vid_link
+                    )
+                        
+                    st.download_button(
+                        label="📄 Download", 
+                        data=pdf_buf,
+                        file_name=f"{row['name']}_{sel_title}.pdf".replace(" ", "_"),
+                        mime="application/pdf", 
+                        key=f"dl_{type_choice}_{row['id']}",
+                        use_container_width=True
+                    )
+                else:
+                    st.button("📄 N/A", disabled=True, key=f"dl_na_{type_choice}_{row['id']}", use_container_width=True)
+                
             with col4:
-                type_ar = "Quiz" if type_choice == "Quiz" else "Homework"
+                # If they have a score, send the standard grading message
+                if has_score:
+                    type_ar = "Quiz" if type_choice == "Quiz" else "Homework"
+                    
+                    wa_msg_parent = emoji.emojize(
+                        f":bar_chart: درجة الـ {sel_title}\n\n"
+                        f"ولي الأمر الكريم،\n"
+                        f"نحيط حضرتكم علمًا بأن الطالب {row['name']} حصل على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
+                        f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. :glowing_star:\n\n"
+                        f"Mathematics Team – Mahmoud Adel"
+                    )
+                    
+                    wa_msg_student = emoji.emojize(
+                        f":bar_chart: درجة الـ {sel_title}\n\n"
+                        f"أهلاً بك يا {row['name']}،\n"
+                        f"لقد حصلت على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
+                        f"استمر في المذاكرة والتدريب، ونتمنى لك دوام التفوق والنجاح! :glowing_star:\n\n"
+                        f"Mathematics Team – Mahmoud Adel"
+                    )
+                
+                # If they DO NOT have a score, send the separated warning messages
+                else:
+                    if type_choice == "Homework":
+                        wa_msg_parent = emoji.emojize(
+                            f":bar_chart: درجة الـ homework\n\n"
+                            f"نحيط حضرتكم علمًا بأن\n"
+                            f"الطالب: {row['name']}\n"
+                            f"لم يقم بأداء : {sel_title}\n\n"
+                            f"برجاء الالتزام بحضور وأداء الواجبات في المواعيد المحددة، ومتابعة جميع التقييمات أولًا بأول.\n\n"
+                            f"Mathematics Team – Mahmoud Adel"
+                        )
+                        wa_msg_student = emoji.emojize(
+                            f":bell: تذكير بـ homework\n\n"
+                            f"أهلاً بك يا {row['name']}،\n"
+                            f"نذكرك بأنه لم يتم تسجيل أداءك في : {sel_title}\n\n"
+                            f"برجاء سرعة إتمام الواجب والالتزام بالمواعيد المحددة.\n\n"
+                            f"Mathematics Team – Mahmoud Adel"
+                        )
+                    else:
+                        wa_msg_parent = emoji.emojize(
+                            f":bar_chart: درجة الـ quiz\n\n"
+                            f"نحيط حضرتكم علمًا بأن\n"
+                            f"الطالب: {row['name']}\n"
+                            f"لم يقم بأداء : {sel_title}\n\n"
+                            f"برجاء الالتزام بحضور وأداء الاختبارات في المواعيد المحددة، ومتابعة جميع التقييمات أولًا بأول.\n\n"
+                            f"Mathematics Team – Mahmoud Adel"
+                        )
+                        wa_msg_student = emoji.emojize(
+                            f":bell: تذكير بـ quiz\n\n"
+                            f"أهلاً بك يا {row['name']}،\n"
+                            f"نذكرك بأنه لم يتم تسجيل أداءك في : {sel_title}\n\n"
+                            f"برجاء سرعة إتمام الاختبار والالتزام بالمواعيد المحددة.\n\n"
+                            f"Mathematics Team – Mahmoud Adel"
+                        )
 
-                wa_msg_parent = emoji.emojize(
-                    f":bar_chart: درجة الـ {sel_title}\n\n"
-                    f"ولي الأمر الكريم،\n"
-                    f"نحيط حضرتكم علمًا بأن الطالب {row['name']} حصل على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
-                    f"نتمنى له مزيدًا من التقدم والنجاح، ونسعى دائمًا لمتابعة مستوى الطالب بشكل مستمر وتحسين نقاط الضعف أولًا بأول. :glowing_star:\n\n"
-                    f"Mathematics Team – Mahmoud Adel"
-                )
                 encoded_msg_parent = urllib.parse.quote(wa_msg_parent)
-
-                wa_msg_student = emoji.emojize(
-                    f":bar_chart: درجة الـ {sel_title}\n\n"
-                    f"أهلاً بك يا {row['name']}،\n"
-                    f"لقد حصلت على {row['score']} / {total_q} في الـ {type_ar} الأخير.\n\n"
-                    f"استمر في المذاكرة والتدريب، ونتمنى لك دوام التفوق والنجاح! :glowing_star:\n\n"
-                    f"Mathematics Team – Mahmoud Adel"
-                )
                 encoded_msg_student = urllib.parse.quote(wa_msg_student)
-
+                
                 parent_num = clean_number(row["phone_parent"])
                 student_num = clean_number(row["phone"])
-
+                
                 sub1, sub2 = st.columns(2)
                 with sub1:
                     if parent_num:
                         st.link_button("👨‍👩‍👦 Parent", f"https://api.whatsapp.com/send?phone={parent_num}&text={encoded_msg_parent}", key=f"wa_p_{type_choice}_{row['id']}", use_container_width=True)
                     else:
                         st.button("👨‍👩‍👦 N/A", disabled=True, key=f"wa_p_na_{type_choice}_{row['id']}", use_container_width=True)
-
+                        
                 with sub2:
                     if student_num:
                         st.link_button("🎓 Student", f"https://api.whatsapp.com/send?phone={student_num}&text={encoded_msg_student}", key=f"wa_s_{type_choice}_{row['id']}", use_container_width=True)
                     else:
                         st.button("🎓 N/A", disabled=True, key=f"wa_s_na_{type_choice}_{row['id']}", use_container_width=True)
-
+            
+            
             st.divider()
 
 if __name__ == "__main__":
