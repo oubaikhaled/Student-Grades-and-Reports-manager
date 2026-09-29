@@ -71,7 +71,7 @@ class PDFGenerator:
         return buffer
 
     @classmethod
-    def generate_student_report(cls, student_name, homework_title, score, total_questions, percentage, report_text, image_bytes=None, video_link=None):
+     def generate_student_report(cls, student_name, homework_title, score, total_questions, percentage, report_text, image_bytes=None, video_link=None):
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
         styles, arabic_style = cls._get_base_styles()
