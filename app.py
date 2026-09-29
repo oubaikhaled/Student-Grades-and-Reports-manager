@@ -364,7 +364,8 @@ class GradePortalApp:
             pdf_data = [(r["id"], r["name"], r["correct_answers"] if pd.notna(r["correct_answers"]) else None,
                          (float(r["correct_answers"]) / total_q) * 100 if pd.notna(r["correct_answers"]) else None) for
                         _, r in filtered_df.iterrows()]
-            pdf_buf = PDFGenerator.generate_master_report(f"{sel_hw_title} ({filter_group})", total_q, pdf_data)
+            # Uses the cached version so it doesn't freeze the app on every click
+            pdf_buf = get_cached_master_report(sel_hw_title, filter_group, total_q, pdf_data)
             st.download_button("📄 Download Master PDF Report", data=pdf_buf, file_name=f"{sel_hw_title}_{filter_group}_Master.pdf".replace(' ', '_'), mime="application/pdf")
 
     def _admin_record_quizzes(self):
