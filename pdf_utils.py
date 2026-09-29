@@ -139,6 +139,7 @@ class PDFGenerator:
         buffer.seek(0)
         return buffer
 
+   
     @classmethod
     def generate_student_profile_report(cls, student_info, status_text, avg_display, hw_records, qz_records):
         buffer = io.BytesIO()
@@ -162,7 +163,21 @@ class PDFGenerator:
         
         elements.extend([
             Paragraph(info_html, arabic_style),
-            Spacer(1, 24),
+            Spacer(1, 16)
+        ])
+
+        # --- UPDATED: Render Teacher's Manual Notes ---
+        notes = student_info.get('notes', '')
+        if pd.notna(notes) and str(notes).strip():
+            formatted_notes = "<br/>".join([cls.fix_arabic(line) for line in str(notes).split('\n')])
+            elements.extend([
+                Paragraph("<b>Teacher's Improvement Plan & Notes:</b>", styles["Normal"]),
+                Spacer(1, 4),
+                Paragraph(formatted_notes, arabic_style),
+                Spacer(1, 16)
+            ])
+            
+        elements.extend([
             Paragraph("<b>Homework History</b>", styles["Heading2"]),
             Spacer(1, 8)
         ])
