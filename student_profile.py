@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+from pdf_utils import PDFGenerator
 
 class StudentProfileView:
     def __init__(self, db_manager):
@@ -84,6 +85,9 @@ class StudentProfileView:
             # Display Grades Dataframes
             col_hw, col_qz = st.columns(2)
             
+            hw_records = []
+            qz_records = []
+
             with col_hw:
                 st.subheader("📚 Homework History")
                 hw_df = self.db.fetch_dataframe("""
@@ -99,6 +103,7 @@ class StudentProfileView:
                 else:
                     hw_df["Percentage"] = hw_df["Percentage"].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
                     st.dataframe(hw_df, hide_index=True, use_container_width=True)
+                    hw_records = hw_df.to_dict('records')
 
             with col_qz:
                 st.subheader("📝 Quiz History")
@@ -108,3 +113,23 @@ class StudentProfileView:
                     qz_display = qz_df.rename(columns={"title": "Quiz", "score": "Score", "max_score": "Out Of", "percentage": "Percentage"})
                     qz_display["Percentage"] = qz_display["Percentage"].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
                     st.dataframe(qz_display, hide_index=True, use_container_width=True)
+                    qz_records = qz_display.to_dict('records')
+
+            # PDF Download Generation
+            st.divider()
+            col_b1, col_b2, col_b3 = st.columns([1, 2, 1])
+            with col_b2:
+                pdf_buf = PDFGenerator.generate_student_profile_report(
+                    student_info=student_info.to_dict(),
+                    status_text=status,
+                    avg_display=avg_display,
+                    hw_records=hw_records,
+                    qz_records=qz_records
+                )
+                st.download_button(
+                    label="📄 Download Full Student Profile (PDF)",
+                    data=pdf_buf,
+                    file_name=f"{student_info['name']}_Profile.pdf".replace(" ", "_"),
+                    mime="application/pdf",
+                    use_container_width=True
+                )
