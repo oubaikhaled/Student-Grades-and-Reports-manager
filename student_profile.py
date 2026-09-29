@@ -5,19 +5,29 @@ from pdf_utils import PDFGenerator
 class StudentProfileView:
     def __init__(self, db_manager):
         self.db = db_manager
+        self._ensure_notes_column()
+
+    def _ensure_notes_column(self):
+        # Safely add the 'notes' column to the students table if it doesn't exist yet
+        try:
+            with self.db.get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("ALTER TABLE students ADD COLUMN notes TEXT")
+                conn.commit()
+        except Exception:
+            pass # Column already exists, safe to ignore
 
     def render(self):
         st.subheader("👤 Student Profiles")
-        st.caption("Search for a student to view their complete profile, overall status, analytical trends, and grade history.")
+        st.caption("Search for a student to view their complete profile, overall status, performance timelines, and teacher notes.")
 
-        # Fetch all students for the search dropdown
-        students_df = self.db.fetch_dataframe("SELECT id, name, phone, phone_parent, group_number FROM students ORDER BY name ASC")
+        # Fetch all students including the new notes column
+        students_df = self.db.fetch_dataframe("SELECT id, name, phone, phone_parent, group_number, notes FROM students ORDER BY name ASC")
         
         if students_df.empty:
             st.info("No students registered yet.")
             return
 
-        # Search bar
         search_term = st.text_input("🔍 Search Student by Name or ID", placeholder="Type to filter...").strip()
         
         if search_term:
@@ -40,7 +50,6 @@ class StudentProfileView:
             stu_id = selected_label.split("(ID: ")[1].replace(")", "")
             student_info = students_df[students_df['id'] == stu_id].iloc[0]
 
-            # Fetch data in ASCENDING order (Oldest -> Newest) to build a chronological sequence
             hw_df = self.db.fetch_dataframe("""
                 SELECT h.title as "Homework", hg.correct_answers as "Score", h.total_questions as "Out Of", hg.percentage as "Percentage"
                 FROM homework_grades hg
@@ -57,7 +66,6 @@ class StudentProfileView:
                 ORDER BY q.quiz_id ASC
             """, (stu_id,))
 
-            # --- 1. Status Calculation ---
             if not qz_df.empty and not qz_df['Percentage'].isna().all():
                 avg_quiz_perc = qz_df['Percentage'].mean()
                 if avg_quiz_perc >= 85:
@@ -77,7 +85,6 @@ class StudentProfileView:
 
             st.divider()
 
-            # --- 2. Display Profile Header ---
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.markdown(f"### {student_info['name']}")
@@ -89,61 +96,49 @@ class StudentProfileView:
 
             st.divider()
 
-            # --- 3. Independent Analytics Processing ---
             weaknesses = []
-            
             hw_chart_data = []
-            hw_percs = []
             if not hw_df.empty:
                 for row in hw_df.to_dict('records'):
                     perc = row['Percentage']
                     if pd.notna(perc):
                         hw_chart_data.append({"Assignment": row['Homework'], "Score": perc})
-                        hw_percs.append(perc)
-                        if perc < 70:
-                            weaknesses.append({"Topic": f"{row['Homework']} (HW)", "Percentage": perc})
+                        if perc < 70: weaknesses.append({"Topic": f"{row['Homework']} (HW)", "Percentage": perc})
 
             qz_chart_data = []
-            qz_percs = []
             if not qz_df.empty:
                 for row in qz_df.to_dict('records'):
                     perc = row['Percentage']
                     if pd.notna(perc):
                         qz_chart_data.append({"Assignment": row['Quiz'], "Score": perc})
-                        qz_percs.append(perc)
-                        if perc < 70:
-                            weaknesses.append({"Topic": f"{row['Quiz']} (Quiz)", "Percentage": perc})
+                        if perc < 70: weaknesses.append({"Topic": f"{row['Quiz']} (Quiz)", "Percentage": perc})
 
-            # --- 4. Independent Performance Graphs ---
             st.subheader("📈 Performance Timelines")
             col_g1, col_g2 = st.columns(2)
             
             with col_g1:
                 st.markdown("**Homework Trajectory**")
                 if hw_chart_data:
-                    hw_cdf = pd.DataFrame(hw_chart_data).set_index("Assignment")
-                    st.line_chart(hw_cdf, color="#1f77b4") # Blue
+                    st.line_chart(pd.DataFrame(hw_chart_data).set_index("Assignment"), color="#1f77b4")
                 else:
                     st.info("Not enough homework data to plot.")
                     
             with col_g2:
                 st.markdown("**Quiz Trajectory**")
                 if qz_chart_data:
-                    qz_cdf = pd.DataFrame(qz_chart_data).set_index("Assignment")
-                    st.line_chart(qz_cdf, color="#ff7f0e") # Orange
+                    st.line_chart(pd.DataFrame(qz_chart_data).set_index("Assignment"), color="#ff7f0e")
                 else:
                     st.info("Not enough quiz data to plot.")
 
             st.divider()
 
-            # --- 5. Automated Analytics Section ---
+            # --- UPDATED: Focus Areas and Manual Teacher Notes ---
             col_w, col_t = st.columns(2)
             
             with col_w:
                 st.subheader("🎯 Priority Focus Areas")
                 st.caption("Top 3 weakest topics (Below 70%)")
                 if weaknesses:
-                    # Sort ascending to isolate the absolute lowest scores
                     weaknesses = sorted(weaknesses, key=lambda x: x['Percentage'])
                     for w in weaknesses[:3]:
                         st.error(f"**{w['Topic']}**: {w['Percentage']:.1f}%")
@@ -151,37 +146,26 @@ class StudentProfileView:
                     st.success("No critical weaknesses detected! All assignments are at 70% or above.")
 
             with col_t:
-                st.subheader("🤖 Automated Trend Analysis")
-                hw_avg = hw_df['Percentage'].mean() if not hw_df.empty else 0
-                qz_avg = qz_df['Percentage'].mean() if not qz_df.empty else 0
+                st.subheader("✍️ Teacher's Improvement Plan")
+                current_notes = student_info.get('notes', '')
+                if pd.isna(current_notes): current_notes = ''
                 
-                trend_notes = []
-                
-                # Check for HW vs Quiz gap
-                if hw_avg >= 85 and qz_avg < 70:
-                    trend_notes.append("⚠️ **Practice vs. Test Gap:** High homework completion but quiz performance is struggling. Focus on time-management and independent testing.")
-                
-                # Quiz Momentum detection (More heavily weighted than HW momentum)
-                if len(qz_percs) >= 4:
-                    overall_qz_avg = sum(qz_percs) / len(qz_percs)
-                    recent_qz_avg = sum(qz_percs[-2:]) / 2  # Average of the last 2 quizzes
-                    
-                    if recent_qz_avg < overall_qz_avg - 12:
-                        trend_notes.append("📉 **Quiz Downward Trend:** Recent exam scores have dropped significantly compared to the student's historical average.")
-                    elif recent_qz_avg > overall_qz_avg + 12:
-                        trend_notes.append("📈 **Quiz Upward Trend:** Excellent momentum! Recent exam scores are well above the student's historical baseline.")
-                        
-                if not trend_notes:
-                    trend_notes.append("✅ **Consistent Performance:** The student is maintaining a steady learning trajectory based on current data.")
-                    
-                for note in trend_notes:
-                    st.info(note)
+                with st.form("teacher_notes_form"):
+                    new_notes = st.text_area("Write actionable advice, goals, or notes for this student:", value=current_notes, height=125)
+                    if st.form_submit_button("💾 Save Notes", type="primary"):
+                        try:
+                            with self.db.get_connection() as conn:
+                                with conn.cursor() as c:
+                                    c.execute("UPDATE students SET notes = %s WHERE id = %s", (new_notes.strip(), stu_id))
+                                conn.commit()
+                            st.success("Notes saved successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to save notes: {e}")
 
             st.divider()
 
-            # --- 6. Detailed Tables (Reversed for Newest-First View) ---
             col_hw_tbl, col_qz_tbl = st.columns(2)
-            
             hw_records_desc = hw_df.iloc[::-1].to_dict('records') if not hw_df.empty else []
             qz_records_desc = qz_df.iloc[::-1].to_dict('records') if not qz_df.empty else []
 
@@ -203,7 +187,6 @@ class StudentProfileView:
                     qz_disp["Percentage"] = qz_disp["Percentage"].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
                     st.dataframe(qz_disp, hide_index=True, use_container_width=True)
 
-            # --- 7. PDF Download ---
             st.divider()
             col_b1, col_b2, col_b3 = st.columns([1, 2, 1])
             with col_b2:
