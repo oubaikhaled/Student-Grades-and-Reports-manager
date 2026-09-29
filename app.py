@@ -692,33 +692,33 @@ class GradePortalApp:
                 else:
                     if type_choice == "Homework":
                         wa_msg_parent = emoji.emojize(
-                            f":bar_chart: درجة الـ homework\n\n"
+                            f":bar_chart: homework\n\n"
                             f"نحيط حضرتكم علمًا بأن\n"
                             f"الطالب: {row['name']}\n"
-                            f"لم يقم بأداء : {sel_title}\n\n"
+                            f"لم يقم بأداء واجب  : {sel_title}\n\n"
                             f"برجاء الالتزام بحضور وأداء الواجبات في المواعيد المحددة، ومتابعة جميع التقييمات أولًا بأول.\n\n"
                             f"Mathematics Team – Mahmoud Adel"
                         )
                         wa_msg_student = emoji.emojize(
                             f":bell: تذكير بـ homework\n\n"
                             f"أهلاً بك يا {row['name']}،\n"
-                            f"نذكرك بأنه لم يتم تسجيل أداءك في : {sel_title}\n\n"
+                            f"نذكرك بأنه لم يتم تسجيل أداءك في واجب : {sel_title}\n\n"
                             f"برجاء سرعة إتمام الواجب والالتزام بالمواعيد المحددة.\n\n"
                             f"Mathematics Team – Mahmoud Adel"
                         )
                     else:
                         wa_msg_parent = emoji.emojize(
-                            f":bar_chart: درجة الـ quiz\n\n"
+                            f":bar_chart:  quiz\n\n"
                             f"نحيط حضرتكم علمًا بأن\n"
                             f"الطالب: {row['name']}\n"
-                            f"لم يقم بأداء : {sel_title}\n\n"
+                            f"لم يقم بأداء امتحان : {sel_title}\n\n"
                             f"برجاء الالتزام بحضور وأداء الاختبارات في المواعيد المحددة، ومتابعة جميع التقييمات أولًا بأول.\n\n"
                             f"Mathematics Team – Mahmoud Adel"
                         )
                         wa_msg_student = emoji.emojize(
                             f":bell: تذكير بـ quiz\n\n"
                             f"أهلاً بك يا {row['name']}،\n"
-                            f"نذكرك بأنه لم يتم تسجيل أداءك في : {sel_title}\n\n"
+                            f"نذكرك بأنه لم يتم تسجيل أداءك في كويز : {sel_title}\n\n"
                             f"برجاء سرعة إتمام الاختبار والالتزام بالمواعيد المحددة.\n\n"
                             f"Mathematics Team – Mahmoud Adel"
                         )
