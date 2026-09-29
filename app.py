@@ -769,7 +769,7 @@ def _stitch_images(self, uploaded_files):
                 conn.commit()
             st.rerun()
 
-    @st.dialog("📝 Grade Quiz")
+        @st.dialog("📝 Grade Quiz")
     def _qz_grading_dialog(self, student_name, student_id, q_id, q_max, current_score, current_report):
         st.write(f"Student: **{student_name}** (ID: {student_id})")
         
