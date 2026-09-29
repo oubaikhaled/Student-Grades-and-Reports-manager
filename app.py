@@ -121,8 +121,8 @@ class GradePortalApp:
         st.sidebar.button("🚪 Logout", on_click=self.auth.logout, type="primary")
         st.title("📚 Homework & Grade Manager")
         menu = st.sidebar.radio("Navigation",
-                                ["Manage Homeworks", "Record Quiz Grades", 
-                                 "Manage Students", "Student Profiles", "WhatsApp Parents"])
+                                ["Manage Homeworks", "Manage Quizzes", 
+                                 "Manage Students", "Student Profiles", "WhatsApp Students and parents"])
 
         if menu == "Manage Homeworks":
             self._admin_manage_homeworks()
