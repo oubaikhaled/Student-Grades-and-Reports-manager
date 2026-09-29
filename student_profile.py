@@ -89,43 +89,50 @@ class StudentProfileView:
 
             st.divider()
 
-            # --- 3. Chronological Mapping & Analytics Processing ---
-            hws = hw_df.to_dict('records') if not hw_df.empty else []
-            qzs = qz_df.to_dict('records') if not qz_df.empty else []
-            
-            max_len = max(len(hws), len(qzs))
-            paired_data = []
+            # --- 3. Independent Analytics Processing ---
             weaknesses = []
-            all_percs = []
             
-            for i in range(max_len):
-                hw = hws[i] if i < len(hws) else None
-                qz = qzs[i] if i < len(qzs) else None
-                
-                # Assume homework title holds the core lesson name; fallback to quiz title
-                lesson_name = hw['Homework'] if hw else (qz['Quiz'] if qz else f"Sequence {i+1}")
-                hw_perc = hw['Percentage'] if hw else None
-                qz_perc = qz['Percentage'] if qz else None
-                
-                paired_data.append({"Lesson": lesson_name, "Homework": hw_perc, "Quiz": qz_perc})
-                
-                # Gather weaknesses and trends
-                if hw and pd.notna(hw_perc):
-                    all_percs.append(hw_perc)
-                    if hw_perc < 70:
-                        weaknesses.append({"Topic": f"{lesson_name} (HW)", "Percentage": hw_perc})
-                if qz and pd.notna(qz_perc):
-                    all_percs.append(qz_perc)
-                    if qz_perc < 70:
-                        weaknesses.append({"Topic": f"{lesson_name} (Quiz)", "Percentage": qz_perc})
+            hw_chart_data = []
+            hw_percs = []
+            if not hw_df.empty:
+                for row in hw_df.to_dict('records'):
+                    perc = row['Percentage']
+                    if pd.notna(perc):
+                        hw_chart_data.append({"Assignment": row['Homework'], "Score": perc})
+                        hw_percs.append(perc)
+                        if perc < 70:
+                            weaknesses.append({"Topic": f"{row['Homework']} (HW)", "Percentage": perc})
 
-            # --- 4. Unified Progress Graph ---
-            st.subheader("📈 Unified Performance Timeline")
-            if paired_data:
-                chart_df = pd.DataFrame(paired_data).set_index("Lesson")
-                st.line_chart(chart_df[['Homework', 'Quiz']])
-            else:
-                st.info("Not enough data to plot a timeline yet.")
+            qz_chart_data = []
+            qz_percs = []
+            if not qz_df.empty:
+                for row in qz_df.to_dict('records'):
+                    perc = row['Percentage']
+                    if pd.notna(perc):
+                        qz_chart_data.append({"Assignment": row['Quiz'], "Score": perc})
+                        qz_percs.append(perc)
+                        if perc < 70:
+                            weaknesses.append({"Topic": f"{row['Quiz']} (Quiz)", "Percentage": perc})
+
+            # --- 4. Independent Performance Graphs ---
+            st.subheader("📈 Performance Timelines")
+            col_g1, col_g2 = st.columns(2)
+            
+            with col_g1:
+                st.markdown("**Homework Trajectory**")
+                if hw_chart_data:
+                    hw_cdf = pd.DataFrame(hw_chart_data).set_index("Assignment")
+                    st.line_chart(hw_cdf, color="#1f77b4") # Blue
+                else:
+                    st.info("Not enough homework data to plot.")
+                    
+            with col_g2:
+                st.markdown("**Quiz Trajectory**")
+                if qz_chart_data:
+                    qz_cdf = pd.DataFrame(qz_chart_data).set_index("Assignment")
+                    st.line_chart(qz_cdf, color="#ff7f0e") # Orange
+                else:
+                    st.info("Not enough quiz data to plot.")
 
             st.divider()
 
@@ -152,20 +159,20 @@ class StudentProfileView:
                 
                 # Check for HW vs Quiz gap
                 if hw_avg >= 85 and qz_avg < 70:
-                    trend_notes.append("⚠️ **Practice vs. Test Gap:** High homework completion but quiz performance is struggling. Focus on time-management and solving problems completely independently.")
+                    trend_notes.append("⚠️ **Practice vs. Test Gap:** High homework completion but quiz performance is struggling. Focus on time-management and independent testing.")
                 
-                # Momentum detection
-                if len(all_percs) >= 5:
-                    overall_avg = sum(all_percs) / len(all_percs)
-                    recent_avg = sum(all_percs[-3:]) / 3  # Average of the last 3 assignments recorded
+                # Quiz Momentum detection (More heavily weighted than HW momentum)
+                if len(qz_percs) >= 4:
+                    overall_qz_avg = sum(qz_percs) / len(qz_percs)
+                    recent_qz_avg = sum(qz_percs[-2:]) / 2  # Average of the last 2 quizzes
                     
-                    if recent_avg < overall_avg - 10:
-                        trend_notes.append("📉 **Recent Downward Trend:** A drop in recent scores was detected. Please review the material from the last few lessons immediately.")
-                    elif recent_avg > overall_avg + 10:
-                        trend_notes.append("📈 **Recent Upward Trend:** Great job! Recent scores show strong momentum and improvement.")
+                    if recent_qz_avg < overall_qz_avg - 12:
+                        trend_notes.append("📉 **Quiz Downward Trend:** Recent exam scores have dropped significantly compared to the student's historical average.")
+                    elif recent_qz_avg > overall_qz_avg + 12:
+                        trend_notes.append("📈 **Quiz Upward Trend:** Excellent momentum! Recent exam scores are well above the student's historical baseline.")
                         
                 if not trend_notes:
-                    trend_notes.append("✅ **Consistent Performance:** The student is maintaining a steady trajectory based on current data.")
+                    trend_notes.append("✅ **Consistent Performance:** The student is maintaining a steady learning trajectory based on current data.")
                     
                 for note in trend_notes:
                     st.info(note)
