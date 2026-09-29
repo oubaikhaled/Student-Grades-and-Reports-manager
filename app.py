@@ -9,7 +9,10 @@ from auth import AuthManager
 import emoji
 from student_profile import StudentProfileView
 
+# 1. Page Config MUST be the very first command
 st.set_page_config(page_title="Eng.Mahmoud Adel Grade Portal", layout="wide")
+
+# 2. Cached Master Report Function
 @st.cache_data(show_spinner=False)
 def get_cached_master_report(title, group, total, pdf_data):
     return PDFGenerator.generate_master_report(f"{title} ({group})", total, pdf_data)
@@ -81,21 +84,27 @@ class GradePortalApp:
                                  use_container_width=True)
 
                     st.markdown("**📄 Download Feedback Report**")
-                    sel_hw = st.selectbox("Select Assignment", hw_df["Assignment"].tolist(), key=f"dl_{student['id']}")
+                    sel_hw = st.selectbox("Select Assignment", hw_df["Assignment"].tolist(), key=f"sel_hw_{student['id']}")
                     if sel_hw:
                         row = hw_df[hw_df["Assignment"] == sel_hw].iloc[0]
-                        img_bytes = bytes(row["Image"]) if pd.notna(row.get("Image")) and row["Image"] else None
-
-                        pdf_buf = PDFGenerator.generate_student_report(
-                            student["name"], sel_hw, row["Score"], row["Out Of"],
-                            row["Percentage"], row["Report"], img_bytes
-                        )
-
-                        st.download_button(
-                            label=f"Download {sel_hw} Report", data=pdf_buf,
-                            file_name=f"{student['name']}_{sel_hw}_Report.pdf".replace(" ", "_"),
-                            mime="application/pdf", key=f"btn_{student['id']}", use_container_width=True
-                        )
+                        gen_key = f"gen_hw_{student['id']}_{sel_hw}"
+                        
+                        # Lazy Loading PDF
+                        if not st.session_state.get(gen_key):
+                            if st.button("📄 Prepare PDF Report", key=f"btn_{gen_key}", use_container_width=True):
+                                st.session_state[gen_key] = True
+                                st.rerun()
+                        else:
+                            img_bytes = bytes(row["Image"]) if pd.notna(row.get("Image")) and row["Image"] else None
+                            pdf_buf = PDFGenerator.generate_student_report(
+                                student["name"], sel_hw, row["Score"], row["Out Of"],
+                                row["Percentage"], row["Report"], img_bytes
+                            )
+                            st.download_button(
+                                label=f"⬇️ Download {sel_hw} Report", data=pdf_buf,
+                                file_name=f"{student['name']}_{sel_hw}_Report.pdf".replace(" ", "_"),
+                                mime="application/pdf", key=f"dl_btn_{gen_key}", use_container_width=True
+                            )
 
             with col2:
                 st.markdown("**Quiz Scores**")
@@ -105,21 +114,27 @@ class GradePortalApp:
                     st.dataframe(qz_df[["Quiz", "Score", "Out Of", "Percentage"]], hide_index=True, use_container_width=True)
 
                     st.markdown("**📄 Download Feedback Report**")
-                    sel_qz = st.selectbox("Select Quiz", qz_df["Quiz"].tolist(), key=f"dl_qz_{student['id']}")
+                    sel_qz = st.selectbox("Select Quiz", qz_df["Quiz"].tolist(), key=f"sel_qz_{student['id']}")
                     if sel_qz:
                         row_qz = qz_df[qz_df["Quiz"] == sel_qz].iloc[0]
-                        img_bytes_qz = bytes(row_qz["Image"]) if pd.notna(row_qz.get("Image")) and row_qz["Image"] else None
-
-                        pdf_buf_qz = PDFGenerator.generate_student_report(
-                            student["name"], sel_qz, row_qz["Score"], row_qz["Out Of"],
-                            row_qz["Percentage"], row_qz["Report"], img_bytes_qz
-                        )
-
-                        st.download_button(
-                            label=f"Download {sel_qz} Report", data=pdf_buf_qz,
-                            file_name=f"{student['name']}_{sel_qz}_Report.pdf".replace(" ", "_"),
-                            mime="application/pdf", key=f"btn_qz_{student['id']}", use_container_width=True
-                        )
+                        gen_key_qz = f"gen_qz_{student['id']}_{sel_qz}"
+                        
+                        # Lazy Loading PDF
+                        if not st.session_state.get(gen_key_qz):
+                            if st.button("📄 Prepare PDF Report", key=f"btn_{gen_key_qz}", use_container_width=True):
+                                st.session_state[gen_key_qz] = True
+                                st.rerun()
+                        else:
+                            img_bytes_qz = bytes(row_qz["Image"]) if pd.notna(row_qz.get("Image")) and row_qz["Image"] else None
+                            pdf_buf_qz = PDFGenerator.generate_student_report(
+                                student["name"], sel_qz, row_qz["Score"], row_qz["Out Of"],
+                                row_qz["Percentage"], row_qz["Report"], img_bytes_qz
+                            )
+                            st.download_button(
+                                label=f"⬇️ Download {sel_qz} Report", data=pdf_buf_qz,
+                                file_name=f"{student['name']}_{sel_qz}_Report.pdf".replace(" ", "_"),
+                                mime="application/pdf", key=f"dl_btn_{gen_key_qz}", use_container_width=True
+                            )
             st.divider()
 
     def _render_admin_portal(self):
@@ -278,6 +293,7 @@ class GradePortalApp:
 
             if filtered_df.empty:
                 st.warning("No students found matching your filters.")
+                # We return here so we don't proceed to draw tables for empty results
                 return
 
             # --- THE "ADDING PAGE" PANEL (Hidden until a button is clicked) ---
@@ -286,50 +302,57 @@ class GradePortalApp:
 
             if st.session_state.active_hw_student:
                 stu_id = st.session_state.active_hw_student
-                stu_data = filtered_df[filtered_df['id'] == stu_id].iloc[0]
                 
-                st.markdown(f"### 📝 Grading Panel: {stu_data['name']} (ID: {stu_id})")
-                with st.container(border=True):
-                    st.info(f"🎯 **Full Mark for this Assignment:** {total_q}")
+                # --- SAFETY CHECK: Prevent the IndexError crash ---
+                target_stu = filtered_df[filtered_df['id'] == stu_id]
+                if target_stu.empty:
+                    st.session_state.active_hw_student = None
+                    st.rerun()
+                else:
+                    stu_data = target_stu.iloc[0]
                     
-                    with st.form(f"hw_grade_form_{stu_id}"):
-                        current_score = stu_data['correct_answers']
-                        current_report = stu_data['report']
+                    st.markdown(f"### 📝 Grading Panel: {stu_data['name']} (ID: {stu_id})")
+                    with st.container(border=True):
+                        st.info(f"🎯 **Full Mark for this Assignment:** {total_q}")
                         
-                        score = st.number_input("Correct Answers", min_value=0, max_value=int(total_q), value=int(current_score) if pd.notna(current_score) else 0, step=1)
-                        report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
-                        uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-                        
-                        col_save, col_cancel = st.columns([3, 1])
-                        if col_save.form_submit_button("💾 Save Grade", type="primary"):
-                            img_bytes = self._stitch_images(uploaded_files)
-                            perc = (float(score) / float(total_q)) * 100.0
+                        with st.form(f"hw_grade_form_{stu_id}"):
+                            current_score = stu_data['correct_answers']
+                            current_report = stu_data['report']
                             
-                            with self.db.get_connection() as conn:
-                                with conn.cursor() as c:
-                                    if img_bytes:
-                                        c.execute("""
-                                            INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report, report_image)
-                                            VALUES (%s, %s, %s, %s, %s, %s)
-                                            ON CONFLICT (homework_id, student_id) 
-                                            DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
-                                        """, (hw_id, str(stu_id), score, perc, report, psycopg2.Binary(img_bytes)))
-                                    else:
-                                        c.execute("""
-                                            INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report)
-                                            VALUES (%s, %s, %s, %s, %s)
-                                            ON CONFLICT (homework_id, student_id) 
-                                            DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report
-                                        """, (hw_id, str(stu_id), score, perc, report))
-                                conn.commit()
-                            st.session_state.active_hw_student = None
-                            st.success(f"Grade saved for {stu_data['name']}!")
-                            st.rerun()
+                            score = st.number_input("Correct Answers", min_value=0, max_value=int(total_q), value=int(current_score) if pd.notna(current_score) else 0, step=1)
+                            report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
+                            uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
                             
-                        if col_cancel.form_submit_button("❌ Cancel"):
-                            st.session_state.active_hw_student = None
-                            st.rerun()
-                st.divider()
+                            col_save, col_cancel = st.columns([3, 1])
+                            if col_save.form_submit_button("💾 Save Grade", type="primary"):
+                                img_bytes = self._stitch_images(uploaded_files)
+                                perc = (float(score) / float(total_q)) * 100.0
+                                
+                                with self.db.get_connection() as conn:
+                                    with conn.cursor() as c:
+                                        if img_bytes:
+                                            c.execute("""
+                                                INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report, report_image)
+                                                VALUES (%s, %s, %s, %s, %s, %s)
+                                                ON CONFLICT (homework_id, student_id) 
+                                                DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
+                                            """, (hw_id, str(stu_id), score, perc, report, psycopg2.Binary(img_bytes)))
+                                        else:
+                                            c.execute("""
+                                                INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report)
+                                                VALUES (%s, %s, %s, %s, %s)
+                                                ON CONFLICT (homework_id, student_id) 
+                                                DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report
+                                            """, (hw_id, str(stu_id), score, perc, report))
+                                    conn.commit()
+                                st.session_state.active_hw_student = None
+                                st.success(f"Grade saved for {stu_data['name']}!")
+                                st.rerun()
+                                
+                            if col_cancel.form_submit_button("❌ Cancel"):
+                                st.session_state.active_hw_student = None
+                                st.rerun()
+                    st.divider()
 
             # --- THE TABLE UI ---
             st.markdown("### 📋 Class Roster")
@@ -358,12 +381,18 @@ class GradePortalApp:
 
             st.divider()
             
-            pdf_data = [(r["id"], r["name"], r["correct_answers"] if pd.notna(r["correct_answers"]) else None,
-                         (float(r["correct_answers"]) / total_q) * 100 if pd.notna(r["correct_answers"]) else None) for
-                        _, r in filtered_df.iterrows()]
-            # Uses the cached version so it doesn't freeze the app on every click
-            pdf_buf = get_cached_master_report(sel_hw_title, filter_group, total_q, pdf_data)
-            st.download_button("📄 Download Master PDF Report", data=pdf_buf, file_name=f"{sel_hw_title}_{filter_group}_Master.pdf".replace(' ', '_'), mime="application/pdf")
+            # --- LAZY PDF MASTER REPORT ---
+            master_key = f"gen_master_hw_{hw_id}_{filter_group}"
+            if not st.session_state.get(master_key):
+                if st.button("📄 Prepare Master PDF Report", key=f"btn_{master_key}"):
+                    st.session_state[master_key] = True
+                    st.rerun()
+            else:
+                pdf_data = [(r["id"], r["name"], r["correct_answers"] if pd.notna(r["correct_answers"]) else None,
+                             (float(r["correct_answers"]) / total_q) * 100 if pd.notna(r["correct_answers"]) else None) for
+                            _, r in filtered_df.iterrows()]
+                pdf_buf = get_cached_master_report(sel_hw_title, filter_group, total_q, pdf_data)
+                st.download_button("⬇️ Download Master PDF Report", data=pdf_buf, file_name=f"{sel_hw_title}_{filter_group}_Master.pdf".replace(' ', '_'), mime="application/pdf")
 
     def _admin_record_quizzes(self):
         st.subheader("📝 Manage Curriculum & Quizzes")
@@ -458,50 +487,57 @@ class GradePortalApp:
 
         if st.session_state.active_qz_student:
             stu_id = st.session_state.active_qz_student
-            stu_data = filtered_df[filtered_df['id'] == stu_id].iloc[0]
             
-            st.markdown(f"### 📝 Grading Panel: {stu_data['name']} (ID: {stu_id})")
-            with st.container(border=True):
-                st.info(f"🎯 **Full Mark for this Quiz:** {q_max}")
+            # --- SAFETY CHECK: Prevent the IndexError crash ---
+            target_stu = filtered_df[filtered_df['id'] == stu_id]
+            if target_stu.empty:
+                st.session_state.active_qz_student = None
+                st.rerun()
+            else:
+                stu_data = target_stu.iloc[0]
                 
-                with st.form(f"qz_grade_form_{stu_id}"):
-                    current_score = stu_data['score']
-                    current_report = stu_data['report']
+                st.markdown(f"### 📝 Grading Panel: {stu_data['name']} (ID: {stu_id})")
+                with st.container(border=True):
+                    st.info(f"🎯 **Full Mark for this Quiz:** {q_max}")
                     
-                    score = st.number_input("Final Score", min_value=0.0, max_value=float(q_max), value=float(current_score) if pd.notna(current_score) else 0.0, step=0.5)
-                    report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
-                    uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="qz_files")
-                    
-                    col_save, col_cancel = st.columns([3, 1])
-                    if col_save.form_submit_button("💾 Save Grade", type="primary"):
-                        img_bytes = self._stitch_images(uploaded_files)
-                        perc = (float(score) / float(q_max)) * 100.0 if q_max > 0 else 0
+                    with st.form(f"qz_grade_form_{stu_id}"):
+                        current_score = stu_data['score']
+                        current_report = stu_data['report']
                         
-                        with self.db.get_connection() as conn:
-                            with conn.cursor() as c:
-                                if img_bytes:
-                                    c.execute("""
-                                        INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report, report_image)
-                                        VALUES (%s, %s, %s, %s, %s, %s)
-                                        ON CONFLICT (quiz_id, student_id) 
-                                        DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
-                                    """, (q_id, str(stu_id), score, perc, report, psycopg2.Binary(img_bytes)))
-                                else:
-                                    c.execute("""
-                                        INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report)
-                                        VALUES (%s, %s, %s, %s, %s)
-                                        ON CONFLICT (quiz_id, student_id) 
-                                        DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
-                                    """, (q_id, str(stu_id), score, perc, report))
-                            conn.commit()
-                        st.session_state.active_qz_student = None
-                        st.success(f"Grade saved for {stu_data['name']}!")
-                        st.rerun()
+                        score = st.number_input("Final Score", min_value=0.0, max_value=float(q_max), value=float(current_score) if pd.notna(current_score) else 0.0, step=0.5)
+                        report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
+                        uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="qz_files")
                         
-                    if col_cancel.form_submit_button("❌ Cancel"):
-                        st.session_state.active_qz_student = None
-                        st.rerun()
-            st.divider()
+                        col_save, col_cancel = st.columns([3, 1])
+                        if col_save.form_submit_button("💾 Save Grade", type="primary"):
+                            img_bytes = self._stitch_images(uploaded_files)
+                            perc = (float(score) / float(q_max)) * 100.0 if q_max > 0 else 0
+                            
+                            with self.db.get_connection() as conn:
+                                with conn.cursor() as c:
+                                    if img_bytes:
+                                        c.execute("""
+                                            INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report, report_image)
+                                            VALUES (%s, %s, %s, %s, %s, %s)
+                                            ON CONFLICT (quiz_id, student_id) 
+                                            DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
+                                        """, (q_id, str(stu_id), score, perc, report, psycopg2.Binary(img_bytes)))
+                                    else:
+                                        c.execute("""
+                                            INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report)
+                                            VALUES (%s, %s, %s, %s, %s)
+                                            ON CONFLICT (quiz_id, student_id) 
+                                            DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
+                                        """, (q_id, str(stu_id), score, perc, report))
+                                conn.commit()
+                            st.session_state.active_qz_student = None
+                            st.success(f"Grade saved for {stu_data['name']}!")
+                            st.rerun()
+                            
+                        if col_cancel.form_submit_button("❌ Cancel"):
+                            st.session_state.active_qz_student = None
+                            st.rerun()
+                st.divider()
 
         # --- THE TABLE UI ---
         st.markdown("### 📋 Class Roster")
@@ -530,11 +566,20 @@ class GradePortalApp:
 
         st.divider()
         
-        pdf_data = [(r["id"], r["name"], r["score"] if pd.notna(r["score"]) else None,
-                     (float(r["score"]) / q_max) * 100 if pd.notna(r["score"]) else None) for
-                    _, r in filtered_df.iterrows()]
-        pdf_buf = PDFGenerator.generate_master_report(f"{sel_q} ({filter_group})", q_max, pdf_data)
-        st.download_button("📄 Download Master PDF Report", data=pdf_buf, file_name=f"{sel_q}_{filter_group}_Master.pdf".replace(' ', '_'), mime="application/pdf")
+        # --- LAZY PDF MASTER REPORT ---
+        master_key = f"gen_master_qz_{q_id}_{filter_group}"
+        if not st.session_state.get(master_key):
+            if st.button("📄 Prepare Master PDF Report", key=f"btn_{master_key}"):
+                st.session_state[master_key] = True
+                st.rerun()
+        else:
+            pdf_data = [(r["id"], r["name"], r["score"] if pd.notna(r["score"]) else None,
+                         (float(r["score"]) / q_max) * 100 if pd.notna(r["score"]) else None) for
+                        _, r in filtered_df.iterrows()]
+            pdf_buf = get_cached_master_report(sel_q, filter_group, q_max, pdf_data)
+            st.download_button("⬇️ Download Master PDF Report", data=pdf_buf, file_name=f"{sel_q}_{filter_group}_Master.pdf".replace(' ', '_'), mime="application/pdf")
+
+
     def _admin_manage_students(self):
         st.subheader("👥 Manage Students")
 
@@ -755,21 +800,28 @@ class GradePortalApp:
             
             with col3:
                 if has_score:
-                    img_bytes = bytes(row["report_image"]) if pd.notna(row.get("report_image")) and row["report_image"] else None
-                    pdf_buf = PDFGenerator.generate_student_report(
-                        row["name"], sel_title, row["score"], total_q, 
-                        row["percentage"], row.get("report"), img_bytes,
-                        video_link=vid_link
-                    )
-                        
-                    st.download_button(
-                        label="📄 Download", 
-                        data=pdf_buf,
-                        file_name=f"{row['name']}_{sel_title}.pdf".replace(" ", "_"),
-                        mime="application/pdf", 
-                        key=f"dl_{type_choice}_{row['id']}",
-                        use_container_width=True
-                    )
+                    # --- LAZY PDF LOADING ---
+                    gen_key = f"gen_wa_{type_choice}_{row['id']}_{item_id}"
+                    
+                    if not st.session_state.get(gen_key):
+                        if st.button("📄 Prepare PDF", key=f"btn_{gen_key}", use_container_width=True):
+                            st.session_state[gen_key] = True
+                            st.rerun()
+                    else:
+                        img_bytes = bytes(row["report_image"]) if pd.notna(row.get("report_image")) and row["report_image"] else None
+                        pdf_buf = PDFGenerator.generate_student_report(
+                            row["name"], sel_title, row["score"], total_q, 
+                            row["percentage"], row.get("report"), img_bytes,
+                            video_link=vid_link
+                        )
+                        st.download_button(
+                            label="⬇️ Download Ready", 
+                            data=pdf_buf,
+                            file_name=f"{row['name']}_{sel_title}.pdf".replace(" ", "_"),
+                            mime="application/pdf", 
+                            key=f"dl_{type_choice}_{row['id']}",
+                            use_container_width=True
+                        )
                 else:
                     st.button("📄 N/A", disabled=True, key=f"dl_na_{type_choice}_{row['id']}", use_container_width=True)
                 
