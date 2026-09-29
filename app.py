@@ -119,7 +119,7 @@ class GradePortalApp:
 
     def _render_admin_portal(self):
         st.sidebar.button("🚪 Logout", on_click=self.auth.logout, type="primary")
-        st.title("📚 Homework & Grade Manager")
+        st.title("Eng.Mahmoud Adel Grade Portal")
         menu = st.sidebar.radio("Navigation",
                                 ["Manage Homeworks", "Manage Quizzes", 
                                  "Manage Students", "Student Profiles", "WhatsApp Students and parents"])
