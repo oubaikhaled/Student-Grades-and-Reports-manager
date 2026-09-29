@@ -142,30 +142,26 @@ class GradePortalApp:
         
         tab_hw, tab_ch = st.tabs(["📝 Homeworks", "📑 Manage Chapters"])
         
-        # --- TAB 2: CHAPTER MANAGEMENT ---
+        # --- CHAPTER TAB ---
         with tab_ch:
             with st.form("add_chapter_form"):
-                st.write("**Create a New Chapter**")
                 title = st.text_input("Chapter Title (e.g., 'Unit 1: Integration')").strip()
-                if st.form_submit_button("➕ Add Chapter", type="primary"):
-                    if title:
-                        try:
-                            with self.db.get_connection() as conn:
-                                with conn.cursor() as c:
-                                    c.execute("INSERT INTO chapters (title) VALUES (%s)", (title,))
-                                conn.commit()
-                            st.success(f"Chapter '{title}' added!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error: {e}")
+                if st.form_submit_button("➕ Add Chapter", type="primary") and title:
+                    try:
+                        with self.db.get_connection() as conn:
+                            with conn.cursor() as c:
+                                c.execute("INSERT INTO chapters (title) VALUES (%s)", (title,))
+                            conn.commit()
+                        st.success(f"Chapter '{title}' added!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
-            st.divider()
             ch_df = self.db.fetch_dataframe("SELECT chapter_id, title FROM chapters ORDER BY chapter_id ASC")
             if not ch_df.empty:
+                st.divider()
                 st.dataframe(ch_df, hide_index=True, use_container_width=True)
-                
                 with st.expander("⚠️ Delete a Chapter"):
-                    st.warning("Deleting a chapter will NOT delete its homeworks/quizzes, but they will be left without a chapter.")
                     ch_to_delete = st.selectbox("Select Chapter to Delete", ch_df['title'].tolist())
                     if st.button("🚨 Delete Chapter"):
                         del_id = ch_df[ch_df['title'] == ch_to_delete].iloc[0]['chapter_id']
@@ -173,312 +169,223 @@ class GradePortalApp:
                             with conn.cursor() as c:
                                 c.execute("DELETE FROM chapters WHERE chapter_id = %s", (int(del_id),))
                             conn.commit()
-                        st.success(f"Chapter deleted.")
                         st.rerun()
 
-        # --- TAB 1: HOMEWORK MANAGEMENT ---
+        # --- HOMEWORK TAB ---
         with tab_hw:
             if ch_df.empty:
                 st.warning("Please create at least one Chapter in the 'Manage Chapters' tab first.")
                 return
-                
             chapter_options = ch_df.apply(lambda x: f"{x['title']} (ID: {x['chapter_id']})", axis=1).tolist()
             
-            with st.form("add_homework_form"):
-                sel_chapter = st.selectbox("Assign to Chapter", chapter_options)
-                title = st.text_input("Homework Title")
-                total_q = st.number_input("Total Questions (Max Score)", min_value=1, step=1)
-                video_link = st.text_input("Homework Video Link (Optional)", placeholder="https://youtube.com/...")
+            # 1. ADD / DELETE SECTION
+            with st.expander("🛠️ Add or Delete Homework Assignments", expanded=False):
+                with st.form("add_homework_form"):
+                    sel_chapter = st.selectbox("Assign to Chapter", chapter_options)
+                    title = st.text_input("Homework Title")
+                    total_q = st.number_input("Total Questions (Max Score)", min_value=1, step=1)
+                    video_link = st.text_input("Homework Video Link (Optional)", placeholder="https://youtube.com/...")
 
-                if st.form_submit_button("➕ Add Homework", type="primary"):
-                    if not title.strip():
-                        st.error("Title cannot be empty.")
-                    else:
-                        try:
-                            clean_link = video_link.strip() if video_link.strip() else None
-                            ch_id = sel_chapter.split("(ID: ")[1].replace(")", "")
-                            with self.db.get_connection() as conn:
-                                with conn.cursor() as c:
-                                    c.execute(
-                                        "INSERT INTO homeworks (title, total_questions, video_link, chapter_id) VALUES (%s, %s, %s, %s)", 
-                                        (title.strip(), total_q, clean_link, ch_id)
-                                    )
-                                conn.commit()
-                            st.success("Homework created successfully!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Failed to add homework. Error: {e}")
+                    if st.form_submit_button("➕ Add Homework", type="primary"):
+                        if title.strip():
+                            try:
+                                clean_link = video_link.strip() if video_link.strip() else None
+                                ch_id = sel_chapter.split("(ID: ")[1].replace(")", "")
+                                with self.db.get_connection() as conn:
+                                    with conn.cursor() as c:
+                                        c.execute("INSERT INTO homeworks (title, total_questions, video_link, chapter_id) VALUES (%s, %s, %s, %s)", 
+                                                  (title.strip(), total_q, clean_link, ch_id))
+                                    conn.commit()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                
+                hw_df_all = self.db.fetch_dataframe("SELECT homework_id, title FROM homeworks ORDER BY homework_id DESC")
+                if not hw_df_all.empty:
+                    st.divider()
+                    del_hw_title = st.selectbox("Select Homework to Delete", hw_df_all["title"].tolist())
+                    if st.button("🚨 Delete Selected Homework"):
+                        hw_del_id = hw_df_all[hw_df_all["title"] == del_hw_title].iloc[0]["homework_id"]
+                        with self.db.get_connection() as conn:
+                            with conn.cursor() as c:
+                                c.execute("DELETE FROM homework_grades WHERE homework_id = %s", (int(hw_del_id),))
+                                c.execute("DELETE FROM homeworks WHERE homework_id = %s", (int(hw_del_id),))
+                            conn.commit()
+                        st.rerun()
 
-            st.divider()
-
-            hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions, video_link FROM homeworks ORDER BY homework_id DESC")
+            hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions FROM homeworks ORDER BY homework_id DESC")
             if hw_df.empty:
                 st.info("No homeworks created yet.")
                 return
 
-            st.subheader("📊 Enter Homework Grades & Feedback")
-            sel_hw_title = st.selectbox("Select Homework", hw_df["title"].tolist())
+            st.divider()
+            
+            # 2. SELECT ASSIGNMENT TO GRADE
+            st.subheader("📊 Select Assignment to Grade")
+            sel_hw_title = st.selectbox("Current Homework", hw_df["title"].tolist())
             hw_row = hw_df[hw_df["title"] == sel_hw_title].iloc[0]
-            hw_id = int(hw_row["homework_id"])
-            total_q = int(hw_row["total_questions"])
-
-            with st.expander("⚠️ Danger Zone: Delete Homework"):
-                if st.button("🚨 Yes, Delete This Homework"):
-                    try:
-                        with self.db.get_connection() as conn:
-                            with conn.cursor() as c:
-                                c.execute("DELETE FROM homework_grades WHERE homework_id = %s", (hw_id,))
-                                c.execute("DELETE FROM homeworks WHERE homework_id = %s", (hw_id,))
-                            conn.commit()
-                        st.success("Homework deleted!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to delete. Error: {e}")
+            hw_id, total_q = int(hw_row["homework_id"]), int(hw_row["total_questions"])
 
             grades_df = self.db.fetch_dataframe("""
-                SELECT s.id, s.name, s.group_number, g.correct_answers, g.report 
+                SELECT s.id, s.name, s.phone, s.group_number, g.correct_answers, g.report 
                 FROM students s
                 LEFT JOIN homework_grades g ON s.id = g.student_id AND g.homework_id = %s ORDER BY s.name ASC
             """, (hw_id,))
 
-            # Group Filter for Grading and PDF Generation
-            current_group_label = "All Groups"
+            st.divider()
+
+            # 3. STUDENT FILTER & SELECTOR
+            st.subheader("🔍 Select Student")
+            col_f1, col_f2 = st.columns(2)
+            
             available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
-            if available_groups:
-                filter_group = st.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups), key="hw_grp_filter")
-                current_group_label = filter_group
-                if filter_group != "All Groups":
-                    grades_df = grades_df[grades_df['group_number'] == filter_group]
+            filter_group = col_f1.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups))
+            search_term = col_f2.text_input("Search Name, ID, or Phone").strip()
 
-            st.caption(f"Total Questions: **{total_q}** | Edit 'Correct Answers' and 'Feedback Report' below.")
-            edited_df = st.data_editor(
-                grades_df, hide_index=True, use_container_width=True,
-                column_config={
-                    "id": st.column_config.TextColumn("Student ID", disabled=True),
-                    "name": st.column_config.TextColumn("Student Name", disabled=True),
-                    "group_number": st.column_config.TextColumn("Group", disabled=True),
-                    "correct_answers": st.column_config.NumberColumn("Correct Answers", min_value=0, max_value=total_q, step=1),
-                    "report": st.column_config.TextColumn("Feedback Report")
-                }
-            )
+            filtered_df = grades_df
+            if filter_group != "All Groups":
+                filtered_df = filtered_df[filtered_df['group_number'] == filter_group]
+            if search_term:
+                mask = (
+                    filtered_df['name'].str.contains(search_term, case=False, na=False) |
+                    filtered_df['id'].astype(str).str.contains(search_term, case=False, na=False) |
+                    filtered_df['phone'].astype(str).str.contains(search_term, case=False, na=False)
+                )
+                filtered_df = filtered_df[mask]
 
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                if st.button("💾 Save Grades & Text Reports", type="primary"):
-                    with self.db.get_connection() as conn:
-                        with conn.cursor() as c:
-                            for _, row in edited_df.iterrows():
-                                score = row["correct_answers"]
-                                rep_val = row["report"] if pd.notna(row.get("report")) else None
-                                if pd.notna(score):
-                                    perc = (float(score) / float(total_q)) * 100.0
-                                    c.execute("""
-                                        INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report)
-                                        VALUES (%s, %s, %s, %s, %s) ON CONFLICT (homework_id, student_id) 
-                                        DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report
-                                    """, (hw_id, str(row["id"]), int(score), perc, rep_val))
-                                else:
-                                    c.execute(
-                                        "UPDATE homework_grades SET correct_answers = NULL, percentage = NULL, report = %s WHERE homework_id = %s AND student_id = %s",
-                                        (rep_val, hw_id, str(row["id"])))
-                        conn.commit()
-                    st.success("Grades & Text saved!")
-                    st.rerun()
+            if filtered_df.empty:
+                st.warning("No students found matching your filters.")
+                return
 
-            with col2:
-                pdf_data = [(r["id"], r["name"], r["correct_answers"] if pd.notna(r["correct_answers"]) else None,
-                             (float(r["correct_answers"]) / total_q) * 100 if pd.notna(r["correct_answers"]) else None) for
-                            _, r in edited_df.iterrows()]
+            student_options = filtered_df.apply(lambda x: f"{x['name']} (Score: {x['correct_answers'] if pd.notna(x['correct_answers']) else 'Missing'})", axis=1).tolist()
+            selected_student_label = st.selectbox("Select Student to Open Grading Panel", student_options)
+            
+            selected_student_name = selected_student_label.split(" (Score")[0]
+            student_data = filtered_df[filtered_df['name'] == selected_student_name].iloc[0]
 
-                # Master report dynamically reflects the selected group
-                pdf_buf = PDFGenerator.generate_master_report(f"{sel_hw_title} ({current_group_label})", total_q, pdf_data)
-                st.download_button("📄 Download Master Report (PDF)", data=pdf_buf,
-                                   file_name=f"{sel_hw_title.replace(' ', '_')}_{current_group_label.replace(' ', '_')}_Master.pdf", mime="application/pdf")
+            if st.button("✏️ Open Grading Panel", type="primary"):
+                self._hw_grading_dialog(
+                    student_data['name'], student_data['id'], hw_id, total_q, 
+                    student_data['correct_answers'], student_data['report']
+                )
 
             st.divider()
-            st.subheader("📝 Individual Feedback & Attachments")
-            st.caption("Write a detailed text report or attach an image for a specific student.")
-
-            report_df = self.db.fetch_dataframe("""
-                SELECT s.id, s.name, g.report 
-                FROM students s
-                LEFT JOIN homework_grades g ON s.id = g.student_id AND g.homework_id = %s
-                ORDER BY s.name ASC
-            """, (hw_id,))
-
-            student_to_attach = st.selectbox("Select Student", report_df["name"].tolist(), key="hw_stu_sel")
-            if student_to_attach:
-                sel_student = report_df[report_df["name"] == student_to_attach].iloc[0]
-                sel_sid = sel_student["id"]
-                current_report = sel_student["report"] if pd.notna(sel_student["report"]) else ""
-
-                with st.form("hw_feedback_form"):
-                    new_report = st.text_area("Teacher's Text Report", value=current_report, height=150)
-                    up_file = st.file_uploader("Upload Image Attachment (Optional)", type=["png", "jpg", "jpeg"])
-
-                    if st.form_submit_button("💾 Save Feedback Details"):
-                        with self.db.get_connection() as conn:
-                            with conn.cursor() as c:
-                                c.execute(
-                                    "UPDATE homework_grades SET report = %s WHERE homework_id = %s AND student_id = %s",
-                                    (new_report, hw_id, str(sel_sid)))
-                                if up_file:
-                                    c.execute(
-                                        "UPDATE homework_grades SET report_image = %s WHERE homework_id = %s AND student_id = %s",
-                                        (psycopg2.Binary(up_file.read()), hw_id, str(sel_sid)))
-                            conn.commit()
-                        st.success(f"Feedback safely stored for {student_to_attach}!")
-                        st.rerun()
+            
+            # Master PDF Download mapped to current group filter
+            pdf_data = [(r["id"], r["name"], r["correct_answers"] if pd.notna(r["correct_answers"]) else None,
+                         (float(r["correct_answers"]) / total_q) * 100 if pd.notna(r["correct_answers"]) else None) for
+                        _, r in filtered_df.iterrows()]
+            pdf_buf = PDFGenerator.generate_master_report(f"{sel_hw_title} ({filter_group})", total_q, pdf_data)
+            st.download_button("📄 Download Master PDF Report", data=pdf_buf, file_name=f"{sel_hw_title}_{filter_group}_Master.pdf".replace(' ', '_'), mime="application/pdf")
 
     def _admin_record_quizzes(self):
-        st.subheader("📝 Record External Quiz Grades")
+        st.subheader("📝 Manage Curriculum & Quizzes")
         
         ch_df = self.db.fetch_dataframe("SELECT chapter_id, title FROM chapters ORDER BY chapter_id ASC")
         if ch_df.empty:
             st.warning("Please create at least one Chapter in 'Manage Homeworks' -> 'Manage Chapters' tab first.")
             return
-            
         chapter_options = ch_df.apply(lambda x: f"{x['title']} (ID: {x['chapter_id']})", axis=1).tolist()
         
-        with st.expander("➕ Create a New Quiz"):
+        # 1. ADD / DELETE SECTION
+        with st.expander("🛠️ Add or Delete Quizzes", expanded=False):
             with st.form("create_quiz_form"):
                 sel_chapter = st.selectbox("Assign to Chapter", chapter_options)
                 q_title = st.text_input("Quiz Title").strip()
                 q_max = st.number_input("Maximum Score", min_value=1.0, value=10.0, step=1.0)
-                if st.form_submit_button("Create Quiz"):
-                    if not q_title:
-                        st.error("Title required.")
-                    else:
-                        try:
-                            ch_id = sel_chapter.split("(ID: ")[1].replace(")", "")
-                            with self.db.get_connection() as conn:
-                                with conn.cursor() as c:
-                                    c.execute("INSERT INTO quizzes (title, max_score, chapter_id) VALUES (%s, %s, %s) RETURNING quiz_id",
-                                              (q_title, q_max, ch_id))
-                                    q_id = c.fetchone()[0]
-                                    c.execute("SELECT id FROM students")
-                                    for (sid,) in c.fetchall():
-                                        c.execute("INSERT INTO quiz_grades (quiz_id, student_id) VALUES (%s, %s)",
-                                                  (q_id, sid))
-                                conn.commit()
-                            st.success(f"Created '{q_title}'!")
-                            st.rerun()
-                        except psycopg2.IntegrityError:
-                            st.error("Quiz already exists.")
-
-        qz_df = self.db.fetch_dataframe("SELECT quiz_id, title, max_score FROM quizzes ORDER BY quiz_id DESC")
-        if not qz_df.empty:
-            st.divider()
-            st.subheader("📊 Enter Quiz Grades & Feedback")
-            sel_q = st.selectbox("Select Quiz", qz_df["title"].tolist())
-            q_row = qz_df[qz_df["title"] == sel_q].iloc[0]
-            q_id, q_max = int(q_row["quiz_id"]), float(q_row["max_score"])
-
-            with st.expander("⚠️ Danger Zone: Delete Quiz"):
-                if st.button("🚨 Yes, Delete This Quiz"):
+                if st.form_submit_button("➕ Create Quiz", type="primary") and q_title:
                     try:
-                        self.db.execute_query("DELETE FROM quiz_grades WHERE quiz_id = %s", (q_id,))
-                        self.db.execute_query("DELETE FROM quizzes WHERE quiz_id = %s", (q_id,))
-                        st.success(f"'{sel_q}' deleted!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-
-            grades_df = self.db.fetch_dataframe("""
-                SELECT s.id, s.name, s.group_number, qg.score, qg.report 
-                FROM students s 
-                LEFT JOIN quiz_grades qg ON s.id = qg.student_id AND qg.quiz_id = %s 
-                ORDER BY s.name ASC
-            """, (q_id,))
-
-            # Group Filter for Grading and PDF Generation
-            current_group_label = "All Groups"
-            available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
-            if available_groups:
-                filter_group = st.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups), key="qz_grp_filter")
-                current_group_label = filter_group
-                if filter_group != "All Groups":
-                    grades_df = grades_df[grades_df['group_number'] == filter_group]
-
-            st.caption(f"Maximum Score: **{q_max}** | Edit 'Final Score' and 'Feedback Report' below.")
-            edited_df = st.data_editor(
-                grades_df, hide_index=True, use_container_width=True,
-                column_config={
-                    "id": st.column_config.TextColumn("Student ID", disabled=True),
-                    "name": st.column_config.TextColumn("Student Name", disabled=True),
-                    "group_number": st.column_config.TextColumn("Group", disabled=True),
-                    "score": st.column_config.NumberColumn("Final Score", min_value=0.0, max_value=q_max),
-                    "report": st.column_config.TextColumn("Feedback Report")
-                }
-            )
-
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                if st.button("💾 Save Quiz Grades & Text Reports", type="primary"):
-                    with self.db.get_connection() as conn:
-                        with conn.cursor() as c:
-                            for _, row in edited_df.iterrows():
-                                score = row["score"]
-                                rep_val = row["report"] if pd.notna(row.get("report")) else None
-                                if pd.notna(score):
-                                    c.execute("""
-                                        INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report) VALUES (%s, %s, %s, %s, %s)
-                                        ON CONFLICT (quiz_id, student_id) DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
-                                    """, (
-                                    q_id, str(row["id"]), float(score), (float(score) / q_max) * 100.0 if q_max > 0 else 0, rep_val))
-                                else:
-                                    c.execute(
-                                        "UPDATE quiz_grades SET score = NULL, percentage = NULL, report = %s WHERE quiz_id = %s AND student_id = %s",
-                                        (rep_val, q_id, str(row["id"])))
-                        conn.commit()
-                    st.success("Quiz grades & Text saved!")
-                    st.rerun()
-
-            with col2:
-                pdf_data = [(r["id"], r["name"], r["score"] if pd.notna(r["score"]) else None,
-                             (float(r["score"]) / q_max) * 100 if pd.notna(r["score"]) else None) for
-                            _, r in edited_df.iterrows()]
-
-                # Master report dynamically reflects the selected group
-                pdf_buf = PDFGenerator.generate_master_report(f"{sel_q} ({current_group_label})", q_max, pdf_data)
-                st.download_button("📄 Download Master Report (PDF)", data=pdf_buf,
-                                   file_name=f"{sel_q.replace(' ', '_')}_{current_group_label.replace(' ', '_')}_Master.pdf", mime="application/pdf")
-
-            st.divider()
-            st.subheader("📝 Individual Feedback & Attachments")
-            st.caption("Write a detailed text report or attach an image for a specific student's quiz.")
-
-            report_df = self.db.fetch_dataframe("""
-                SELECT s.id, s.name, qg.report 
-                FROM students s
-                LEFT JOIN quiz_grades qg ON s.id = qg.student_id AND qg.quiz_id = %s
-                ORDER BY s.name ASC
-            """, (q_id,))
-
-            student_to_attach = st.selectbox("Select Student", report_df["name"].tolist(), key="qz_stu_sel")
-            if student_to_attach:
-                sel_student = report_df[report_df["name"] == student_to_attach].iloc[0]
-                sel_sid = sel_student["id"]
-                current_report = sel_student["report"] if pd.notna(sel_student["report"]) else ""
-
-                with st.form("qz_feedback_form"):
-                    new_report = st.text_area("Teacher's Text Report", value=current_report, height=150)
-                    up_file = st.file_uploader("Upload Image Attachment (Optional)", type=["png", "jpg", "jpeg"])
-
-                    if st.form_submit_button("💾 Save Feedback Details"):
+                        ch_id = sel_chapter.split("(ID: ")[1].replace(")", "")
                         with self.db.get_connection() as conn:
                             with conn.cursor() as c:
-                                c.execute(
-                                    "UPDATE quiz_grades SET report = %s WHERE quiz_id = %s AND student_id = %s",
-                                    (new_report, q_id, str(sel_sid)))
-                                if up_file:
-                                    c.execute(
-                                        "UPDATE quiz_grades SET report_image = %s WHERE quiz_id = %s AND student_id = %s",
-                                        (psycopg2.Binary(up_file.read()), q_id, str(sel_sid)))
+                                c.execute("INSERT INTO quizzes (title, max_score, chapter_id) VALUES (%s, %s, %s) RETURNING quiz_id",
+                                          (q_title, q_max, ch_id))
+                                q_id = c.fetchone()[0]
+                                c.execute("SELECT id FROM students")
+                                for (sid,) in c.fetchall():
+                                    c.execute("INSERT INTO quiz_grades (quiz_id, student_id) VALUES (%s, %s)", (q_id, sid))
                             conn.commit()
-                        st.success(f"Feedback safely stored for {student_to_attach}!")
                         st.rerun()
+                    except psycopg2.IntegrityError:
+                        st.error("Quiz already exists.")
+            
+            qz_df_all = self.db.fetch_dataframe("SELECT quiz_id, title FROM quizzes ORDER BY quiz_id DESC")
+            if not qz_df_all.empty:
+                st.divider()
+                del_qz_title = st.selectbox("Select Quiz to Delete", qz_df_all["title"].tolist())
+                if st.button("🚨 Delete Selected Quiz"):
+                    qz_del_id = qz_df_all[qz_df_all["title"] == del_qz_title].iloc[0]["quiz_id"]
+                    with self.db.get_connection() as conn:
+                        with conn.cursor() as c:
+                            c.execute("DELETE FROM quiz_grades WHERE quiz_id = %s", (int(qz_del_id),))
+                            c.execute("DELETE FROM quizzes WHERE quiz_id = %s", (int(qz_del_id),))
+                        conn.commit()
+                    st.rerun()
 
+        qz_df = self.db.fetch_dataframe("SELECT quiz_id, title, max_score FROM quizzes ORDER BY quiz_id DESC")
+        if qz_df.empty:
+            st.info("No quizzes created yet.")
+            return
+
+        st.divider()
+
+        # 2. SELECT ASSIGNMENT TO GRADE
+        st.subheader("📊 Select Quiz to Grade")
+        sel_q = st.selectbox("Current Quiz", qz_df["title"].tolist())
+        q_row = qz_df[qz_df["title"] == sel_q].iloc[0]
+        q_id, q_max = int(q_row["quiz_id"]), float(q_row["max_score"])
+
+        grades_df = self.db.fetch_dataframe("""
+            SELECT s.id, s.name, s.phone, s.group_number, qg.score, qg.report 
+            FROM students s 
+            LEFT JOIN quiz_grades qg ON s.id = qg.student_id AND qg.quiz_id = %s 
+            ORDER BY s.name ASC
+        """, (q_id,))
+
+        st.divider()
+
+        # 3. STUDENT FILTER & SELECTOR
+        st.subheader("🔍 Select Student")
+        col_f1, col_f2 = st.columns(2)
+        
+        available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
+        filter_group = col_f1.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups), key="qz_grp")
+        search_term = col_f2.text_input("Search Name, ID, or Phone", key="qz_srch").strip()
+
+        filtered_df = grades_df
+        if filter_group != "All Groups":
+            filtered_df = filtered_df[filtered_df['group_number'] == filter_group]
+        if search_term:
+            mask = (
+                filtered_df['name'].str.contains(search_term, case=False, na=False) |
+                filtered_df['id'].astype(str).str.contains(search_term, case=False, na=False) |
+                filtered_df['phone'].astype(str).str.contains(search_term, case=False, na=False)
+            )
+            filtered_df = filtered_df[mask]
+
+        if filtered_df.empty:
+            st.warning("No students found matching your filters.")
+            return
+
+        student_options = filtered_df.apply(lambda x: f"{x['name']} (Score: {x['score'] if pd.notna(x['score']) else 'Missing'})", axis=1).tolist()
+        selected_student_label = st.selectbox("Select Student to Open Grading Panel", student_options, key="qz_sel")
+        
+        selected_student_name = selected_student_label.split(" (Score")[0]
+        student_data = filtered_df[filtered_df['name'] == selected_student_name].iloc[0]
+
+        if st.button("✏️ Open Grading Panel", type="primary", key="qz_btn"):
+            self._qz_grading_dialog(
+                student_data['name'], student_data['id'], q_id, q_max, 
+                student_data['score'], student_data['report']
+            )
+
+        st.divider()
+        
+        pdf_data = [(r["id"], r["name"], r["score"] if pd.notna(r["score"]) else None,
+                     (float(r["score"]) / q_max) * 100 if pd.notna(r["score"]) else None) for
+                    _, r in filtered_df.iterrows()]
+        pdf_buf = PDFGenerator.generate_master_report(f"{sel_q} ({filter_group})", q_max, pdf_data)
+        st.download_button("📄 Download Master PDF Report", data=pdf_buf, file_name=f"{sel_q}_{filter_group}_Master.pdf".replace(' ', '_'), mime="application/pdf")
     def _admin_manage_students(self):
         st.subheader("👥 Manage Students")
 
@@ -807,7 +714,93 @@ class GradePortalApp:
             
             
             st.divider()
+def _stitch_images(self, uploaded_files):
+        if not uploaded_files:
+            return None
+        from PIL import Image as PILImage
+        import io
+        try:
+            images = [PILImage.open(f) for f in uploaded_files]
+            widths, heights = zip(*(i.size for i in images))
+            total_height = sum(heights)
+            max_width = max(widths)
+            stitched_img = PILImage.new('RGB', (max_width, total_height), color=(255, 255, 255))
+            y_offset = 0
+            for im in images:
+                stitched_img.paste(im, (0, y_offset))
+                y_offset += im.size[1]
+            img_byte_arr = io.BytesIO()
+            stitched_img.save(img_byte_arr, format='JPEG', quality=85)
+            return img_byte_arr.getvalue()
+        except Exception as e:
+            st.error(f"Image processing failed: {e}")
+            return None
 
+    @st.dialog("📝 Grade Homework")
+    def _hw_grading_dialog(self, student_name, student_id, hw_id, total_q, current_score, current_report):
+        st.write(f"Student: **{student_name}** (ID: {student_id})")
+        
+        score = st.number_input("Correct Answers", min_value=0, max_value=int(total_q), value=int(current_score) if pd.notna(current_score) else 0, step=1)
+        report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
+        uploaded_files = st.file_uploader("Upload Attachments (Images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+        
+        st.warning("⚠️ You must click 'Save Grade' below to apply changes before closing this window.")
+        
+        if st.button("💾 Save Grade", type="primary", use_container_width=True):
+            img_bytes = self._stitch_images(uploaded_files)
+            perc = (float(score) / float(total_q)) * 100.0
+            
+            with self.db.get_connection() as conn:
+                with conn.cursor() as c:
+                    if img_bytes:
+                        c.execute("""
+                            INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report, report_image)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (homework_id, student_id) 
+                            DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
+                        """, (hw_id, str(student_id), score, perc, report, psycopg2.Binary(img_bytes)))
+                    else:
+                        c.execute("""
+                            INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (homework_id, student_id) 
+                            DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report
+                        """, (hw_id, str(student_id), score, perc, report))
+                conn.commit()
+            st.rerun()
+
+    @st.dialog("📝 Grade Quiz")
+    def _qz_grading_dialog(self, student_name, student_id, q_id, q_max, current_score, current_report):
+        st.write(f"Student: **{student_name}** (ID: {student_id})")
+        
+        score = st.number_input("Final Score", min_value=0.0, max_value=float(q_max), value=float(current_score) if pd.notna(current_score) else 0.0)
+        report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
+        uploaded_files = st.file_uploader("Upload Attachments (Images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+        
+        st.warning("⚠️ You must click 'Save Grade' below to apply changes before closing this window.")
+        
+        if st.button("💾 Save Grade", type="primary", use_container_width=True):
+            img_bytes = self._stitch_images(uploaded_files)
+            perc = (float(score) / float(q_max)) * 100.0 if q_max > 0 else 0
+            
+            with self.db.get_connection() as conn:
+                with conn.cursor() as c:
+                    if img_bytes:
+                        c.execute("""
+                            INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report, report_image)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (quiz_id, student_id) 
+                            DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
+                        """, (q_id, str(student_id), score, perc, report, psycopg2.Binary(img_bytes)))
+                    else:
+                        c.execute("""
+                            INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (quiz_id, student_id) 
+                            DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
+                        """, (q_id, str(student_id), score, perc, report))
+                conn.commit()
+            st.rerun()
 if __name__ == "__main__":
     app = GradePortalApp()
     app.run()
