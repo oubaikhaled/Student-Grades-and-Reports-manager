@@ -135,6 +135,86 @@ class PDFGenerator:
                 Paragraph(link_html, arabic_style)
             ])
 
+        @classmethod
+    def generate_student_profile_report(cls, student_info, status_text, avg_display, hw_records, qz_records):
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+        styles, arabic_style = cls._get_base_styles()
+        
+        elements = [
+            Paragraph(f"<b>Student Profile Report</b>", styles["Title"]),
+            Spacer(1, 12)
+        ]
+        
+        # Profile Header Section
+        group_num = student_info.get('group_number', 'N/A')
+        group_disp = group_num if pd.notna(group_num) else 'N/A'
+        
+        info_html = (
+            f"<b>Student Name:</b> {cls.fix_arabic(student_info['name'])}<br/>"
+            f"<b>Student ID:</b> {student_info['id']} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Group:</b> {group_disp}<br/>"
+            f"<b>Overall Status:</b> {status_text.replace('🌟', '').replace('👍', '').replace('⚠️', '').replace('⚪', '').strip()} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Quiz Average:</b> {avg_display}"
+        )
+        
+        elements.extend([
+            Paragraph(info_html, arabic_style),
+            Spacer(1, 24),
+            Paragraph("<b>Homework History</b>", styles["Heading2"]),
+            Spacer(1, 8)
+        ])
+        
+        # Homework Table
+        hw_data = [["Assignment", "Score", "Out Of", "Percentage"]]
+        if not hw_records:
+            hw_data.append(["No homework grades recorded.", "-", "-", "-"])
+        else:
+            for row in hw_records:
+                hw_data.append([
+                    cls.fix_arabic(row.get('Homework', '')), 
+                    str(row.get('Score', '-')), 
+                    str(row.get('Out Of', '-')), 
+                    str(row.get('Percentage', '-'))
+                ])
+                
+        hw_table = Table(hw_data, colWidths=[200, 80, 80, 100])
+        hw_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, 1), (0, -1), GLOBAL_FONT), 
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+        ]))
+        
+        elements.extend([hw_table, Spacer(1, 24), Paragraph("<b>Quiz History</b>", styles["Heading2"]), Spacer(1, 8)])
+        
+        # Quiz Table
+        qz_data = [["Quiz", "Score", "Out Of", "Percentage"]]
+        if not qz_records:
+            qz_data.append(["No quiz grades recorded.", "-", "-", "-"])
+        else:
+            for row in qz_records:
+                qz_data.append([
+                    cls.fix_arabic(row.get('Quiz', '')), 
+                    str(row.get('Score', '-')), 
+                    str(row.get('Out Of', '-')), 
+                    str(row.get('Percentage', '-'))
+                ])
+                
+        qz_table = Table(qz_data, colWidths=[200, 80, 80, 100])
+        qz_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, 1), (0, -1), GLOBAL_FONT), 
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+        ]))
+        
+        elements.append(qz_table)
+        
         doc.build(elements)
         buffer.seek(0)
         return buffer
