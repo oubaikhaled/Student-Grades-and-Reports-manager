@@ -122,16 +122,19 @@ class GradePortalApp:
         st.title("📚 Homework & Grade Manager")
         menu = st.sidebar.radio("Navigation",
                                 ["Manage Homeworks", "Record Quiz Grades", 
-                                 "Manage Students", "WhatsApp Parents"])
+                                 "Manage Students", "Student Profiles", "WhatsApp Parents"])
 
         if menu == "Manage Homeworks":
             self._admin_manage_homeworks()
-        elif menu == "Record Quiz Grades":
+        elif menu == "Manage Quizzes":
             self._admin_record_quizzes()
         elif menu == "Manage Students":
             self._admin_manage_students()
-        elif menu == "WhatsApp Parents":
-            self._admin_whatsapp_parents()
+        elif menu == "Student Profiles":
+            # Route cleanly to the new class
+            StudentProfileView(self.db).render()
+        elif menu == "WhatsApp Students and parents":
+            self._admin_whatsapp_parent()
 
     def _admin_manage_homeworks(self):
         st.subheader("📚 Manage Homeworks")
