@@ -7,7 +7,7 @@ from database import DatabaseManager
 from pdf_utils import PDFGenerator
 from auth import AuthManager
 import emoji
-
+from student_profile import StudentProfileView
 st.set_page_config(page_title="Eng.Mahmoud Adel Grade Portal", layout="wide")
 
 class GradePortalApp:
