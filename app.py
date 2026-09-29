@@ -137,12 +137,33 @@ class GradePortalApp:
         elif menu == "WhatsApp Students and parents":
             self._admin_whatsapp_parents()
 
+    def _stitch_images(self, uploaded_files):
+        if not uploaded_files:
+            return None
+        from PIL import Image as PILImage
+        import io
+        try:
+            images = [PILImage.open(f) for f in uploaded_files]
+            widths, heights = zip(*(i.size for i in images))
+            total_height = sum(heights)
+            max_width = max(widths)
+            stitched_img = PILImage.new('RGB', (max_width, total_height), color=(255, 255, 255))
+            y_offset = 0
+            for im in images:
+                stitched_img.paste(im, (0, y_offset))
+                y_offset += im.size[1]
+            img_byte_arr = io.BytesIO()
+            stitched_img.save(img_byte_arr, format='JPEG', quality=85)
+            return img_byte_arr.getvalue()
+        except Exception as e:
+            st.error(f"Image processing failed: {e}")
+            return None
+
     def _admin_manage_homeworks(self):
         st.subheader("📚 Manage Curriculum & Homeworks")
         
         tab_hw, tab_ch = st.tabs(["📝 Homeworks", "📑 Manage Chapters"])
         
-        # --- CHAPTER TAB ---
         with tab_ch:
             with st.form("add_chapter_form"):
                 title = st.text_input("Chapter Title (e.g., 'Unit 1: Integration')").strip()
@@ -162,8 +183,8 @@ class GradePortalApp:
                 st.divider()
                 st.dataframe(ch_df, hide_index=True, use_container_width=True)
                 with st.expander("⚠️ Delete a Chapter"):
-                    ch_to_delete = st.selectbox("Select Chapter to Delete", ch_df['title'].tolist())
-                    if st.button("🚨 Delete Chapter"):
+                    ch_to_delete = st.selectbox("Select Chapter to Delete", ch_df['title'].tolist(), key="del_ch_hw")
+                    if st.button("🚨 Delete Chapter", key="btn_del_ch_hw"):
                         del_id = ch_df[ch_df['title'] == ch_to_delete].iloc[0]['chapter_id']
                         with self.db.get_connection() as conn:
                             with conn.cursor() as c:
@@ -171,14 +192,12 @@ class GradePortalApp:
                             conn.commit()
                         st.rerun()
 
-        # --- HOMEWORK TAB ---
         with tab_hw:
             if ch_df.empty:
                 st.warning("Please create at least one Chapter in the 'Manage Chapters' tab first.")
                 return
             chapter_options = ch_df.apply(lambda x: f"{x['title']} (ID: {x['chapter_id']})", axis=1).tolist()
             
-            # 1. ADD / DELETE SECTION
             with st.expander("🛠️ Add or Delete Homework Assignments", expanded=False):
                 with st.form("add_homework_form"):
                     sel_chapter = st.selectbox("Assign to Chapter", chapter_options)
@@ -203,8 +222,8 @@ class GradePortalApp:
                 hw_df_all = self.db.fetch_dataframe("SELECT homework_id, title FROM homeworks ORDER BY homework_id DESC")
                 if not hw_df_all.empty:
                     st.divider()
-                    del_hw_title = st.selectbox("Select Homework to Delete", hw_df_all["title"].tolist())
-                    if st.button("🚨 Delete Selected Homework"):
+                    del_hw_title = st.selectbox("Select Homework to Delete", hw_df_all["title"].tolist(), key="del_hw_sel")
+                    if st.button("🚨 Delete Selected Homework", key="btn_del_hw"):
                         hw_del_id = hw_df_all[hw_df_all["title"] == del_hw_title].iloc[0]["homework_id"]
                         with self.db.get_connection() as conn:
                             with conn.cursor() as c:
@@ -220,9 +239,8 @@ class GradePortalApp:
 
             st.divider()
             
-            # 2. SELECT ASSIGNMENT TO GRADE
             st.subheader("📊 Select Assignment to Grade")
-            sel_hw_title = st.selectbox("Current Homework", hw_df["title"].tolist())
+            sel_hw_title = st.selectbox("Current Homework", hw_df["title"].tolist(), key="sel_hw_grade")
             hw_row = hw_df[hw_df["title"] == sel_hw_title].iloc[0]
             hw_id, total_q = int(hw_row["homework_id"]), int(hw_row["total_questions"])
 
@@ -234,13 +252,12 @@ class GradePortalApp:
 
             st.divider()
 
-            # 3. STUDENT FILTER & SELECTOR
-            st.subheader("🔍 Select Student")
+            st.subheader("🔍 Select Student to Grade")
             col_f1, col_f2 = st.columns(2)
             
             available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
-            filter_group = col_f1.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups))
-            search_term = col_f2.text_input("Search Name, ID, or Phone").strip()
+            filter_group = col_f1.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups), key="hw_grp_sel")
+            search_term = col_f2.text_input("Search Name, ID, or Phone", key="hw_srch_sel").strip()
 
             filtered_df = grades_df
             if filter_group != "All Groups":
@@ -257,21 +274,50 @@ class GradePortalApp:
                 st.warning("No students found matching your filters.")
                 return
 
-            student_options = filtered_df.apply(lambda x: f"{x['name']} (Score: {x['correct_answers'] if pd.notna(x['correct_answers']) else 'Missing'})", axis=1).tolist()
-            selected_student_label = st.selectbox("Select Student to Open Grading Panel", student_options)
+            student_options = filtered_df.apply(lambda x: f"{x['name']} (ID: {x['id']} | Score: {x['correct_answers'] if pd.notna(x['correct_answers']) else 'Missing'})", axis=1).tolist()
+            selected_student_label = st.selectbox("Select Student", student_options, key="hw_stu_picker")
             
-            selected_student_name = selected_student_label.split(" (Score")[0]
+            selected_student_name = selected_student_label.split(" (ID:")[0]
             student_data = filtered_df[filtered_df['name'] == selected_student_name].iloc[0]
 
-            if st.button("✏️ Open Grading Panel", type="primary"):
-                self._hw_grading_dialog(
-                    student_data['name'], student_data['id'], hw_id, total_q, 
-                    student_data['correct_answers'], student_data['report']
-                )
+            # Dedicated Grading Expandable Panel (Replaces dialog to prevent version compatibility issues)
+            with st.expander(f"📝 Grading Panel for: {student_data['name']}", expanded=True):
+                with st.form(f"hw_grade_form_{student_data['id']}"):
+                    current_score = student_data['correct_answers']
+                    current_report = student_data['report']
+                    
+                    score = st.number_input("Correct Answers", min_value=0, max_value=int(total_q), value=int(current_score) if pd.notna(current_score) else 0, step=1)
+                    report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
+                    uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+                    
+                    st.warning("⚠️ Click 'Save Grade' below to apply changes.")
+                    
+                    if st.form_submit_button("💾 Save Grade", type="primary"):
+                        img_bytes = self._stitch_images(uploaded_files)
+                        perc = (float(score) / float(total_q)) * 100.0
+                        
+                        with self.db.get_connection() as conn:
+                            with conn.cursor() as c:
+                                if img_bytes:
+                                    c.execute("""
+                                        INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report, report_image)
+                                        VALUES (%s, %s, %s, %s, %s, %s)
+                                        ON CONFLICT (homework_id, student_id) 
+                                        DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
+                                    """, (hw_id, str(student_data['id']), score, perc, report, psycopg2.Binary(img_bytes)))
+                                else:
+                                    c.execute("""
+                                        INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report)
+                                        VALUES (%s, %s, %s, %s, %s)
+                                        ON CONFLICT (homework_id, student_id) 
+                                        DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report
+                                    """, (hw_id, str(student_data['id']), score, perc, report))
+                            conn.commit()
+                        st.success(f"Grade saved successfully for {student_data['name']}!")
+                        st.rerun()
 
             st.divider()
             
-            # Master PDF Download mapped to current group filter
             pdf_data = [(r["id"], r["name"], r["correct_answers"] if pd.notna(r["correct_answers"]) else None,
                          (float(r["correct_answers"]) / total_q) * 100 if pd.notna(r["correct_answers"]) else None) for
                         _, r in filtered_df.iterrows()]
@@ -287,7 +333,6 @@ class GradePortalApp:
             return
         chapter_options = ch_df.apply(lambda x: f"{x['title']} (ID: {x['chapter_id']})", axis=1).tolist()
         
-        # 1. ADD / DELETE SECTION
         with st.expander("🛠️ Add or Delete Quizzes", expanded=False):
             with st.form("create_quiz_form"):
                 sel_chapter = st.selectbox("Assign to Chapter", chapter_options)
@@ -312,8 +357,8 @@ class GradePortalApp:
             qz_df_all = self.db.fetch_dataframe("SELECT quiz_id, title FROM quizzes ORDER BY quiz_id DESC")
             if not qz_df_all.empty:
                 st.divider()
-                del_qz_title = st.selectbox("Select Quiz to Delete", qz_df_all["title"].tolist())
-                if st.button("🚨 Delete Selected Quiz"):
+                del_qz_title = st.selectbox("Select Quiz to Delete", qz_df_all["title"].tolist(), key="del_qz_sel")
+                if st.button("🚨 Delete Selected Quiz", key="btn_del_qz"):
                     qz_del_id = qz_df_all[qz_df_all["title"] == del_qz_title].iloc[0]["quiz_id"]
                     with self.db.get_connection() as conn:
                         with conn.cursor() as c:
@@ -329,9 +374,8 @@ class GradePortalApp:
 
         st.divider()
 
-        # 2. SELECT ASSIGNMENT TO GRADE
         st.subheader("📊 Select Quiz to Grade")
-        sel_q = st.selectbox("Current Quiz", qz_df["title"].tolist())
+        sel_q = st.selectbox("Current Quiz", qz_df["title"].tolist(), key="sel_qz_grade")
         q_row = qz_df[qz_df["title"] == sel_q].iloc[0]
         q_id, q_max = int(q_row["quiz_id"]), float(q_row["max_score"])
 
@@ -344,13 +388,12 @@ class GradePortalApp:
 
         st.divider()
 
-        # 3. STUDENT FILTER & SELECTOR
-        st.subheader("🔍 Select Student")
+        st.subheader("🔍 Select Student to Grade")
         col_f1, col_f2 = st.columns(2)
         
         available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
-        filter_group = col_f1.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups), key="qz_grp")
-        search_term = col_f2.text_input("Search Name, ID, or Phone", key="qz_srch").strip()
+        filter_group = col_f1.selectbox("Filter by Group", ["All Groups"] + sorted(available_groups), key="qz_grp_sel")
+        search_term = col_f2.text_input("Search Name, ID, or Phone", key="qz_srch_sel").strip()
 
         filtered_df = grades_df
         if filter_group != "All Groups":
@@ -367,17 +410,46 @@ class GradePortalApp:
             st.warning("No students found matching your filters.")
             return
 
-        student_options = filtered_df.apply(lambda x: f"{x['name']} (Score: {x['score'] if pd.notna(x['score']) else 'Missing'})", axis=1).tolist()
-        selected_student_label = st.selectbox("Select Student to Open Grading Panel", student_options, key="qz_sel")
+        student_options = filtered_df.apply(lambda x: f"{x['name']} (ID: {x['id']} | Score: {x['score'] if pd.notna(x['score']) else 'Missing'})", axis=1).tolist()
+        selected_student_label = st.selectbox("Select Student", student_options, key="qz_stu_picker")
         
-        selected_student_name = selected_student_label.split(" (Score")[0]
+        selected_student_name = selected_student_label.split(" (ID:")[0]
         student_data = filtered_df[filtered_df['name'] == selected_student_name].iloc[0]
 
-        if st.button("✏️ Open Grading Panel", type="primary", key="qz_btn"):
-            self._qz_grading_dialog(
-                student_data['name'], student_data['id'], q_id, q_max, 
-                student_data['score'], student_data['report']
-            )
+        with st.expander(f"📝 Grading Panel for: {student_data['name']}", expanded=True):
+            with st.form(f"qz_grade_form_{student_data['id']}"):
+                current_score = student_data['score']
+                current_report = student_data['report']
+                
+                score = st.number_input("Final Score", min_value=0.0, max_value=float(q_max), value=float(current_score) if pd.notna(current_score) else 0.0)
+                report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
+                uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="qz_files")
+                
+                st.warning("⚠️ Click 'Save Grade' below to apply changes.")
+                
+                if st.form_submit_button("💾 Save Grade", type="primary"):
+                    img_bytes = self._stitch_images(uploaded_files)
+                    perc = (float(score) / float(q_max)) * 100.0 if q_max > 0 else 0
+                    
+                    with self.db.get_connection() as conn:
+                        with conn.cursor() as c:
+                            if img_bytes:
+                                c.execute("""
+                                    INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report, report_image)
+                                    VALUES (%s, %s, %s, %s, %s, %s)
+                                    ON CONFLICT (quiz_id, student_id) 
+                                    DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
+                                """, (q_id, str(student_data['id']), score, perc, report, psycopg2.Binary(img_bytes)))
+                            else:
+                                c.execute("""
+                                    INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                    ON CONFLICT (quiz_id, student_id) 
+                                    DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
+                                """, (q_id, str(student_data['id']), score, perc, report))
+                        conn.commit()
+                    st.success(f"Grade saved successfully for {student_data['name']}!")
+                    st.rerun()
 
         st.divider()
         
@@ -386,10 +458,10 @@ class GradePortalApp:
                     _, r in filtered_df.iterrows()]
         pdf_buf = PDFGenerator.generate_master_report(f"{sel_q} ({filter_group})", q_max, pdf_data)
         st.download_button("📄 Download Master PDF Report", data=pdf_buf, file_name=f"{sel_q}_{filter_group}_Master.pdf".replace(' ', '_'), mime="application/pdf")
+
     def _admin_manage_students(self):
         st.subheader("👥 Manage Students")
 
-        # --- RESTORED: ADD STUDENT FEATURE ---
         with st.expander("➕ Add New Student", expanded=False):
             with st.form("add_student_form"):
                 col1, col2 = st.columns(2)
@@ -422,7 +494,6 @@ class GradePortalApp:
 
         st.divider()
 
-        # Fetch current students
         students_df = self.db.fetch_dataframe("SELECT id, name, phone, phone_parent, group_number FROM students ORDER BY name ASC")
 
         if students_df.empty:
@@ -434,12 +505,10 @@ class GradePortalApp:
 
         st.divider()
 
-        # Real-time search filter for expandability
         st.subheader("🛠️ Modify Student Records")
         search_term = st.text_input("🔍 Search Student by Name or ID", placeholder="Start typing to filter the dropdowns below...").strip()
 
         if search_term:
-            # Filter the dataframe dynamically (case-insensitive)
             mask = (
                 students_df['name'].str.contains(search_term, case=False, na=False) |
                 students_df['id'].astype(str).str.contains(search_term, case=False, na=False)
@@ -452,10 +521,8 @@ class GradePortalApp:
             st.warning("No students match your search criteria.")
             return
 
-        # Generate options based ONLY on the filtered results
         student_options = filtered_df.apply(lambda x: f"{x['name']} (ID: {x['id']})", axis=1).tolist()
 
-        # Edit Student Data
         with st.expander("✏️ Edit Student Data"):
             selected_edit_label = st.selectbox("Select Student to Edit", student_options, key="edit_student_sel_v2")
 
@@ -479,13 +546,11 @@ class GradePortalApp:
                                 with self.db.get_connection() as conn:
                                     with conn.cursor() as c:
                                         if new_id != edit_id:
-                                            # Check if the new ID is already taken
                                             c.execute("SELECT id FROM students WHERE id = %s", (new_id,))
                                             if c.fetchone():
                                                 st.error(f"The ID {new_id} is already assigned to another student.")
                                                 st.stop()
 
-                                            # Safe transfer
                                             c.execute("INSERT INTO students (id, name, phone, phone_parent, group_number) VALUES (%s, %s, %s, %s, %s)", 
                                                       (new_id, new_name, new_phone, new_parent_phone, new_group))
                                             c.execute("UPDATE homework_grades SET student_id = %s WHERE student_id = %s", (new_id, edit_id))
@@ -503,7 +568,6 @@ class GradePortalApp:
                             except Exception as e:
                                 st.error(f"Failed to update student. Error: {e}")
 
-        # Danger Zone for Deletion
         with st.expander("⚠️ Danger Zone: Delete Student"):
             st.warning("Deleting a student will permanently remove all their recorded homework and quiz grades. This action cannot be undone.")
 
@@ -523,7 +587,7 @@ class GradePortalApp:
                     st.success("Student successfully deleted!")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Failed to delete student. Error: {e}")                
+                    st.error(f"Failed to delete student. Error: {e}")
 
     def _admin_whatsapp_parents(self):
         st.subheader("💬 WhatsApp & Report Broadcasting")
@@ -531,7 +595,6 @@ class GradePortalApp:
         
         type_choice = st.radio("Select Assignment Type", ["Homework", "Quiz"], horizontal=True)
         
-        # --- NEW: Filter by Chapter First ---
         ch_df = self.db.fetch_dataframe("SELECT chapter_id, title FROM chapters ORDER BY chapter_id ASC")
         if ch_df.empty:
             st.warning("No chapters exist yet. Please create a chapter in 'Manage Homeworks' first.")
@@ -553,7 +616,6 @@ class GradePortalApp:
             
             vid_link = hw_row["video_link"] if "video_link" in hw_row and pd.notna(hw_row["video_link"]) and str(hw_row["video_link"]).strip() else None
             
-            # Using LEFT JOIN to fetch ALL students, even those without grades
             grades_df = self.db.fetch_dataframe("""
                 SELECT s.id, s.name, s.phone, s.phone_parent, s.group_number, g.correct_answers as score, g.percentage, g.report, g.report_image 
                 FROM students s
@@ -573,7 +635,6 @@ class GradePortalApp:
             total_q = float(qz_row["max_score"])
             vid_link = None
             
-            # Using LEFT JOIN to fetch ALL students, even those without grades
             grades_df = self.db.fetch_dataframe("""
                 SELECT s.id, s.name, s.phone, s.phone_parent, s.group_number, g.score, g.percentage, g.report, g.report_image 
                 FROM students s
@@ -609,7 +670,6 @@ class GradePortalApp:
             group_label = f" *(Group: {row['group_number']})*" if pd.notna(row['group_number']) and str(row['group_number']).strip() else ""
             col1.markdown(f"**{row['name']}**{group_label}")
             
-            # Check if the student actually has a score submitted
             has_score = pd.notna(row['score'])
             
             if has_score:
@@ -638,7 +698,6 @@ class GradePortalApp:
                     st.button("📄 N/A", disabled=True, key=f"dl_na_{type_choice}_{row['id']}", use_container_width=True)
                 
             with col4:
-                # If they have a score, send the standard grading message
                 if has_score:
                     type_ar = "Quiz" if type_choice == "Quiz" else "Homework"
                     
@@ -657,8 +716,6 @@ class GradePortalApp:
                         f"استمر في المذاكرة والتدريب، ونتمنى لك دوام التفوق والنجاح! :glowing_star:\n\n"
                         f"Mathematics Team – Mahmoud Adel"
                     )
-                
-                # If they DO NOT have a score, send the separated warning messages
                 else:
                     if type_choice == "Homework":
                         wa_msg_parent = emoji.emojize(
@@ -712,95 +769,8 @@ class GradePortalApp:
                     else:
                         st.button("🎓 N/A", disabled=True, key=f"wa_s_na_{type_choice}_{row['id']}", use_container_width=True)
             
-            
             st.divider()
-def _stitch_images(self, uploaded_files):
-        if not uploaded_files:
-            return None
-        from PIL import Image as PILImage
-        import io
-        try:
-            images = [PILImage.open(f) for f in uploaded_files]
-            widths, heights = zip(*(i.size for i in images))
-            total_height = sum(heights)
-            max_width = max(widths)
-            stitched_img = PILImage.new('RGB', (max_width, total_height), color=(255, 255, 255))
-            y_offset = 0
-            for im in images:
-                stitched_img.paste(im, (0, y_offset))
-                y_offset += im.size[1]
-            img_byte_arr = io.BytesIO()
-            stitched_img.save(img_byte_arr, format='JPEG', quality=85)
-            return img_byte_arr.getvalue()
-        except Exception as e:
-            st.error(f"Image processing failed: {e}")
-            return None
 
-    @st.dialog("📝 Grade Homework")
-    def _hw_grading_dialog(self, student_name, student_id, hw_id, total_q, current_score, current_report):
-        st.write(f"Student: **{student_name}** (ID: {student_id})")
-        
-        score = st.number_input("Correct Answers", min_value=0, max_value=int(total_q), value=int(current_score) if pd.notna(current_score) else 0, step=1)
-        report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
-        uploaded_files = st.file_uploader("Upload Attachments (Images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-        
-        st.warning("⚠️ You must click 'Save Grade' below to apply changes before closing this window.")
-        
-        if st.button("💾 Save Grade", type="primary", use_container_width=True):
-            img_bytes = self._stitch_images(uploaded_files)
-            perc = (float(score) / float(total_q)) * 100.0
-            
-            with self.db.get_connection() as conn:
-                with conn.cursor() as c:
-                    if img_bytes:
-                        c.execute("""
-                            INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report, report_image)
-                            VALUES (%s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (homework_id, student_id) 
-                            DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
-                        """, (hw_id, str(student_id), score, perc, report, psycopg2.Binary(img_bytes)))
-                    else:
-                        c.execute("""
-                            INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report)
-                            VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (homework_id, student_id) 
-                            DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report
-                        """, (hw_id, str(student_id), score, perc, report))
-                conn.commit()
-            st.rerun()
-
-        @st.dialog("📝 Grade Quiz")
-    def _qz_grading_dialog(self, student_name, student_id, q_id, q_max, current_score, current_report):
-        st.write(f"Student: **{student_name}** (ID: {student_id})")
-        
-        score = st.number_input("Final Score", min_value=0.0, max_value=float(q_max), value=float(current_score) if pd.notna(current_score) else 0.0)
-        report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
-        uploaded_files = st.file_uploader("Upload Attachments (Images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-        
-        st.warning("⚠️ You must click 'Save Grade' below to apply changes before closing this window.")
-        
-        if st.button("💾 Save Grade", type="primary", use_container_width=True):
-            img_bytes = self._stitch_images(uploaded_files)
-            perc = (float(score) / float(q_max)) * 100.0 if q_max > 0 else 0
-            
-            with self.db.get_connection() as conn:
-                with conn.cursor() as c:
-                    if img_bytes:
-                        c.execute("""
-                            INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report, report_image)
-                            VALUES (%s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (quiz_id, student_id) 
-                            DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
-                        """, (q_id, str(student_id), score, perc, report, psycopg2.Binary(img_bytes)))
-                    else:
-                        c.execute("""
-                            INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report)
-                            VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (quiz_id, student_id) 
-                            DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
-                        """, (q_id, str(student_id), score, perc, report))
-                conn.commit()
-            st.rerun()
 if __name__ == "__main__":
     app = GradePortalApp()
     app.run()
