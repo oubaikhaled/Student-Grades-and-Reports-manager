@@ -163,6 +163,7 @@ class GradePortalApp:
         
         tab_hw, tab_ch = st.tabs(["📝 Homeworks", "📑 Manage Chapters"])
         
+        # --- CHAPTER TAB ---
         with tab_ch:
             with st.form("add_chapter_form"):
                 title = st.text_input("Chapter Title (e.g., 'Unit 1: Integration')").strip()
@@ -191,6 +192,7 @@ class GradePortalApp:
                             conn.commit()
                         st.rerun()
 
+        # --- HOMEWORK TAB ---
         with tab_hw:
             if ch_df.empty:
                 st.warning("Please create at least one Chapter in the 'Manage Chapters' tab first.")
@@ -251,7 +253,8 @@ class GradePortalApp:
 
             st.divider()
 
-            st.subheader("🔍 Select Student to Grade")
+            # 3. STUDENT LIST & GRADING INTERFACE
+            st.subheader("🔍 Search & Grade Students")
             col_f1, col_f2 = st.columns(2)
             
             available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
@@ -273,47 +276,81 @@ class GradePortalApp:
                 st.warning("No students found matching your filters.")
                 return
 
-            student_options = filtered_df.apply(lambda x: f"{x['name']} (ID: {x['id']} | Score: {x['correct_answers'] if pd.notna(x['correct_answers']) else 'Missing'})", axis=1).tolist()
-            selected_student_label = st.selectbox("Select Student", student_options, key="hw_stu_picker")
-            
-            selected_student_name = selected_student_label.split(" (ID:")[0]
-            student_data = filtered_df[filtered_df['name'] == selected_student_name].iloc[0]
+            # --- THE "ADDING PAGE" PANEL (Hidden until a button is clicked) ---
+            if "active_hw_student" not in st.session_state:
+                st.session_state.active_hw_student = None
 
-            # Dedicated Grading Expandable Panel (Replaces dialog to prevent version compatibility issues)
-            with st.expander(f"📝 Grading Panel for: {student_data['name']}", expanded=True):
-                with st.form(f"hw_grade_form_{student_data['id']}"):
-                    current_score = student_data['correct_answers']
-                    current_report = student_data['report']
+            if st.session_state.active_hw_student:
+                stu_id = st.session_state.active_hw_student
+                stu_data = filtered_df[filtered_df['id'] == stu_id].iloc[0]
+                
+                st.markdown(f"### 📝 Grading Panel: {stu_data['name']} (ID: {stu_id})")
+                with st.container(border=True):
+                    st.info(f"🎯 **Full Mark for this Assignment:** {total_q}")
                     
-                    score = st.number_input("Correct Answers", min_value=0, max_value=int(total_q), value=int(current_score) if pd.notna(current_score) else 0, step=1)
-                    report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
-                    uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-                    
-                    st.warning("⚠️ Click 'Save Grade' below to apply changes.")
-                    
-                    if st.form_submit_button("💾 Save Grade", type="primary"):
-                        img_bytes = self._stitch_images(uploaded_files)
-                        perc = (float(score) / float(total_q)) * 100.0
+                    with st.form(f"hw_grade_form_{stu_id}"):
+                        current_score = stu_data['correct_answers']
+                        current_report = stu_data['report']
                         
-                        with self.db.get_connection() as conn:
-                            with conn.cursor() as c:
-                                if img_bytes:
-                                    c.execute("""
-                                        INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report, report_image)
-                                        VALUES (%s, %s, %s, %s, %s, %s)
-                                        ON CONFLICT (homework_id, student_id) 
-                                        DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
-                                    """, (hw_id, str(student_data['id']), score, perc, report, psycopg2.Binary(img_bytes)))
-                                else:
-                                    c.execute("""
-                                        INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report)
-                                        VALUES (%s, %s, %s, %s, %s)
-                                        ON CONFLICT (homework_id, student_id) 
-                                        DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report
-                                    """, (hw_id, str(student_data['id']), score, perc, report))
-                            conn.commit()
-                        st.success(f"Grade saved successfully for {student_data['name']}!")
-                        st.rerun()
+                        score = st.number_input("Correct Answers", min_value=0, max_value=int(total_q), value=int(current_score) if pd.notna(current_score) else 0, step=1)
+                        report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
+                        uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+                        
+                        col_save, col_cancel = st.columns([3, 1])
+                        if col_save.form_submit_button("💾 Save Grade", type="primary"):
+                            img_bytes = self._stitch_images(uploaded_files)
+                            perc = (float(score) / float(total_q)) * 100.0
+                            
+                            with self.db.get_connection() as conn:
+                                with conn.cursor() as c:
+                                    if img_bytes:
+                                        c.execute("""
+                                            INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report, report_image)
+                                            VALUES (%s, %s, %s, %s, %s, %s)
+                                            ON CONFLICT (homework_id, student_id) 
+                                            DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
+                                        """, (hw_id, str(stu_id), score, perc, report, psycopg2.Binary(img_bytes)))
+                                    else:
+                                        c.execute("""
+                                            INSERT INTO homework_grades (homework_id, student_id, correct_answers, percentage, report)
+                                            VALUES (%s, %s, %s, %s, %s)
+                                            ON CONFLICT (homework_id, student_id) 
+                                            DO UPDATE SET correct_answers = EXCLUDED.correct_answers, percentage = EXCLUDED.percentage, report = EXCLUDED.report
+                                        """, (hw_id, str(stu_id), score, perc, report))
+                                conn.commit()
+                            st.session_state.active_hw_student = None
+                            st.success(f"Grade saved for {stu_data['name']}!")
+                            st.rerun()
+                            
+                        if col_cancel.form_submit_button("❌ Cancel"):
+                            st.session_state.active_hw_student = None
+                            st.rerun()
+                st.divider()
+
+            # --- THE TABLE UI ---
+            st.markdown("### 📋 Class Roster")
+            
+            h1, h2, h3, h4 = st.columns([1, 3, 2, 2])
+            h1.markdown("**ID**")
+            h2.markdown("**Name**")
+            h3.markdown("**Status**")
+            h4.markdown("**Action**")
+            st.divider()
+            
+            for _, row in filtered_df.iterrows():
+                c1, c2, c3, c4 = st.columns([1, 3, 2, 2])
+                c1.write(row['id'])
+                c2.write(row['name'])
+                
+                has_score = pd.notna(row['correct_answers'])
+                if has_score:
+                    c3.success(f"✅ {int(row['correct_answers'])} / {total_q}")
+                else:
+                    c3.error("❌ Missing")
+                
+                if c4.button("✏️ Grade", key=f"btn_grade_hw_{row['id']}", use_container_width=True):
+                    st.session_state.active_hw_student = row['id']
+                    st.rerun()
 
             st.divider()
             
@@ -387,7 +424,8 @@ class GradePortalApp:
 
         st.divider()
 
-        st.subheader("🔍 Select Student to Grade")
+        # 3. STUDENT LIST & GRADING INTERFACE
+        st.subheader("🔍 Search & Grade Students")
         col_f1, col_f2 = st.columns(2)
         
         available_groups = [g for g in grades_df['group_number'].dropna().unique() if str(g).strip()]
@@ -409,46 +447,81 @@ class GradePortalApp:
             st.warning("No students found matching your filters.")
             return
 
-        student_options = filtered_df.apply(lambda x: f"{x['name']} (ID: {x['id']} | Score: {x['score'] if pd.notna(x['score']) else 'Missing'})", axis=1).tolist()
-        selected_student_label = st.selectbox("Select Student", student_options, key="qz_stu_picker")
-        
-        selected_student_name = selected_student_label.split(" (ID:")[0]
-        student_data = filtered_df[filtered_df['name'] == selected_student_name].iloc[0]
+        # --- THE "ADDING PAGE" PANEL (Hidden until a button is clicked) ---
+        if "active_qz_student" not in st.session_state:
+            st.session_state.active_qz_student = None
 
-        with st.expander(f"📝 Grading Panel for: {student_data['name']}", expanded=True):
-            with st.form(f"qz_grade_form_{student_data['id']}"):
-                current_score = student_data['score']
-                current_report = student_data['report']
+        if st.session_state.active_qz_student:
+            stu_id = st.session_state.active_qz_student
+            stu_data = filtered_df[filtered_df['id'] == stu_id].iloc[0]
+            
+            st.markdown(f"### 📝 Grading Panel: {stu_data['name']} (ID: {stu_id})")
+            with st.container(border=True):
+                st.info(f"🎯 **Full Mark for this Quiz:** {q_max}")
                 
-                score = st.number_input("Final Score", min_value=0.0, max_value=float(q_max), value=float(current_score) if pd.notna(current_score) else 0.0)
-                report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
-                uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="qz_files")
-                
-                st.warning("⚠️ Click 'Save Grade' below to apply changes.")
-                
-                if st.form_submit_button("💾 Save Grade", type="primary"):
-                    img_bytes = self._stitch_images(uploaded_files)
-                    perc = (float(score) / float(q_max)) * 100.0 if q_max > 0 else 0
+                with st.form(f"qz_grade_form_{stu_id}"):
+                    current_score = stu_data['score']
+                    current_report = stu_data['report']
                     
-                    with self.db.get_connection() as conn:
-                        with conn.cursor() as c:
-                            if img_bytes:
-                                c.execute("""
-                                    INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report, report_image)
-                                    VALUES (%s, %s, %s, %s, %s, %s)
-                                    ON CONFLICT (quiz_id, student_id) 
-                                    DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
-                                """, (q_id, str(student_data['id']), score, perc, report, psycopg2.Binary(img_bytes)))
-                            else:
-                                c.execute("""
-                                    INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report)
-                                    VALUES (%s, %s, %s, %s, %s)
-                                    ON CONFLICT (quiz_id, student_id) 
-                                    DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
-                                """, (q_id, str(student_data['id']), score, perc, report))
-                        conn.commit()
-                    st.success(f"Grade saved successfully for {student_data['name']}!")
-                    st.rerun()
+                    score = st.number_input("Final Score", min_value=0.0, max_value=float(q_max), value=float(current_score) if pd.notna(current_score) else 0.0, step=0.5)
+                    report = st.text_area("Feedback Report", value=current_report if pd.notna(current_report) else "", height=120)
+                    uploaded_files = st.file_uploader("Upload Attachments (Multiple images will be merged vertically)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="qz_files")
+                    
+                    col_save, col_cancel = st.columns([3, 1])
+                    if col_save.form_submit_button("💾 Save Grade", type="primary"):
+                        img_bytes = self._stitch_images(uploaded_files)
+                        perc = (float(score) / float(q_max)) * 100.0 if q_max > 0 else 0
+                        
+                        with self.db.get_connection() as conn:
+                            with conn.cursor() as c:
+                                if img_bytes:
+                                    c.execute("""
+                                        INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report, report_image)
+                                        VALUES (%s, %s, %s, %s, %s, %s)
+                                        ON CONFLICT (quiz_id, student_id) 
+                                        DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report, report_image = EXCLUDED.report_image
+                                    """, (q_id, str(stu_id), score, perc, report, psycopg2.Binary(img_bytes)))
+                                else:
+                                    c.execute("""
+                                        INSERT INTO quiz_grades (quiz_id, student_id, score, percentage, report)
+                                        VALUES (%s, %s, %s, %s, %s)
+                                        ON CONFLICT (quiz_id, student_id) 
+                                        DO UPDATE SET score = EXCLUDED.score, percentage = EXCLUDED.percentage, report = EXCLUDED.report
+                                    """, (q_id, str(stu_id), score, perc, report))
+                            conn.commit()
+                        st.session_state.active_qz_student = None
+                        st.success(f"Grade saved for {stu_data['name']}!")
+                        st.rerun()
+                        
+                    if col_cancel.form_submit_button("❌ Cancel"):
+                        st.session_state.active_qz_student = None
+                        st.rerun()
+            st.divider()
+
+        # --- THE TABLE UI ---
+        st.markdown("### 📋 Class Roster")
+        
+        h1, h2, h3, h4 = st.columns([1, 3, 2, 2])
+        h1.markdown("**ID**")
+        h2.markdown("**Name**")
+        h3.markdown("**Status**")
+        h4.markdown("**Action**")
+        st.divider()
+        
+        for _, row in filtered_df.iterrows():
+            c1, c2, c3, c4 = st.columns([1, 3, 2, 2])
+            c1.write(row['id'])
+            c2.write(row['name'])
+            
+            has_score = pd.notna(row['score'])
+            if has_score:
+                c3.success(f"✅ {row['score']} / {q_max}")
+            else:
+                c3.error("❌ Missing")
+            
+            if c4.button("✏️ Grade", key=f"btn_grade_qz_{row['id']}", use_container_width=True):
+                st.session_state.active_qz_student = row['id']
+                st.rerun()
 
         st.divider()
         
@@ -457,7 +530,6 @@ class GradePortalApp:
                     _, r in filtered_df.iterrows()]
         pdf_buf = PDFGenerator.generate_master_report(f"{sel_q} ({filter_group})", q_max, pdf_data)
         st.download_button("📄 Download Master PDF Report", data=pdf_buf, file_name=f"{sel_q}_{filter_group}_Master.pdf".replace(' ', '_'), mime="application/pdf")
-
     def _admin_manage_students(self):
         st.subheader("👥 Manage Students")
 
