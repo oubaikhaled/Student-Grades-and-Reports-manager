@@ -9,14 +9,11 @@ from auth import AuthManager
 import emoji
 from student_profile import StudentProfileView
 
+st.set_page_config(page_title="Eng.Mahmoud Adel Grade Portal", layout="wide")
 @st.cache_data(show_spinner=False)
 def get_cached_master_report(title, group, total, pdf_data):
     return PDFGenerator.generate_master_report(f"{title} ({group})", total, pdf_data)
 
-
-class GradePortalApp:
-    # ... rest of your code ...
-st.set_page_config(page_title="Eng.Mahmoud Adel Grade Portal", layout="wide")
 
 class GradePortalApp:
     def __init__(self):
