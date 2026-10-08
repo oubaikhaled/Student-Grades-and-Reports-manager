@@ -7,3 +7,4 @@ python-bidi
 openpyxl
 emoji
 Pillow
+requests
