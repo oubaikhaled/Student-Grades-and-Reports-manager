@@ -7,6 +7,8 @@ import emoji
 import pandas as pd
 import psycopg2
 import streamlit as st
+import base64
+import requests
 
 from auth import AuthManager
 from database import DatabaseManager
@@ -575,19 +577,81 @@ class GradePortalApp:
     # ---- login ------------------------------------------------------------
     def _render_login(self):
         st.title("📚 Eng.Mahmoud Adel Grade Portal")
-        tab_parent, tab_admin = st.tabs(["👨‍👩‍👧 Parent Access", "🔐 Admin Access"])
+        tab_parent, tab_student, tab_admin = st.tabs(["👨‍👩‍👧 Parent Access", "🎓 Student Submission", "🔐 Admin Access"])
 
         with tab_parent:
             st.subheader("View Student Grades")
-            parent_phone = st.text_input("Parent Phone Number", placeholder="e.g. 01030007000").strip()
-            if st.button("View Grades", type="primary") and parent_phone:
+            parent_phone = st.text_input("Parent Phone Number", placeholder="e.g. 01030007000", key="parent_phone_login").strip()
+            if st.button("View Grades", type="primary", key="btn_parent_login") and parent_phone:
                 self.auth.login_parent(self.db, parent_phone)
+
+        with tab_student:
+            st.subheader("📤 Submit Homework")
+            st.caption("Submit your completed homework as a PDF file.")
+            
+            # Fetch active homeworks
+            hw_df = load_homeworks(self.db)
+            if hw_df.empty:
+                st.info("No active homeworks available for submission.")
+            else:
+                hw_options = {row['homework_id']: f"{row['title']}" for _, row in hw_df.iterrows()}
+                selected_hw_id = st.selectbox("Select Homework", options=list(hw_options.keys()), format_func=lambda x: hw_options[x], key="student_hw_sel")
+                
+                # Student ID Verification
+                col1, col2 = st.columns(2)
+                student_id = col1.text_input("Enter your Student ID", key="student_id_input").strip()
+                student_name = ""
+                
+                if student_id:
+                    stu_df = self.db.fetch_dataframe("SELECT name FROM students WHERE id = %s", (student_id,))
+                    if not stu_df.empty:
+                        student_name = stu_df.iloc[0]['name']
+                        col2.success(f"Welcome, **{student_name}**!")
+                    else:
+                        col2.error("Student ID not found.")
+                
+                # File Upload
+                uploaded_file = st.file_uploader("Upload Homework (PDF only)", type=["pdf"], key="hw_upload")
+                
+                submit_disabled = not (student_id and student_name and uploaded_file)
+                if st.button("🚀 Submit Homework", type="primary", disabled=submit_disabled, use_container_width=True):
+                    with st.spinner("Uploading to Google Drive..."):
+                        try:
+                            # 1. Read and encode the file
+                            file_bytes = uploaded_file.read()
+                            base64_data = base64.b64encode(file_bytes).decode("utf-8")
+                            
+                            # 2. Enforce naming convention: <student_id>,<homework_id>.pdf
+                            file_name = f"{student_id},{selected_hw_id}.pdf"
+                            
+                            # 3. Send to Google Apps Script
+                            script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
+                            payload = {
+                                "filename": file_name,
+                                "mimeType": "application/pdf",
+                                "base64": base64_data
+                            }
+                            
+                            response = requests.post(script_url, json=payload)
+                            
+                            if response.status_code == 200:
+                                res_json = response.json()
+                                if res_json.get("status") == "success":
+                                    st.success(f"Homework successfully submitted as `{file_name}`!")
+                                    st.balloons()
+                                else:
+                                    st.error(f"Error from Google Drive: {res_json.get('message', 'Unknown error')}")
+                            else:
+                                st.error(f"Failed to connect to Google Drive. Status Code: {response.status_code}")
+                                
+                        except Exception as e:
+                            st.error(f"An error occurred: {e}")
 
         with tab_admin:
             st.subheader("Teacher & Admin Login")
             admin_num = st.text_input("Admin Number")
             admin_pass = st.text_input("Password", type="password")
-            if st.button("Login as Admin", type="primary"):
+            if st.button("Login as Admin", type="primary", key="btn_admin_login"):
                 self.auth.login_admin(admin_num, admin_pass)
 
     # ---- parent -----------------------------------------------------------
