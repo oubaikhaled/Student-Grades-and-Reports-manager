@@ -14,11 +14,15 @@ from auth import AuthManager
 from database import DatabaseManager
 from pdf_utils import PDFGenerator
 from student_profile import StudentProfileView
-
-# Requires streamlit >= 1.37 (st.fragment, dataframe row selection, st.rerun(scope=...))
+from ai_grading import (
+    fetch_pdf_from_drive,
+    grade_full_homework,
+    get_gemini_api_key,
+    parse_api_keys,
+)
 
 # 1. Page Config MUST be the very first Streamlit command
-st.set_page_config(page_title="Eng.Mahmoud Adel Grade Portal", layout="wide")
+st.set_page_config(page_title="Eng. Mahmoud Adel — Grade Portal", layout="wide")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -27,7 +31,6 @@ CACHE_TTL = 120          # seconds; every write also clears the cache immediatel
 PAGE_SIZE = 20           # rows per page on the WhatsApp screen
 MAX_IMG_WIDTH = 1200     # uploaded feedback images are downscaled to this width
 
-# Homework and quiz share the same logic; only names differ.
 KINDS = {
     "homework": {
         "table": "homework_grades", "item_col": "homework_id", "score_col": "correct_answers",
@@ -47,6 +50,18 @@ KINDS = {
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+def build_drive_hw_filename(student_id: str, homework_id: int, homework_title: str) -> str:
+    """
+    Builds a clean, filesystem-safe Google Drive filename that includes student_id,
+    homework_id, and the homework title (e.g., '176109,5_Homework_1_Derivatives.pdf').
+    """
+    safe_title = re.sub(r'[\\/*?:"<>|,]', "", str(homework_title or "")).strip()
+    safe_title = re.sub(r"\s+", "_", safe_title)
+    if safe_title:
+        return f"{student_id},{homework_id}_{safe_title}.pdf"
+    return f"{student_id},{homework_id}.pdf"
+
+
 def clean(v):
     """numpy -> python scalar, NaN/NA -> None (also keeps cache keys hashable)."""
     if v is None:
@@ -99,27 +114,41 @@ def clean_number(p_str):
 
 
 def stitch_images(uploaded_files):
-    """Merge uploaded images vertically. Downscales wide photos so the BLOB stays small."""
+    """Merge uploaded images into a clean 1- or 2-column contact sheet so large multi-page homeworks fit in PDF."""
     if not uploaded_files:
         return None
     from PIL import Image as PILImage, ImageOps
     try:
         images = []
-        for f in uploaded_files:
+        target_w = 850 if len(uploaded_files) > 3 else MAX_IMG_WIDTH
+        for f in uploaded_files[:24]:
+            if isinstance(f, bytes):
+                f = io.BytesIO(f)
             im = ImageOps.exif_transpose(PILImage.open(f)).convert("RGB")
-            if im.width > MAX_IMG_WIDTH:
-                new_h = int(im.height * MAX_IMG_WIDTH / im.width)
-                im = im.resize((MAX_IMG_WIDTH, new_h), PILImage.LANCZOS)
+            if im.width > target_w:
+                new_h = int(im.height * target_w / im.width)
+                im = im.resize((target_w, new_h), PILImage.Resampling.LANCZOS)
             images.append(im)
-        max_width = max(i.width for i in images)
-        total_height = sum(i.height for i in images)
-        stitched = PILImage.new("RGB", (max_width, total_height), color=(255, 255, 255))
+
+        cols = 2 if len(images) >= 4 else 1
+        rows = math.ceil(len(images) / cols)
+        col_w = max(i.width for i in images)
+        row_heights = [
+            max(images[r * cols + c].height for c in range(cols) if r * cols + c < len(images))
+            for r in range(rows)
+        ]
+
+        stitched = PILImage.new("RGB", (col_w * cols, sum(row_heights)), color=(255, 255, 255))
         y = 0
-        for im in images:
-            stitched.paste(im, (0, y))
-            y += im.height
+        for r in range(rows):
+            for c in range(cols):
+                idx = r * cols + c
+                if idx < len(images):
+                    stitched.paste(images[idx], (c * col_w, y))
+            y += row_heights[r]
+
         out = io.BytesIO()
-        stitched.save(out, format="JPEG", quality=80, optimize=True)
+        stitched.save(out, format="JPEG", quality=78, optimize=True)
         return out.getvalue()
     except Exception as e:
         st.error(f"Image processing failed: {e}")
@@ -181,12 +210,10 @@ def build_wa_messages(kind, name, title, score, total):
 
 # ---------------------------------------------------------------------------
 # Shared resources & cached reads
-# (`_db` has a leading underscore so Streamlit doesn't try to hash it)
-# Every write calls st.cache_data.clear(), so admins always see fresh data.
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_db():
-    """Created once per server process instead of on every rerun (incl. init_db DDL)."""
+    """Created once per server process with a persistent connection pool."""
     db = DatabaseManager(st.secrets["DATABASE_URL"])
     db.init_db()
     return db
@@ -200,7 +227,7 @@ def load_chapters(_db):
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_homeworks(_db):
     return _db.fetch_dataframe(
-        "SELECT homework_id, title, total_questions, video_link, chapter_id FROM homeworks ORDER BY homework_id DESC"
+        "SELECT homework_id, title, total_questions, video_link, chapter_id, rubric FROM homeworks ORDER BY homework_id DESC"
     )
 
 
@@ -220,10 +247,17 @@ def load_students(_db):
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_item_grades(_db, kind, item_id):
-    """Grades for ONE homework/quiz. No image column: images are fetched only when a PDF is built."""
     cfg = KINDS[kind]
+    if kind == "homework":
+        return _db.fetch_dataframe(
+            f"SELECT student_id, {cfg['score_col']} AS score, percentage, report, "
+            f"COALESCE(submitted, FALSE) AS submitted "
+            f"FROM {cfg['table']} WHERE {cfg['item_col']} = %s",
+            (item_id,),
+        )
     return _db.fetch_dataframe(
-        f"SELECT student_id, {cfg['score_col']} AS score, percentage, report "
+        f"SELECT student_id, {cfg['score_col']} AS score, percentage, report, "
+        f"FALSE AS submitted "
         f"FROM {cfg['table']} WHERE {cfg['item_col']} = %s",
         (item_id,),
     )
@@ -231,12 +265,14 @@ def load_item_grades(_db, kind, item_id):
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_parent_students(_db, phone):
-    return _db.fetch_dataframe("SELECT id, name FROM students WHERE phone_parent = %s", (phone,))
+    return _db.fetch_dataframe(
+        "SELECT id, name, phone, phone_parent, group_number, notes FROM students WHERE phone_parent = %s ORDER BY name ASC",
+        (phone,),
+    )
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_parent_grades(_db, kind, student_ids):
-    """One query for ALL of a parent's children (no per-child N+1). `student_ids` is a tuple."""
     if kind == "homework":
         sql = """
             SELECT g.student_id, h.homework_id AS item_id, h.title AS "Assignment",
@@ -259,18 +295,28 @@ def load_parent_grades(_db, kind, student_ids):
 
 
 def merge_grades(students_df, grades_df):
-    """Left-join students with one item's grades in pandas (students list is cached separately)."""
     out = students_df.copy()
     if grades_df.empty:
         out["score"] = float("nan")
         out["percentage"] = float("nan")
         out["report"] = None
+        out["submitted"] = False
         return out
     out["_sid"] = out["id"].astype(str)
     g = grades_df.copy()
     g["_sid"] = g["student_id"].astype(str)
     g = g.drop(columns=["student_id"])
-    return out.merge(g, on="_sid", how="left").drop(columns="_sid")
+    merged = out.merge(g, on="_sid", how="left").drop(columns="_sid")
+    merged["submitted"] = merged["submitted"].fillna(False).astype(bool)
+    return merged
+
+
+def format_submission_status(score, max_score, submitted=False):
+    if pd.notna(score):
+        return f"✅ {fmt(score)} / {fmt(max_score)}"
+    if bool(submitted):
+        return "📩 Submitted (Pending Grading)"
+    return "❌ Missing"
 
 
 def fetch_report_image(db, kind, item_id, student_id):
@@ -290,7 +336,6 @@ def fetch_report_image(db, kind, item_id, student_id):
 @st.cache_data(show_spinner=False, ttl=600, max_entries=200)
 def build_report_pdf(_db, kind, item_id, student_id, student_name, title,
                      score, out_of, pct, report, video_link):
-    """Builds (and caches) one student's PDF. The image BLOB is loaded here, only on demand."""
     img = fetch_report_image(_db, kind, item_id, student_id)
     extra = {"video_link": video_link} if video_link else {}
     buf = PDFGenerator.generate_student_report(
@@ -304,12 +349,30 @@ def get_cached_master_report(title, group, total, pdf_data):
     return to_bytes(PDFGenerator.generate_master_report(f"{title} ({group})", total, pdf_data))
 
 
+def mark_homework_submitted(db, homework_id: int, student_id: str):
+    """Marks a homework as submitted in the database when a student uploads their PDF."""
+    sql = """
+        INSERT INTO homework_grades (homework_id, student_id, submitted)
+        VALUES (%s, %s, TRUE)
+        ON CONFLICT (homework_id, student_id) DO UPDATE SET submitted = TRUE
+    """
+    with db.get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(sql, (int(homework_id), str(student_id)))
+        conn.commit()
+    st.cache_data.clear()
+
+
 def save_grade(db, kind, item_id, student_id, score, perc, report, img_bytes):
     cfg = KINDS[kind]
     t, ic, sc = cfg["table"], cfg["item_col"], cfg["score_col"]
     cols = [ic, "student_id", sc, "percentage", "report"]
     vals = [int(item_id), str(student_id), score, perc, report]
     updates = [f"{sc} = EXCLUDED.{sc}", "percentage = EXCLUDED.percentage", "report = EXCLUDED.report"]
+    if kind == "homework":
+        cols.append("submitted")
+        vals.append(True)
+        updates.append("submitted = TRUE")
     if img_bytes:
         cols.append("report_image")
         vals.append(psycopg2.Binary(img_bytes))
@@ -326,7 +389,6 @@ def save_grade(db, kind, item_id, student_id, score, perc, report, img_bytes):
 
 
 def filter_students(df, key_prefix):
-    """Group + search filters. Vectorised, and regex=False so input like '(' can't crash."""
     col_f1, col_f2 = st.columns(2)
     groups = sorted({str(g).strip() for g in df["group_number"].dropna().unique() if str(g).strip()})
     filter_group = col_f1.selectbox("Filter by Group", ["All Groups"] + groups, key=f"{key_prefix}_grp_sel")
@@ -346,16 +408,21 @@ def filter_students(df, key_prefix):
 
 
 # ---------------------------------------------------------------------------
-# Fragments: interactions inside these rerun ONLY the fragment, not the whole page
+# Fragments
 # ---------------------------------------------------------------------------
 @st.fragment
-def parent_student_fragment(db, sid, name, hw_df, qz_df):
-    st.subheader(f"🎓 {name}")
-    col1, col2 = st.columns(2)
-    with col1:
-        render_parent_grades(db, "homework", sid, name, hw_df)
-    with col2:
-        render_parent_grades(db, "quiz", sid, name, qz_df)
+def parent_student_fragment(db, student_row, hw_df, qz_df):
+    sid = str(student_row["id"])
+    name = student_row["name"]
+
+    StudentProfileView(db).render_single_student_profile(student_row, is_admin=False)
+
+    with st.expander(f"📄 Download Individual Homework & Quiz Feedback Reports for {name}", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            render_parent_grades(db, "homework", sid, name, hw_df)
+        with col2:
+            render_parent_grades(db, "quiz", sid, name, qz_df)
     st.divider()
 
 
@@ -377,7 +444,6 @@ def render_parent_grades(db, kind, sid, student_name, df):
     item_id = int(row["item_id"])
     gen_key = f"gen_{kind}_{sid}_{item_id}"
 
-    # Lazy PDF: nothing is generated until the parent asks for it
     if not st.session_state.get(gen_key):
         st.button("📄 Prepare PDF Report", key=f"btn_{gen_key}", use_container_width=True,
                   on_click=set_flag, args=(gen_key,))
@@ -395,13 +461,12 @@ def render_parent_grades(db, kind, sid, student_name, df):
 
 
 @st.fragment
-def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label):
-    """Roster + grading panel + master PDF for one homework/quiz."""
+def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label, saved_rubric=""):
     cfg = KINDS[kind]
     ver_key = f"roster_ver_{kind}"
     st.session_state.setdefault(ver_key, 0)
 
-    panel = st.container()  # grading panel is drawn here (above the roster) once a row is picked
+    panel = st.container()
 
     st.markdown("### 📋 Class Roster")
     st.caption("Click a row to grade that student.")
@@ -409,7 +474,10 @@ def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label):
         "ID": df["id"].astype(str).values,
         "Name": df["name"].values,
         "Group": df["group_number"].fillna("").astype(str).values,
-        "Status": [f"✅ {fmt(s)} / {fmt(max_score)}" if pd.notna(s) else "❌ Missing" for s in df["score"]],
+        "Status": [
+            format_submission_status(s, max_score, sub)
+            for s, sub in zip(df["score"], df["submitted"])
+        ],
     })
     event = st.dataframe(
         view, hide_index=True, use_container_width=True,
@@ -421,43 +489,191 @@ def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label):
 
     if rows:
         stu = df.iloc[rows[0]]
-        stu_id = stu["id"]
+        stu_id = str(stu["id"])
         with panel:
             st.markdown(f"### 📝 Grading Panel: {stu['name']} (ID: {stu_id})")
-            with st.container(border=True):
-                st.info(f"🎯 **Full Mark for this {cfg['noun']}:** {fmt(max_score)}")
-                with st.form(f"grade_form_{kind}_{item_id}_{stu_id}"):
-                    cur = stu["score"]
-                    if cfg["is_int"]:
-                        score = st.number_input(cfg["score_label"], min_value=0, max_value=int(max_score),
-                                                value=int(cur) if pd.notna(cur) else 0, step=1)
-                    else:
-                        score = st.number_input(cfg["score_label"], min_value=0.0, max_value=float(max_score),
-                                                value=float(cur) if pd.notna(cur) else 0.0, step=0.5)
-                    report = st.text_area("Feedback Report",
-                                          value=stu["report"] if pd.notna(stu["report"]) else "", height=120)
-                    files = st.file_uploader(
-                        "Upload Attachments (Multiple images will be merged vertically)",
-                        type=["png", "jpg", "jpeg"], accept_multiple_files=True,
-                    )
-                    col_save, col_cancel = st.columns([3, 1])
-                    save = col_save.form_submit_button("💾 Save Grade", type="primary")
-                    cancel = col_cancel.form_submit_button("❌ Cancel")
+            st.info(f"🎯 **Full Mark for this {cfg['noun']}:** {fmt(max_score)}")
+
+            score_key = f"ai_score_{kind}_{item_id}_{stu_id}"
+            report_key = f"ai_report_{kind}_{item_id}_{stu_id}"
+            images_key = f"ai_images_{kind}_{item_id}_{stu_id}"
+
+            if kind == "homework":
+                col_manual, col_ai = st.columns([3, 2])
+            else:
+                col_manual = st.container()
+                col_ai = None
+
+            # -----------------------------------------------------------------
+            # RIGHT COLUMN: 1-CLICK AI AUTO-GRADING (SIDE-BY-SIDE)
+            # -----------------------------------------------------------------
+            if kind == "homework" and col_ai is not None:
+                with col_ai:
+                    with st.container(border=True):
+                        st.markdown("#### 🤖 AI Auto-Grading")
+                        st.caption(
+                            "Fetch this student's submitted homework from Google Drive "
+                            "and automatically fill the score and feedback report ."
+                        )
+
+                        grade_clicked = st.button(
+                            "✨ Auto-Grade with AI",
+                            type="primary",
+                            key=f"btn_ai_grade_{stu_id}_{item_id}",
+                            use_container_width=True,
+                        )
+
+                        if grade_clicked:
+                            active_keys = parse_api_keys(get_gemini_api_key(st.secrets))
+                            if not active_keys:
+                                st.error("AI grading is not configured. Please grade manually on the left.")
+                            else:
+                                new_filename = build_drive_hw_filename(stu_id, item_id, item_title)
+                                legacy_filename = f"{stu_id},{item_id}.pdf"
+
+                                prog_placeholder = st.empty()
+                                prog_bar = prog_placeholder.progress(
+                                    0.02, text="📥 Retrieving homework from Google Drive..."
+                                )
+
+                                pdf_data = None
+                                try:
+                                    try:
+                                        pdf_data = fetch_pdf_from_drive(new_filename)
+                                    except FileNotFoundError:
+                                        if new_filename != legacy_filename:
+                                            pdf_data = fetch_pdf_from_drive(legacy_filename)
+                                        else:
+                                            raise
+                                except FileNotFoundError:
+                                    prog_placeholder.empty()
+                                    st.warning(
+                                        f"No submission found on Google Drive for **{stu['name']}** yet. "
+                                        f"You can enter their grade manually on the left."
+                                    )
+                                except Exception as e:
+                                    prog_placeholder.empty()
+                                    st.error(f"Could not retrieve submission: {e}")
+
+                                if pdf_data:
+                                    if not bool(stu.get("submitted", False)):
+                                        mark_homework_submitted(db, item_id, stu_id)
+
+                                    def on_progress(current_step, total_steps, msg):
+                                        pct = min(1.0, max(0.0, current_step / max(1, total_steps)))
+                                        prog_bar.progress(pct, text=msg)
+
+                                    try:
+                                        ai_res = grade_full_homework(
+                                            pdf_bytes=pdf_data,
+                                            assignment_title=item_title,
+                                            max_score=float(max_score),
+                                            api_key=active_keys,
+                                            rubric=saved_rubric or "",
+                                            model_name="auto",
+                                            progress_callback=on_progress,
+                                        )
+                                        prog_placeholder.empty()
+                                        st.session_state[score_key] = ai_res["final_score"]
+                                        st.session_state[report_key] = ai_res["consolidated_report"]
+                                        st.session_state[images_key] = [p["image_bytes"] for p in ai_res["page_results"]]
+                                        st.toast(f"✅ AI Grading Complete: {ai_res['final_score']} / {max_score}")
+                                        st.rerun(scope="fragment")
+                                    except Exception as e:
+                                        prog_placeholder.empty()
+                                        st.error(f"AI Grading failed: {e}")
+
+                        if images_key in st.session_state and st.session_state[images_key]:
+                            page_imgs = st.session_state[images_key]
+                            st.success(
+                                f"✅ **Graded {len(page_imgs)} page(s)!** "
+                                f"Review the score & report on the left, then click **Save Grade**."
+                            )
+                            with st.expander(f"📄 View Submitted Pages ({len(page_imgs)})", expanded=False):
+                                cols_p = st.columns(2)
+                                for idx, p_bytes in enumerate(page_imgs):
+                                    with cols_p[idx % 2]:
+                                        st.image(p_bytes, caption=f"Page {idx + 1}", use_container_width=True)
+
+            # -----------------------------------------------------------------
+            # LEFT COLUMN: CLASSIC MANUAL GRADING FORM (SIDE-BY-SIDE)
+            # -----------------------------------------------------------------
+            cur = stu["score"]
+            default_score = st.session_state.get(
+                score_key,
+                int(cur) if (pd.notna(cur) and cfg["is_int"]) else (float(cur) if pd.notna(cur) else (0 if cfg["is_int"] else 0.0))
+            )
+            default_report = st.session_state.get(
+                report_key,
+                stu["report"] if pd.notna(stu["report"]) else ""
+            )
+
+            ai_rev = "ai" if score_key in st.session_state else "man"
+            with col_manual:
+                with st.container(border=True):
+                    st.markdown("#### ✍️ Grade & Feedback Report")
+                    with st.form(f"grade_form_{kind}_{item_id}_{stu_id}_{ai_rev}"):
+                        if cfg["is_int"]:
+                            score = st.number_input(
+                                cfg["score_label"],
+                                min_value=0,
+                                max_value=int(max_score),
+                                value=int(round(float(default_score))),
+                                step=1,
+                            )
+                        else:
+                            score = st.number_input(
+                                cfg["score_label"],
+                                min_value=0.0,
+                                max_value=float(max_score),
+                                value=float(default_score),
+                                step=0.5,
+                            )
+                        report = st.text_area("Feedback Report", value=default_report, height=140)
+                        files = st.file_uploader(
+                            "Upload Attachments (Multiple images will be merged vertically)",
+                            type=["png", "jpg", "jpeg"],
+                            accept_multiple_files=True,
+                        )
+
+                        attach_ai_pages = False
+                        if images_key in st.session_state and st.session_state[images_key]:
+                            attach_ai_pages = st.checkbox(
+                                "📎 Attach AI-inspected homework pages to student's report card",
+                                value=True,
+                            )
+
+                        col_save, col_cancel = st.columns([3, 1])
+                        save = col_save.form_submit_button("💾 Save Grade", type="primary", use_container_width=True)
+                        cancel = col_cancel.form_submit_button("❌ Cancel", use_container_width=True)
 
             if save:
-                img_bytes = stitch_images(files)
+                if files:
+                    img_bytes = stitch_images(files)
+                elif attach_ai_pages and images_key in st.session_state:
+                    img_bytes = stitch_images(st.session_state[images_key])
+                else:
+                    img_bytes = None
+
                 perc = (float(score) / float(max_score)) * 100.0 if max_score > 0 else 0
                 save_grade(db, kind, item_id, stu_id, score, perc, report, img_bytes)
-                st.session_state[ver_key] += 1          # clears the row selection
+
+                st.session_state.pop(score_key, None)
+                st.session_state.pop(report_key, None)
+                st.session_state.pop(images_key, None)
+
+                st.session_state[ver_key] += 1
                 st.session_state["flash"] = f"Grade saved for {stu['name']}!"
-                st.rerun()                               # full rerun so everything shows fresh data
+                st.rerun()
             if cancel:
+                st.session_state.pop(score_key, None)
+                st.session_state.pop(report_key, None)
+                st.session_state.pop(images_key, None)
                 st.session_state[ver_key] += 1
                 st.rerun(scope="fragment")
 
     st.divider()
 
-    # --- LAZY MASTER PDF ---
     master_key = f"gen_master_{kind}_{item_id}_{group_label}"
     if not st.session_state.get(master_key):
         st.button("📄 Prepare Master PDF Report", key=f"btn_{master_key}",
@@ -478,7 +694,6 @@ def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label):
 
 @st.fragment
 def whatsapp_fragment(db, kind, item_id, title, total, vid_link, df):
-    """Paginated broadcast list. Only PAGE_SIZE rows are rendered / built per run."""
     n = len(df)
     pages = max(1, math.ceil(n / PAGE_SIZE))
     page = 1
@@ -496,9 +711,12 @@ def whatsapp_fragment(db, kind, item_id, title, total, vid_link, df):
         col1.markdown(f"**{row['name']}**{group_label}")
 
         score = clean(row["score"])
+        is_submitted = bool(row.get("submitted", False))
         has_score = score is not None
         if has_score:
             col2.write(f"Score: **{fmt(score)}** / {fmt(total)}")
+        elif is_submitted:
+            col2.markdown("Status: 📩 **Submitted**")
         else:
             col2.markdown("Score: ❌ **Missing**")
 
@@ -553,20 +771,24 @@ def whatsapp_fragment(db, kind, item_id, title, total, vid_link, df):
 # ---------------------------------------------------------------------------
 class GradePortalApp:
     def __init__(self):
-        self.db = get_db()           # cached: no new connection manager / init_db per rerun
-        self.auth = AuthManager()    # cheap, kept per-run in case it holds per-session state
+        self.db = get_db()
+        self.auth = AuthManager()
 
     def run(self):
+        query_params = st.query_params
+        is_admin_route = "admin" in query_params
+
         if "logged_in" not in st.session_state or not st.session_state.logged_in:
-            self._render_login()
+            if is_admin_route:
+                self._render_admin_login()
+            else:
+                self._render_public_login()
         elif st.session_state.role == "parent":
             self._render_parent_portal()
         elif st.session_state.role == "admin":
             self._render_admin_portal()
 
-    # ---- writes -----------------------------------------------------------
     def _write(self, ops):
-        """Run several statements in ONE transaction, then invalidate cached reads."""
         with self.db.get_connection() as conn:
             with conn.cursor() as c:
                 for sql, params in ops:
@@ -574,10 +796,17 @@ class GradePortalApp:
             conn.commit()
         st.cache_data.clear()
 
-    # ---- login ------------------------------------------------------------
-    def _render_login(self):
-        st.title("📚 Eng.Mahmoud Adel Grade Portal")
-        tab_parent, tab_student, tab_admin = st.tabs(["👨‍👩‍👧 Parent Access", "🎓 Student Submission", "🔐 Admin Access"])
+    def _render_public_login(self):
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            try:
+                st.image("assets/images/logo.png", use_container_width=True)
+            except Exception:
+                pass
+            st.title("Eng. Mahmoud Adel")
+            st.caption("Student Portal & Homework Submission")
+
+        tab_parent, tab_student = st.tabs(["👨‍👩‍👦 Parent Access", "📤 Student Submission"])
 
         with tab_parent:
             st.subheader("View Student Grades")
@@ -588,83 +817,85 @@ class GradePortalApp:
         with tab_student:
             st.subheader("📤 Submit Homework")
             st.caption("Submit your completed homework as a PDF file.")
-            
-            # Fetch active homeworks
+
             hw_df = load_homeworks(self.db)
             if hw_df.empty:
                 st.info("No active homeworks available for submission.")
             else:
-                hw_options = {row['homework_id']: f"{row['title']}" for _, row in hw_df.iterrows()}
+                hw_options = {row["homework_id"]: f"{row['title']}" for _, row in hw_df.iterrows()}
                 selected_hw_id = st.selectbox("Select Homework", options=list(hw_options.keys()), format_func=lambda x: hw_options[x], key="student_hw_sel")
-                
-                # Student ID Verification
+                selected_hw_title = hw_options[selected_hw_id]
+
                 col1, col2 = st.columns(2)
                 student_id = col1.text_input("Enter your Student ID", key="student_id_input").strip()
                 student_name = ""
-                
+
                 if student_id:
-                    stu_df = self.db.fetch_dataframe("SELECT name FROM students WHERE id = %s", (student_id,))
-                    if not stu_df.empty:
-                        student_name = stu_df.iloc[0]['name']
+                    all_stu_df = load_students(self.db)
+                    match = all_stu_df[all_stu_df["id"].astype(str) == student_id]
+                    if not match.empty:
+                        student_name = match.iloc[0]["name"]
                         col2.success(f"Welcome, **{student_name}**!")
                     else:
                         col2.error("Student ID not found.")
-                
-                # File Upload
+
                 uploaded_file = st.file_uploader("Upload Homework (PDF only)", type=["pdf"], key="hw_upload")
-                
+
                 submit_disabled = not (student_id and student_name and uploaded_file)
                 if st.button("🚀 Submit Homework", type="primary", disabled=submit_disabled, use_container_width=True):
-                    with st.spinner("Uploading to Google Drive..."):
+                    with st.spinner("Uploading your homework..."):
                         try:
-                            # 1. Read and encode the file
                             file_bytes = uploaded_file.read()
                             base64_data = base64.b64encode(file_bytes).decode("utf-8")
-                            
-                            # 2. Enforce naming convention: <student_id>,<homework_id>.pdf
-                            file_name = f"{student_id},{selected_hw_id}.pdf"
-                            
-                            # 3. Send to Google Apps Script
+
+                            # Naming convention includes Student ID, Homework ID, and Homework Title
+                            file_name = build_drive_hw_filename(student_id, selected_hw_id, selected_hw_title)
+
                             script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
                             payload = {
                                 "filename": file_name,
                                 "mimeType": "application/pdf",
                                 "base64": base64_data
                             }
-                            
-                            response = requests.post(script_url, json=payload)
-                            
+
+                            response = requests.post(script_url, json=payload, timeout=60)
                             if response.status_code == 200:
                                 res_json = response.json()
                                 if res_json.get("status") == "success":
-                                    st.success(f"Homework successfully submitted as `{file_name}`!")
+                                    # Immediately record 'submitted = TRUE' in PostgreSQL
+                                    mark_homework_submitted(self.db, selected_hw_id, student_id)
+                                    st.success(f"✅ Homework **{selected_hw_title}** submitted successfully!")
                                     st.balloons()
                                 else:
                                     st.error(f"Error from Google Drive: {res_json.get('message', 'Unknown error')}")
                             else:
                                 st.error(f"Failed to connect to Google Drive. Status Code: {response.status_code}")
-                                
                         except Exception as e:
                             st.error(f"An error occurred: {e}")
 
-        with tab_admin:
-            st.subheader("Teacher & Admin Login")
-            admin_num = st.text_input("Admin Number")
-            admin_pass = st.text_input("Password", type="password")
-            if st.button("Login as Admin", type="primary", key="btn_admin_login"):
-                self.auth.login_admin(admin_num, admin_pass)
+    def _render_admin_login(self):
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.title("Teacher & Admin Portal")
+            st.caption("Please log in to access the management dashboard.")
 
-    # ---- parent -----------------------------------------------------------
+            with st.container(border=True):
+                admin_num = st.text_input("Admin Number")
+                admin_pass = st.text_input("Password", type="password")
+                if st.button("Login Securely", type="primary", key="btn_admin_login", use_container_width=True):
+                    self.auth.login_admin(admin_num, admin_pass)
+
     def _render_parent_portal(self):
-        st.sidebar.button("🚪 Logout", on_click=self.auth.logout, type="primary")
-        st.title("📊 Student Grades Overview")
+        st.sidebar.button("🚪 Logout", on_click=self.auth.logout, type="primary", use_container_width=True)
+        st.title("👤 Student Profile & Grades Overview")
 
         students_df = load_parent_students(self.db, st.session_state.identifier)
         if students_df.empty:
+            st.warning("No students found linked to this phone number.")
             return
 
         ids = tuple(str(i) for i in students_df["id"])
-        hw_all = load_parent_grades(self.db, "homework", ids)   # 2 queries total, not 2 per child
+        hw_all = load_parent_grades(self.db, "homework", ids)
         qz_all = load_parent_grades(self.db, "quiz", ids)
 
         def subset(df, sid):
@@ -674,35 +905,42 @@ class GradePortalApp:
 
         for _, student in students_df.iterrows():
             sid = str(student["id"])
-            parent_student_fragment(self.db, sid, student["name"], subset(hw_all, sid), subset(qz_all, sid))
+            parent_student_fragment(self.db, student, subset(hw_all, sid), subset(qz_all, sid))
 
-    # ---- admin shell ------------------------------------------------------
     def _render_admin_portal(self):
-        st.sidebar.button("🚪 Logout", on_click=self.auth.logout, type="primary")
-        st.title("Eng.Mahmoud Adel Grade Portal")
+        st.sidebar.markdown("### 🎓 Eng. Mahmoud Adel")
+        st.sidebar.caption("Grade Management Portal")
         menu = st.sidebar.radio(
             "Navigation",
-            ["Manage Homeworks", "Manage Quizzes", "Manage Students",
-             "Student Profiles", "WhatsApp Students and parents"],
+            [
+                "📚 Manage Homeworks",
+                "📝 Manage Quizzes",
+                "👥 Manage Students",
+                "👤 Student Profiles",
+                "💬 WhatsApp Broadcast",
+            ],
         )
+        st.sidebar.divider()
+        st.sidebar.button("🚪 Logout", on_click=self.auth.logout, type="primary", use_container_width=True)
+
+        st.title("Eng. Mahmoud Adel — Grade Portal")
 
         flash = st.session_state.pop("flash", None)
         if flash:
             st.success(flash)
 
-        if menu == "Manage Homeworks":
+        if menu == "📚 Manage Homeworks":
             self._admin_manage_homeworks()
-        elif menu == "Manage Quizzes":
+        elif menu == "📝 Manage Quizzes":
             self._admin_record_quizzes()
-        elif menu == "Manage Students":
+        elif menu == "👥 Manage Students":
             self._admin_manage_students()
-        elif menu == "Student Profiles":
+        elif menu == "👤 Student Profiles":
             StudentProfileView(self.db).render()
-        elif menu == "WhatsApp Students and parents":
+        elif menu == "💬 WhatsApp Broadcast":
             self._admin_whatsapp_parents()
 
-    # ---- shared grading section ------------------------------------------
-    def _grading_section(self, kind, item_id, item_title, max_score):
+    def _grading_section(self, kind, item_id, item_title, max_score, saved_rubric=""):
         st.divider()
         st.subheader("🔍 Search & Grade Students")
 
@@ -713,15 +951,13 @@ class GradePortalApp:
         if filtered.empty:
             st.warning("No students found matching your filters.")
             return
-        grading_fragment(self.db, kind, item_id, item_title, max_score, filtered, filter_group)
+        grading_fragment(self.db, kind, item_id, item_title, max_score, filtered, filter_group, saved_rubric=saved_rubric)
 
-    # ---- homeworks --------------------------------------------------------
     def _admin_manage_homeworks(self):
         st.subheader("📚 Manage Curriculum & Homeworks")
         tab_hw, tab_ch = st.tabs(["📝 Homeworks", "📑 Manage Chapters"])
         ch_df = load_chapters(self.db)
 
-        # --- CHAPTER TAB ---
         with tab_ch:
             with st.form("add_chapter_form"):
                 title = st.text_input("Chapter Title (e.g., 'Unit 1: Integration')").strip()
@@ -744,7 +980,6 @@ class GradePortalApp:
                         self._write([("DELETE FROM chapters WHERE chapter_id = %s", (int(del_id),))])
                         st.rerun()
 
-        # --- HOMEWORK TAB ---
         with tab_hw:
             if ch_df.empty:
                 st.warning("Please create at least one Chapter in the 'Manage Chapters' tab first.")
@@ -760,14 +995,21 @@ class GradePortalApp:
                     title = st.text_input("Homework Title")
                     total_q = st.number_input("Total Questions (Max Score)", min_value=1, step=1)
                     video_link = st.text_input("Homework Video Link (Optional)", placeholder="https://youtube.com/...")
+                    rubric = st.text_area(
+                        "AI Grading Answer Key / Rubric (Optional)",
+                        placeholder="Paste the model answers here so AI can auto-grade with one click (e.g., Q1: B (-1), Q2: C (4), Q3: dy/dx = 2x + 1)...",
+                        height=110,
+                    )
 
                     if st.form_submit_button("➕ Add Homework", type="primary") and title.strip():
                         try:
                             clean_link = video_link.strip() or None
+                            clean_rubric = rubric.strip() or None
                             self._write([(
-                                "INSERT INTO homeworks (title, total_questions, video_link, chapter_id) VALUES (%s, %s, %s, %s)",
-                                (title.strip(), int(total_q), clean_link, int(ch_id)),
+                                "INSERT INTO homeworks (title, total_questions, video_link, chapter_id, rubric) VALUES (%s, %s, %s, %s, %s)",
+                                (title.strip(), int(total_q), clean_link, int(ch_id), clean_rubric),
                             )])
+                            st.session_state["flash"] = f"Homework '{title.strip()}' created!"
                             st.rerun()
                         except Exception as e:
                             st.error(f"Error: {e}")
@@ -794,15 +1036,37 @@ class GradePortalApp:
             hw_id = int(st.selectbox("Current Homework", list(hw_titles.keys()),
                                      format_func=lambda i: hw_titles[i], key="sel_hw_grade"))
             hw_row = hw_df[hw_df["homework_id"] == hw_id].iloc[0]
-            self._grading_section("homework", hw_id, hw_row["title"], int(hw_row["total_questions"]))
+            saved_rubric = str(hw_row["rubric"]).strip() if "rubric" in hw_row and pd.notna(hw_row["rubric"]) else ""
 
-    # ---- quizzes ----------------------------------------------------------
+            with st.expander("📋 View or Update Answer Key / Rubric for this Homework", expanded=False):
+                with st.form(f"edit_rubric_form_{hw_id}"):
+                    updated_rubric = st.text_area(
+                        "Answer Key / Rubric used for 1-Click AI Grading",
+                        value=saved_rubric,
+                        placeholder="e.g., Q1: B (-1), Q2: C (4), Q3: dy/dx = 2x + 1...",
+                        height=100,
+                    )
+                    if st.form_submit_button("💾 Save Answer Key", type="primary"):
+                        self._write([
+                            ("UPDATE homeworks SET rubric = %s WHERE homework_id = %s", (updated_rubric.strip() or None, hw_id))
+                        ])
+                        st.session_state["flash"] = "Answer Key updated!"
+                        st.rerun()
+
+            self._grading_section(
+                "homework",
+                hw_id,
+                hw_row["title"],
+                int(hw_row["total_questions"]),
+                saved_rubric=saved_rubric,
+            )
+
     def _admin_record_quizzes(self):
         st.subheader("📝 Manage Curriculum & Quizzes")
 
         ch_df = load_chapters(self.db)
         if ch_df.empty:
-            st.warning("Please create at least one Chapter in 'Manage Homeworks' -> 'Manage Chapters' tab first.")
+            st.warning("Please create at least one Chapter in '📚 Manage Homeworks' -> 'Manage Chapters' tab first.")
             return
         ch_titles = dict(zip(ch_df["chapter_id"], ch_df["title"]))
         qz_df = load_quizzes(self.db)
@@ -815,7 +1079,6 @@ class GradePortalApp:
                 q_max_in = st.number_input("Maximum Score", min_value=1.0, value=10.0, step=1.0)
                 if st.form_submit_button("➕ Create Quiz", type="primary") and q_title:
                     try:
-                        # One statement: create the quiz AND a blank grade row for every student
                         self._write([(
                             """
                             WITH q AS (
@@ -855,7 +1118,6 @@ class GradePortalApp:
         q_row = qz_df[qz_df["quiz_id"] == q_id].iloc[0]
         self._grading_section("quiz", q_id, q_row["title"], float(q_row["max_score"]))
 
-    # ---- students ---------------------------------------------------------
     def _admin_manage_students(self):
         st.subheader("👥 Manage Students")
 
@@ -894,7 +1156,7 @@ class GradePortalApp:
             st.info("No students registered yet.")
             return
 
-        st.caption("Current Enrolled Students")
+        st.caption(f"Current Enrolled Students ({len(students_df)})")
         st.dataframe(students_df, hide_index=True, use_container_width=True)
 
         st.divider()
@@ -979,7 +1241,6 @@ class GradePortalApp:
                 except Exception as e:
                     st.error(f"Failed to delete student. Error: {e}")
 
-    # ---- whatsapp ---------------------------------------------------------
     def _admin_whatsapp_parents(self):
         st.subheader("💬 WhatsApp & Report Broadcasting")
         st.caption("Bulk download PDFs and message parents or students directly for graded or missing assignments.")
@@ -989,7 +1250,7 @@ class GradePortalApp:
 
         ch_df = load_chapters(self.db)
         if ch_df.empty:
-            st.warning("No chapters exist yet. Please create a chapter in 'Manage Homeworks' first.")
+            st.warning("No chapters exist yet. Please create a chapter in '📚 Manage Homeworks' first.")
             return
 
         ch_titles = dict(zip(ch_df["chapter_id"], ch_df["title"]))
