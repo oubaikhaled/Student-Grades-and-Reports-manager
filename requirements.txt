@@ -8,19 +8,7 @@ openpyxl
 emoji
 Pillow
 requests
+pymupdf
 fastapi
 uvicorn
 PyJWT
-google-genai
-pymupdf
-pypdf
-opencv-python-headless
-numpy
- base64
-io
-json
-loggin
-time
-requests
-pymupdf
-PIL
