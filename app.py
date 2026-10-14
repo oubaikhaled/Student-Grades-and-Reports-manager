@@ -796,7 +796,7 @@ class GradePortalApp:
             conn.commit()
         st.cache_data.clear()
 
-    def _render_public_login(self):
+   def _render_public_login(self):
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             try:
@@ -810,7 +810,9 @@ class GradePortalApp:
 
         with tab_parent:
             st.subheader("View Student Grades")
-            parent_phone = st.text_input("Parent Phone Number", placeholder="e.g. 01030007000", key="parent_phone_login").strip()
+            parent_phone = st.text_input(
+                "Parent Phone Number", placeholder="e.g. 01030007000", key="parent_phone_login"
+            ).strip()
             if st.button("View Grades", type="primary", key="btn_parent_login") and parent_phone:
                 self.auth.login_parent(self.db, parent_phone)
 
@@ -823,56 +825,155 @@ class GradePortalApp:
                 st.info("No active homeworks available for submission.")
             else:
                 hw_options = {row["homework_id"]: f"{row['title']}" for _, row in hw_df.iterrows()}
-                selected_hw_id = st.selectbox("Select Homework", options=list(hw_options.keys()), format_func=lambda x: hw_options[x], key="student_hw_sel")
+                selected_hw_id = st.selectbox(
+                    "Select Homework",
+                    options=list(hw_options.keys()),
+                    format_func=lambda x: hw_options[x],
+                    key="student_hw_sel",
+                )
                 selected_hw_title = hw_options[selected_hw_id]
 
                 col1, col2 = st.columns(2)
                 student_id = col1.text_input("Enter your Student ID", key="student_id_input").strip()
                 student_name = ""
+                profile_complete = False
+
+                def _is_missing(val):
+                    if val is None or pd.isna(val):
+                        return True
+                    return str(val).strip().lower() in ("", "none", "nan", "null", "n/a", "non")
 
                 if student_id:
                     all_stu_df = load_students(self.db)
                     match = all_stu_df[all_stu_df["id"].astype(str) == student_id]
                     if not match.empty:
-                        student_name = match.iloc[0]["name"]
-                        col2.success(f"Welcome, **{student_name}**!")
+                        stu_row = match.iloc[0]
+                        cur_name = "" if _is_missing(stu_row.get("name")) else str(stu_row["name"]).strip()
+                        cur_phone = "" if _is_missing(stu_row.get("phone")) else str(stu_row["phone"]).strip()
+                        cur_parent = "" if _is_missing(stu_row.get("phone_parent")) else str(stu_row["phone_parent"]).strip()
+                        cur_group = "" if _is_missing(stu_row.get("group_number")) else str(stu_row["group_number"]).strip()
+
+                        missing_fields = []
+                        if not cur_name:
+                            missing_fields.append("Full Name")
+                        if not cur_phone:
+                            missing_fields.append("Student Phone")
+                        if not cur_parent:
+                            missing_fields.append("Parent Phone")
+                        if not cur_group:
+                            missing_fields.append("Group Number")
+
+                        if not missing_fields:
+                            student_name = cur_name
+                            profile_complete = True
+                            col2.success(f"Welcome, **{student_name}**! (Group: {cur_group})")
+                        else:
+                            col2.warning(f"⚠️ Missing data: **{', '.join(missing_fields)}**")
+                            with st.container(border=True):
+                                st.markdown("#### 📋 Complete Your Student Profile")
+                                st.caption(
+                                    "Please fill in all required details below before submitting your homework."
+                                )
+                                with st.form(f"complete_profile_form_{student_id}"):
+                                    c_p1, c_p2 = st.columns(2)
+                                    with c_p1:
+                                        in_name = st.text_input(
+                                            "Full Name *",
+                                            value=cur_name,
+                                            placeholder="Enter your full name",
+                                        ).strip()
+                                        in_group = st.text_input(
+                                            "Group Number *",
+                                            value=cur_group,
+                                            placeholder="e.g. 1, 2, Online...",
+                                        ).strip()
+                                    with c_p2:
+                                        in_phone = st.text_input(
+                                            "Your Phone Number *",
+                                            value=cur_phone,
+                                            placeholder="010...",
+                                        ).strip()
+                                        in_parent = st.text_input(
+                                            "Parent Phone Number *",
+                                            value=cur_parent,
+                                            placeholder="010...",
+                                        ).strip()
+
+                                    if st.form_submit_button(
+                                        "💾 Save & Unlock Homework Submission",
+                                        type="primary",
+                                        use_container_width=True,
+                                    ):
+                                        # Validate phones are at least 10 digits and student != parent phone
+                                        digits_stu = re.sub(r"\D", "", in_phone)
+                                        digits_par = re.sub(r"\D", "", in_parent)
+                                        if not (in_name and in_group and in_phone and in_parent):
+                                            st.error("All fields are required to unlock homework submission.")
+                                        elif len(digits_stu) < 10 or len(digits_par) < 10:
+                                            st.error("Please enter valid phone numbers (at least 10 digits).")
+                                        elif digits_stu[-10:] == digits_par[-10:]:
+                                            st.error("Parent Phone Number must be different from Student Phone Number.")
+                                        else:
+                                            try:
+                                                self._write([(
+                                                    "UPDATE students SET name = %s, phone = %s, phone_parent = %s, group_number = %s WHERE id = %s",
+                                                    (in_name, in_phone, in_parent, in_group, student_id),
+                                                )])
+                                                st.success("✅ Profile completed! You can now upload your homework below.")
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"Could not save profile: {e}")
                     else:
                         col2.error("Student ID not found.")
 
-                uploaded_file = st.file_uploader("Upload Homework (PDF only)", type=["pdf"], key="hw_upload")
+                uploaded_file = st.file_uploader(
+                    "Upload Homework (PDF only)",
+                    type=["pdf"],
+                    key="hw_upload",
+                    disabled=not profile_complete,
+                )
 
-                submit_disabled = not (student_id and student_name and uploaded_file)
-                if st.button("🚀 Submit Homework", type="primary", disabled=submit_disabled, use_container_width=True):
+                submit_disabled = not (student_id and profile_complete and uploaded_file)
+                if st.button(
+                    "🚀 Submit Homework",
+                    type="primary",
+                    disabled=submit_disabled,
+                    use_container_width=True,
+                ):
                     with st.spinner("Uploading your homework..."):
                         try:
                             file_bytes = uploaded_file.read()
                             base64_data = base64.b64encode(file_bytes).decode("utf-8")
-
-                            # Naming convention includes Student ID, Homework ID, and Homework Title
-                            file_name = build_drive_hw_filename(student_id, selected_hw_id, selected_hw_title)
+                            file_name = build_drive_hw_filename(
+                                student_id, selected_hw_id, selected_hw_title
+                            )
 
                             script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
                             payload = {
                                 "filename": file_name,
                                 "mimeType": "application/pdf",
-                                "base64": base64_data
+                                "base64": base64_data,
                             }
 
                             response = requests.post(script_url, json=payload, timeout=60)
                             if response.status_code == 200:
                                 res_json = response.json()
                                 if res_json.get("status") == "success":
-                                    # Immediately record 'submitted = TRUE' in PostgreSQL
                                     mark_homework_submitted(self.db, selected_hw_id, student_id)
-                                    st.success(f"✅ Homework **{selected_hw_title}** submitted successfully!")
+                                    st.success(
+                                        f"✅ Homework **{selected_hw_title}** submitted successfully!"
+                                    )
                                     st.balloons()
                                 else:
-                                    st.error(f"Error from Google Drive: {res_json.get('message', 'Unknown error')}")
+                                    st.error(
+                                        f"Error from Google Drive: {res_json.get('message', 'Unknown error')}"
+                                    )
                             else:
-                                st.error(f"Failed to connect to Google Drive. Status Code: {response.status_code}")
+                                st.error(
+                                    f"Failed to connect to Google Drive. Status Code: {response.status_code}"
+                                )
                         except Exception as e:
                             st.error(f"An error occurred: {e}")
-
     def _render_admin_login(self):
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
