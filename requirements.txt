@@ -8,3 +8,11 @@ openpyxl
 emoji
 Pillow
 requests
+fastapi
+uvicorn
+PyJWT
+google-genai
+pymupdf
+pypdf
+opencv-python-headless
+numpy
