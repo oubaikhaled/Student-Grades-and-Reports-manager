@@ -6,7 +6,6 @@ import threading
 import time
 import urllib.parse
 import uuid
-
 import emoji
 import pandas as pd
 import psycopg2
@@ -26,7 +25,15 @@ from student_profile import StudentProfileView
 
 # 1. Page Config MUST be the very first Streamlit command
 st.set_page_config(page_title="Eng. Mahmoud Adel — Grade Portal", layout="wide")
-
+st.markdown("""
+<style>
+#MainMenu, footer {visibility: hidden;}
+[data-testid="stToolbar"] {display: none;}
+[data-testid="stDecoration"] {display: none;}
+[data-testid="stStatusWidget"] {display: none;}
+.stAppDeployButton {display: none;}
+</style>
+""", unsafe_allow_html=True)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
