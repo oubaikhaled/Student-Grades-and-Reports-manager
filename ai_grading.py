@@ -78,7 +78,7 @@ def list_available_gemini_models(api_key=None) -> list[str]:
     return ["mistral-ocr + groq-llama-3.3-70b", "groq-llama-4-scout-vision"]
     
     
-    def fetch_pdf_from_drive(
+def fetch_pdf_from_drive(
     filename: str,
     script_url: str = DEFAULT_GAS_URL,
     subfolder: str = ""
