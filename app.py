@@ -977,7 +977,7 @@ class GradePortalApp:
             conn.commit()
         st.cache_data.clear()
 
-   def _render_public_login(self):
+    def _render_public_login(self):
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             try:
