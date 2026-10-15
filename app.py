@@ -977,7 +977,7 @@ class GradePortalApp:
             conn.commit()
         st.cache_data.clear()
 
-    def _render_public_login(self):
+ def _render_public_login(self):
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             try:
@@ -999,7 +999,10 @@ class GradePortalApp:
 
         with tab_student:
             st.subheader("📤 Submit Homework")
-            st.caption("Submit your completed homework as a PDF file.")
+            st.caption(
+                "Verify your identity with your Student ID and Parent Phone Number, "
+                "then upload your homework as a PDF or multiple page photos."
+            )
 
             hw_df = load_homeworks(self.db)
             if hw_df.empty:
@@ -1015,115 +1018,163 @@ class GradePortalApp:
                 selected_hw_title = hw_options[selected_hw_id]
 
                 col1, col2 = st.columns(2)
-                student_id = col1.text_input("Enter your Student ID", key="student_id_input").strip()
+                student_id = col1.text_input(
+                    "1️⃣ Enter your Student ID",
+                    placeholder="e.g. 176109",
+                    key="student_id_input",
+                ).strip()
+                verify_phone = col2.text_input(
+                    "2️⃣ Enter Parent Phone Number (for verification)",
+                    placeholder="e.g. 010...",
+                    key="student_verify_phone_input",
+                ).strip()
+
                 student_name = ""
                 profile_complete = False
+                is_verified = False
 
                 def _is_missing(val):
                     if val is None or pd.isna(val):
                         return True
                     return str(val).strip().lower() in ("", "none", "nan", "null", "n/a", "non")
 
-                if student_id:
+                def _last10(p_val):
+                    digits = re.sub(r"\D", "", str(p_val or ""))
+                    return digits[-10:] if len(digits) >= 10 else ""
+
+                if student_id and verify_phone:
                     all_stu_df = load_students(self.db)
                     match = all_stu_df[all_stu_df["id"].astype(str) == student_id]
-                    if not match.empty:
+                    if match.empty:
+                        st.error("❌ Student ID not found. Please check your ID.")
+                    else:
                         stu_row = match.iloc[0]
                         cur_name = "" if _is_missing(stu_row.get("name")) else str(stu_row["name"]).strip()
                         cur_phone = "" if _is_missing(stu_row.get("phone")) else str(stu_row["phone"]).strip()
                         cur_parent = "" if _is_missing(stu_row.get("phone_parent")) else str(stu_row["phone_parent"]).strip()
                         cur_group = "" if _is_missing(stu_row.get("group_number")) else str(stu_row["group_number"]).strip()
 
-                        missing_fields = []
-                        if not cur_name:
-                            missing_fields.append("Full Name")
-                        if not cur_phone:
-                            missing_fields.append("Student Phone")
-                        if not cur_parent:
-                            missing_fields.append("Parent Phone")
-                        if not cur_group:
-                            missing_fields.append("Group Number")
+                        entered_10 = _last10(verify_phone)
+                        db_parent_10 = _last10(cur_parent)
+                        db_student_10 = _last10(cur_phone)
 
-                        if not missing_fields:
-                            student_name = cur_name
-                            profile_complete = True
-                            col2.success(f"Welcome, **{student_name}**! (Group: {cur_group})")
+                        # Verify against registered parent phone (or student phone if parent phone wasn't recorded yet)
+                        if not entered_10:
+                            st.warning("Please enter a valid 11-digit phone number to verify your identity.")
+                        elif db_parent_10 and entered_10 == db_parent_10:
+                            is_verified = True
+                        elif not db_parent_10 and db_student_10 and entered_10 == db_student_10:
+                            is_verified = True
+                        elif not db_parent_10 and not db_student_10:
+                            # Both phones are missing in DB; allow verification so student can fill them in
+                            is_verified = True
                         else:
-                            col2.warning(f"⚠️ Missing data: **{', '.join(missing_fields)}**")
-                            with st.container(border=True):
-                                st.markdown("#### 📋 Complete Your Student Profile")
-                                st.caption(
-                                    "Please fill in all required details below before submitting your homework."
+                            st.error(
+                                "❌ Verification failed: The phone number entered does not match the Parent Phone Number on file for this ID."
+                            )
+
+                        if is_verified:
+                            missing_fields = []
+                            if not cur_name:
+                                missing_fields.append("Full Name")
+                            if not cur_phone:
+                                missing_fields.append("Student Phone")
+                            if not cur_parent:
+                                missing_fields.append("Parent Phone")
+                            if not cur_group:
+                                missing_fields.append("Group Number")
+
+                            if not missing_fields:
+                                student_name = cur_name
+                                profile_complete = True
+                                st.success(f"✅ Verified! Welcome, **{student_name}** (Group: {cur_group})")
+                            else:
+                                st.warning(
+                                    f"⚠️ Identity verified! Please complete your missing profile details (**{', '.join(missing_fields)}**) to unlock homework submission."
                                 )
-                                with st.form(f"complete_profile_form_{student_id}"):
-                                    c_p1, c_p2 = st.columns(2)
-                                    with c_p1:
-                                        in_name = st.text_input(
-                                            "Full Name *",
-                                            value=cur_name,
-                                            placeholder="Enter your full name",
-                                        ).strip()
-                                        in_group = st.text_input(
-                                            "Group Number *",
-                                            value=cur_group,
-                                            placeholder="e.g. 1, 2, Online...",
-                                        ).strip()
-                                    with c_p2:
-                                        in_phone = st.text_input(
-                                            "Your Phone Number *",
-                                            value=cur_phone,
-                                            placeholder="010...",
-                                        ).strip()
-                                        in_parent = st.text_input(
-                                            "Parent Phone Number *",
-                                            value=cur_parent,
-                                            placeholder="010...",
-                                        ).strip()
+                                with st.container(border=True):
+                                    st.markdown("#### 📋 Complete Your Student Profile")
+                                    with st.form(f"complete_profile_form_{student_id}"):
+                                        c_p1, c_p2 = st.columns(2)
+                                        with c_p1:
+                                            in_name = st.text_input(
+                                                "Full Name *",
+                                                value=cur_name,
+                                                placeholder="Enter your full name",
+                                            ).strip()
+                                            in_group = st.text_input(
+                                                "Group Number *",
+                                                value=cur_group,
+                                                placeholder="e.g. 1, 2, Online...",
+                                            ).strip()
+                                        with c_p2:
+                                            in_phone = st.text_input(
+                                                "Your Phone Number *",
+                                                value=cur_phone,
+                                                placeholder="010...",
+                                            ).strip()
+                                            in_parent = st.text_input(
+                                                "Parent Phone Number *",
+                                                value=cur_parent or verify_phone,
+                                                placeholder="010...",
+                                            ).strip()
 
-                                    if st.form_submit_button(
-                                        "💾 Save & Unlock Homework Submission",
-                                        type="primary",
-                                        use_container_width=True,
-                                    ):
-                                        digits_stu = re.sub(r"\D", "", in_phone)
-                                        digits_par = re.sub(r"\D", "", in_parent)
-                                        if not (in_name and in_group and in_phone and in_parent):
-                                            st.error("All fields are required to unlock homework submission.")
-                                        elif len(digits_stu) < 10 or len(digits_par) < 10:
-                                            st.error("Please enter valid phone numbers (at least 10 digits).")
-                                        elif digits_stu[-10:] == digits_par[-10:]:
-                                            st.error("Parent Phone Number must be different from Student Phone Number.")
-                                        else:
-                                            try:
-                                                self._write([(
-                                                    "UPDATE students SET name = %s, phone = %s, phone_parent = %s, group_number = %s WHERE id = %s",
-                                                    (in_name, in_phone, in_parent, in_group, student_id),
-                                                )])
-                                                st.success("✅ Profile completed! You can now upload your homework below.")
-                                                st.rerun()
-                                            except Exception as e:
-                                                st.error(f"Could not save profile: {e}")
-                    else:
-                        col2.error("Student ID not found.")
+                                        if st.form_submit_button(
+                                            "💾 Save & Unlock Homework Submission",
+                                            type="primary",
+                                            use_container_width=True,
+                                        ):
+                                            digits_stu = re.sub(r"\D", "", in_phone)
+                                            digits_par = re.sub(r"\D", "", in_parent)
+                                            if not (in_name and in_group and in_phone and in_parent):
+                                                st.error("All fields are required to unlock homework submission.")
+                                            elif len(digits_stu) < 10 or len(digits_par) < 10:
+                                                st.error("Please enter valid phone numbers (at least 10 digits).")
+                                            elif digits_stu[-10:] == digits_par[-10:]:
+                                                st.error("Parent Phone Number must be different from Student Phone Number.")
+                                            else:
+                                                try:
+                                                    self._write([(
+                                                        "UPDATE students SET name = %s, phone = %s, phone_parent = %s, group_number = %s WHERE id = %s",
+                                                        (in_name, in_phone, in_parent, in_group, student_id),
+                                                    )])
+                                                    st.success("✅ Profile completed! You can now upload your homework below.")
+                                                    st.rerun()
+                                                except Exception as e:
+                                                    st.error(f"Could not save profile: {e}")
+                elif student_id and not verify_phone:
+                    st.info("🔒 Please enter your **Parent Phone Number** in box 2️⃣ to verify your identity.")
 
-                uploaded_file = st.file_uploader(
-                    "Upload Homework (PDF only)",
-                    type=["pdf"],
+                uploaded_files = st.file_uploader(
+                    "📄 Upload Homework (Select a PDF OR select multiple page photos in order)",
+                    type=["pdf", "png", "jpg", "jpeg"],
+                    accept_multiple_files=True,
                     key="hw_upload",
                     disabled=not profile_complete,
                 )
 
-                submit_disabled = not (student_id and profile_complete and uploaded_file)
+                if uploaded_files and profile_complete:
+                    st.caption(
+                        f"📎 **{len(uploaded_files)} file(s) selected** — "
+                        + (
+                            "Images will be automatically combined into a single PDF upon submission."
+                            if any(not str(f.name).lower().endswith(".pdf") for f in uploaded_files) or len(uploaded_files) > 1
+                            else "Ready to submit PDF."
+                        )
+                    )
+
+                submit_disabled = not (student_id and profile_complete and uploaded_files)
                 if st.button(
                     "🚀 Submit Homework",
                     type="primary",
                     disabled=submit_disabled,
                     use_container_width=True,
                 ):
-                    with st.spinner("Uploading your homework..."):
+                    with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
                         try:
-                            file_bytes = uploaded_file.read()
-                            base64_data = base64.b64encode(file_bytes).decode("utf-8")
+                            # Convert multiple images (or PDFs) into a single clean PDF byte stream
+                            pdf_bytes = convert_uploads_to_pdf_bytes(uploaded_files)
+                            base64_data = base64.b64encode(pdf_bytes).decode("utf-8")
                             file_name = build_drive_hw_filename(
                                 student_id, selected_hw_id, selected_hw_title
                             )
@@ -1131,11 +1182,12 @@ class GradePortalApp:
                             script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
                             payload = {
                                 "filename": file_name,
+                                "subfolder": selected_hw_title,
                                 "mimeType": "application/pdf",
                                 "base64": base64_data,
                             }
 
-                            response = requests.post(script_url, json=payload, timeout=60)
+                            response = requests.post(script_url, json=payload, timeout=90)
                             if response.status_code == 200:
                                 res_json = response.json()
                                 if res_json.get("status") == "success":
@@ -1154,7 +1206,6 @@ class GradePortalApp:
                                 )
                         except Exception as e:
                             st.error(f"An error occurred: {e}")
-
     def _render_admin_login(self):
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
