@@ -1348,7 +1348,7 @@ class GradePortalApp:
                                          format_func=lambda i: f"{ch_titles[i]} (ID: {i})")
                     title = st.text_input("Homework Title")
                     total_q = st.number_input("Total Questions (Max Score)", min_value=1, step=1)
-                    video_link = st.text_input("Homework Video Link (Optional)", placeholder="https://youtube.com/..."
+                    video_link = st.text_input("Homework Video Link (Optional)", placeholder="https://youtube.com/...")
                     rubric = st.text_area(
                         "AI Grading Answer Key / Rubric (Optional)",
                         placeholder="Paste the model answers here so AI can auto-grade with one click (e.g., Q1: B (-1), Q2: C (4), Q3: dy/dx = 2x + 1)...",
