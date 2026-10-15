@@ -76,11 +76,19 @@ def get_gemini_api_key(st_secrets=None) -> str | None:
 def list_available_gemini_models(api_key=None) -> list[str]:
     """Backwards-compatible stub for app.py."""
     return ["mistral-ocr + groq-llama-3.3-70b", "groq-llama-4-scout-vision"]
-
-
-def fetch_pdf_from_drive(filename: str, script_url: str = DEFAULT_GAS_URL) -> bytes:
-    """Fetch PDF file from Google Drive via Google Apps Script."""
-    payload = {"action": "get", "filename": filename}
+    
+    
+    def fetch_pdf_from_drive(
+    filename: str,
+    script_url: str = DEFAULT_GAS_URL,
+    subfolder: str = ""
+) -> bytes:
+    """Fetch PDF file from Google Drive (searching the homework's subfolder first)."""
+    payload = {
+        "action": "get",
+        "filename": filename,
+        "subfolder": subfolder or ""
+    }
     try:
         response = requests.post(script_url, json=payload, timeout=60)
         if response.status_code != 200:
@@ -96,7 +104,6 @@ def fetch_pdf_from_drive(filename: str, script_url: str = DEFAULT_GAS_URL) -> by
             raise RuntimeError(f"Drive retrieval error: {err_msg}")
     except requests.RequestException as e:
         raise RuntimeError(f"Network error connecting to Google Apps Script: {e}")
-
 
 def split_pdf_into_page_images(
     pdf_bytes: bytes,
