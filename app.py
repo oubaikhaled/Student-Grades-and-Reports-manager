@@ -157,7 +157,55 @@ def stitch_images(uploaded_files):
     except Exception as e:
         st.error(f"Image processing failed: {e}")
         return None
+        
+def convert_uploads_to_pdf_bytes(uploaded_files) -> bytes:
+    """
+    Accepts a list of Streamlit UploadedFile objects (either 1+ PDFs or multiple PNG/JPG images)
+    and merges them into a single clean multi-page PDF byte stream.
+    """
+    import pymupdf
+    from PIL import Image as PILImage, ImageOps
 
+    if not isinstance(uploaded_files, (list, tuple)):
+        uploaded_files = [uploaded_files]
+
+    # If the student uploaded a single PDF file directly, return its bytes without re-encoding
+    if len(uploaded_files) == 1 and str(uploaded_files[0].name).lower().endswith(".pdf"):
+        uploaded_files[0].seek(0)
+        return uploaded_files[0].read()
+
+    merged_doc = pymupdf.open()
+    try:
+        for f in uploaded_files:
+            f.seek(0)
+            fname = str(f.name).lower()
+            raw_bytes = f.read()
+
+            if fname.endswith(".pdf"):
+                with pymupdf.open(stream=raw_bytes, filetype="pdf") as src_pdf:
+                    merged_doc.insert_pdf(src_pdf)
+            else:
+                # Image file -> fix phone camera EXIF rotation, downscale if huge, convert to PDF page
+                im = ImageOps.exif_transpose(PILImage.open(io.BytesIO(raw_bytes))).convert("RGB")
+                max_dim = 1600
+                if max(im.width, im.height) > max_dim:
+                    scale = max_dim / float(max(im.width, im.height))
+                    im = im.resize(
+                        (int(im.width * scale), int(im.height * scale)),
+                        PILImage.Resampling.LANCZOS,
+                    )
+                img_buf = io.BytesIO()
+                im.save(img_buf, format="JPEG", quality=85, optimize=True)
+                img_bytes = img_buf.getvalue()
+
+                # Create an A4-proportioned or image-sized PDF page
+                rect = pymupdf.Rect(0, 0, im.width, im.height)
+                page = merged_doc.new_page(width=im.width, height=im.height)
+                page.insert_image(rect, stream=img_bytes)
+
+        return merged_doc.tobytes(deflate=True)
+    finally:
+        merged_doc.close()
 
 def build_wa_messages(kind, name, title, score, total):
     """Returns (parent_message, student_message)."""
