@@ -24,16 +24,11 @@ from pdf_utils import PDFGenerator
 from student_profile import StudentProfileView
 
 # 1. Page Config MUST be the very first Streamlit command
-st.set_page_config(page_title="Eng. Mahmoud Adel — Grade Portal", layout="wide")
-st.markdown("""
-<style>
-#MainMenu, footer {visibility: hidden;}
-[data-testid="stToolbar"] {display: none;}
-[data-testid="stDecoration"] {display: none;}
-[data-testid="stStatusWidget"] {display: none;}
-.stAppDeployButton {display: none;}
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(
+    page_title="Eng. Mahmoud Adel — Grade Portal",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -1278,27 +1273,56 @@ class GradePortalApp:
             parent_student_fragment(self.db, student, subset(hw_all, sid), subset(qz_all, sid))
 
     def _render_admin_portal(self):
-        st.sidebar.markdown("### 🎓 Eng. Mahmoud Adel")
-        st.sidebar.caption("Grade Management Portal")
-        menu = st.sidebar.radio(
-            "Navigation",
-            [
-                "📚 Manage Homeworks",
-                "📝 Manage Quizzes",
-                "👥 Manage Students",
-                "👤 Student Profiles",
-                "💬 WhatsApp Broadcast",
-            ],
-        )
-        st.sidebar.divider()
+        nav_options = [
+            "📚 Manage Homeworks",
+            "📝 Manage Quizzes",
+            "👥 Manage Students",
+            "👤 Student Profiles",
+            "💬 WhatsApp Broadcast",
+        ]
+
+        st.session_state.setdefault("admin_nav_menu", nav_options[0])
+
+        def _sync_from_sidebar():
+            st.session_state["admin_nav_menu"] = st.session_state["nav_sidebar_key"]
+
+        def _sync_from_top():
+            st.session_state["admin_nav_menu"] = st.session_state["nav_top_key"]
 
         def _admin_logout():
             release_my_student_locks()
             self.auth.logout()
 
-        st.sidebar.button("🚪 Logout", on_click=_admin_logout, type="primary", use_container_width=True)
+        # 1. Sidebar Navigation (for Desktop users)
+        st.sidebar.markdown("### 🎓 Eng. Mahmoud Adel")
+        st.sidebar.caption("Grade Management Portal")
+        st.sidebar.radio(
+            "Navigation",
+            nav_options,
+            index=nav_options.index(st.session_state["admin_nav_menu"]),
+            key="nav_sidebar_key",
+            on_change=_sync_from_sidebar,
+        )
+        st.sidebar.divider()
+        st.sidebar.button("🚪 Logout", on_click=_admin_logout, type="primary", use_container_width=True, key="logout_side")
 
-        st.title("Eng. Mahmoud Adel — Grade Portal")
+        # 2. Top Navigation Bar (Always visible on Mobile even when sidebar is collapsed)
+        col_title, col_nav, col_out = st.columns([2.2, 2, 0.8])
+        with col_title:
+            st.subheader("🎓 Eng. Mahmoud Adel — Portal")
+        with col_nav:
+            st.selectbox(
+                "📌 Quick Menu (Mobile & Desktop)",
+                nav_options,
+                index=nav_options.index(st.session_state["admin_nav_menu"]),
+                key="nav_top_key",
+                on_change=_sync_from_top,
+                label_visibility="collapsed",
+            )
+        with col_out:
+            st.button("🚪 Logout", on_click=_admin_logout, type="secondary", use_container_width=True, key="logout_top")
+
+        menu = st.session_state["admin_nav_menu"]
 
         flash = st.session_state.pop("flash", None)
         if flash:
@@ -1314,7 +1338,6 @@ class GradePortalApp:
             StudentProfileView(self.db).render()
         elif menu == "💬 WhatsApp Broadcast":
             self._admin_whatsapp_parents()
-
     def _grading_section(self, kind, item_id, item_title, max_score, saved_rubric=""):
         st.divider()
         st.subheader("🔍 Search & Grade Students")
