@@ -168,16 +168,22 @@ def stitch_images(uploaded_files):
 
 def convert_uploads_to_pdf_bytes(uploaded_files) -> bytes:
     """
-    Accepts a list of Streamlit UploadedFile objects (either 1+ PDFs or multiple PNG/JPG images)
-    and merges them into a single clean multi-page PDF byte stream.
+    Converts mobile phone photos (JPG, PNG, WEBP, HEIC/HEIF) and/or PDFs
+    into a single compressed, memory-safe multi-page PDF.
     """
     import pymupdf
     from PIL import Image as PILImage, ImageOps
 
+    # Register HEIC/HEIF opener for iPhone photos if pillow-heif is installed
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+
     if not isinstance(uploaded_files, (list, tuple)):
         uploaded_files = [uploaded_files]
 
-    # If the student uploaded a single PDF file directly, return its bytes without re-encoding
     if len(uploaded_files) == 1 and str(uploaded_files[0].name).lower().endswith(".pdf"):
         uploaded_files[0].seek(0)
         return uploaded_files[0].read()
@@ -188,33 +194,37 @@ def convert_uploads_to_pdf_bytes(uploaded_files) -> bytes:
             f.seek(0)
             fname = str(f.name).lower()
             raw_bytes = f.read()
+            if not raw_bytes:
+                continue
 
             if fname.endswith(".pdf"):
                 with pymupdf.open(stream=raw_bytes, filetype="pdf") as src_pdf:
                     merged_doc.insert_pdf(src_pdf)
             else:
-                # Image file -> fix phone camera EXIF rotation, downscale if huge, convert to PDF page
-                im = ImageOps.exif_transpose(PILImage.open(io.BytesIO(raw_bytes))).convert("RGB")
-                max_dim = 1600
-                if max(im.width, im.height) > max_dim:
-                    scale = max_dim / float(max(im.width, im.height))
-                    im = im.resize(
-                        (int(im.width * scale), int(im.height * scale)),
-                        PILImage.Resampling.LANCZOS,
-                    )
-                img_buf = io.BytesIO()
-                im.save(img_buf, format="JPEG", quality=85, optimize=True)
-                img_bytes = img_buf.getvalue()
+                with PILImage.open(io.BytesIO(raw_bytes)) as raw_im:
+                    im = ImageOps.exif_transpose(raw_im).convert("RGB")
+                    max_dim = 1500
+                    if max(im.width, im.height) > max_dim:
+                        scale = max_dim / float(max(im.width, im.height))
+                        im = im.resize(
+                            (int(im.width * scale), int(im.height * scale)),
+                            PILImage.Resampling.LANCZOS,
+                        )
+                    img_buf = io.BytesIO()
+                    im.save(img_buf, format="JPEG", quality=82, optimize=True)
+                    w, h = im.width, im.height
+                    img_bytes = img_buf.getvalue()
 
-                # Create an image-sized PDF page
-                rect = pymupdf.Rect(0, 0, im.width, im.height)
-                page = merged_doc.new_page(width=im.width, height=im.height)
+                rect = pymupdf.Rect(0, 0, w, h)
+                page = merged_doc.new_page(width=w, height=h)
                 page.insert_image(rect, stream=img_bytes)
+
+        if len(merged_doc) == 0:
+            raise ValueError("No valid pages could be read from the uploaded files.")
 
         return merged_doc.tobytes(deflate=True)
     finally:
         merged_doc.close()
-
 
 def build_wa_messages(kind, name, title, score, total):
     """Returns (parent_message, student_message)."""
