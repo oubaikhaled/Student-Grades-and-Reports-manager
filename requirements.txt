@@ -6,9 +6,8 @@ arabic-reshaper
 python-bidi
 openpyxl
 emoji
+Pillow
 requests
-pymupdf
-Pillow>=9.1
-fastapi
-uvicorn
-PyJWT
+PyMuPDF
+google-genai
+pillow-heif
