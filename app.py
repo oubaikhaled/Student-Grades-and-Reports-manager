@@ -1177,67 +1177,71 @@ class GradePortalApp:
 
                 can_upload = bool(selected_hw_id is not None and profile_complete)
 
-                uploaded_files = st.file_uploader(
-                    "📄 Upload Homework (Select a PDF OR select multiple page photos in order)",
-                    type=["pdf", "png", "jpg", "jpeg"],
-                    accept_multiple_files=True,
-                    key="hw_upload",
-                    disabled=not can_upload,
-                )
-
-                if uploaded_files and can_upload:
+                if not can_upload:
+                    st.info(
+                        "🔒 **Step 3 (Upload Homework)** will appear automatically right here "
+                        "as soon as you select your Homework above and verify your Student ID & Parent Phone."
+                    )
+                else:
+                    st.markdown("#### 📄 Step 3: Upload Your Homework Pages")
                     st.caption(
-                        f"📎 **{len(uploaded_files)} file(s) selected** for **{selected_hw_title}** — "
-                        + (
-                            "Images will be automatically combined into a single PDF upon submission."
-                            if any(not str(f.name).lower().endswith(".pdf") for f in uploaded_files) or len(uploaded_files) > 1
-                            else "Ready to submit PDF."
-                        )
+                        "📱 **On Mobile:** Tap **Browse files** below to select your homework PDF, "
+                        "or select multiple photos of your notebook pages from your gallery/camera."
+                    )
+                    uploaded_files = st.file_uploader(
+                        "Upload PDF or Page Photos",
+                        type=["pdf", "png", "jpg", "jpeg", "webp", "heic", "heif"],
+                        accept_multiple_files=True,
+                        key=f"hw_upload_{selected_hw_id}_{student_id}",
                     )
 
-                submit_disabled = not (selected_hw_id is not None and student_id and profile_complete and uploaded_files)
-                if st.button(
-                    "🚀 Submit Homework",
-                    type="primary",
-                    disabled=submit_disabled,
-                    use_container_width=True,
-                ):
-                    with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
-                        try:
-                            # Convert multiple images (or PDFs) into a single clean PDF byte stream
-                            pdf_bytes = convert_uploads_to_pdf_bytes(uploaded_files)
-                            base64_data = base64.b64encode(pdf_bytes).decode("utf-8")
-                            file_name = build_drive_hw_filename(
-                                student_id, selected_hw_id, selected_hw_title
-                            )
+                    if uploaded_files:
+                        st.info(
+                            f"📎 **{len(uploaded_files)} file(s) ready** for **{selected_hw_title}** "
+                            f"({', '.join(f.name for f in uploaded_files[:4])}{'...' if len(uploaded_files) > 4 else ''})."
+                        )
 
-                            script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
-                            payload = {
-                                "filename": file_name,
-                                "subfolder": selected_hw_title,
-                                "mimeType": "application/pdf",
-                                "base64": base64_data,
-                            }
+                        if st.button(
+                            "🚀 Submit Homework Now",
+                            type="primary",
+                            key=f"btn_submit_hw_{selected_hw_id}_{student_id}",
+                            use_container_width=True,
+                        ):
+                            with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
+                                try:
+                                    pdf_bytes = convert_uploads_to_pdf_bytes(uploaded_files)
+                                    base64_data = base64.b64encode(pdf_bytes).decode("utf-8")
+                                    file_name = build_drive_hw_filename(
+                                        student_id, selected_hw_id, selected_hw_title
+                                    )
 
-                            response = requests.post(script_url, json=payload, timeout=90)
-                            if response.status_code == 200:
-                                res_json = response.json()
-                                if res_json.get("status") == "success":
-                                    mark_homework_submitted(self.db, selected_hw_id, student_id)
-                                    st.success(
-                                        f"✅ Homework **{selected_hw_title}** submitted successfully!"
-                                    )
-                                    st.balloons()
-                                else:
-                                    st.error(
-                                        f"Error from Google Drive: {res_json.get('message', 'Unknown error')}"
-                                    )
-                            else:
-                                st.error(
-                                    f"Failed to connect to Google Drive. Status Code: {response.status_code}"
-                                )
-                        except Exception as e:
-                            st.error(f"An error occurred: {e}")
+                                    script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
+                                    payload = {
+                                        "filename": file_name,
+                                        "subfolder": selected_hw_title,
+                                        "mimeType": "application/pdf",
+                                        "base64": base64_data,
+                                    }
+
+                                    response = requests.post(script_url, json=payload, timeout=90)
+                                    if response.status_code == 200:
+                                        res_json = response.json()
+                                        if res_json.get("status") == "success":
+                                            mark_homework_submitted(self.db, selected_hw_id, student_id)
+                                            st.success(
+                                                f"✅ Homework **{selected_hw_title}** submitted successfully!"
+                                            )
+                                            st.balloons()
+                                        else:
+                                            st.error(
+                                                f"Error from Google Drive: {res_json.get('message', 'Unknown error')}"
+                                            )
+                                    else:
+                                        st.error(
+                                            f"Failed to connect to Google Drive. Status Code: {response.status_code}"
+                                        )
+                                except Exception as e:
+                                    st.error(f"An error occurred while processing your files: {e}")
 
     def _render_admin_login(self):
         col1, col2, col3 = st.columns([1, 2, 1])
