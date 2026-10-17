@@ -458,7 +458,7 @@ def format_submission_status(score, max_score, submitted=False, is_locked=False)
     if is_locked:
         return "⏳ Being Graded..."
     if bool(submitted):
-        return "📩 Submitted (Pending Grading)"
+        return "📩 Submitted"
     return "❌ Missing"
 
 
