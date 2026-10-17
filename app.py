@@ -22,7 +22,11 @@ from auth import AuthManager
 from database import DatabaseManager
 from pdf_utils import PDFGenerator
 from student_profile import StudentProfileView
-
+from whatsapp_automation import (
+    AutomatedMessagesView,
+    start_background_automation_daemon,
+    trigger_post_grade_whatsapp,
+)
 # 1. Page Config MUST be the very first Streamlit command
 st.set_page_config(
     page_title="Eng. Mahmoud Adel — Grade Portal",
@@ -529,6 +533,24 @@ def save_grade(db, kind, item_id, student_id, score, perc, report, img_bytes):
             c.execute(sql, tuple(vals))
         conn.commit()
     st.cache_data.clear()
+    # Automatically send the grade + PDF report card to the parent on WhatsApp right after grading
+    title_col_table = "homeworks" if kind == "homework" else "quizzes"
+    id_col = "homework_id" if kind == "homework" else "quiz_id"
+    max_col = "total_questions" if kind == "homework" else "max_score"
+    item_df = db.fetch_dataframe(f"SELECT title, {max_col} FROM {title_col_table} WHERE {id_col} = %s", (int(item_id),))
+    if not item_df.empty and score is not None:
+        trigger_post_grade_whatsapp(
+            db=db,
+            kind=kind,
+            item_id=int(item_id),
+            item_title=str(item_df.iloc[0]["title"]),
+            student_id=str(student_id),
+            score=float(score),
+            max_score=float(item_df.iloc[0][max_col]),
+            perc=float(perc),
+            report_text=report or "",
+            img_bytes=img_bytes,
+        )
 
 
 def filter_students(df, key_prefix):
@@ -974,7 +996,10 @@ class GradePortalApp:
     def __init__(self):
         self.db = get_db()
         self.auth = AuthManager()
-
+    def __init__(self):
+        self.db = get_db()
+        self.auth = AuthManager()
+        start_background_automation_daemon(self.db)
     def run(self):
         query_params = st.query_params
         is_admin_route = "admin" in query_params
@@ -1278,6 +1303,7 @@ class GradePortalApp:
             "📝 Manage Quizzes",
             "👥 Manage Students",
             "👤 Student Profiles",
+            "🤖 Automated Messages",
             "💬 WhatsApp Broadcast",
         ]
 
@@ -1338,6 +1364,8 @@ class GradePortalApp:
             StudentProfileView(self.db).render()
         elif menu == "💬 WhatsApp Broadcast":
             self._admin_whatsapp_parents()
+        elif menu == "🤖 Automated Messages":
+            AutomatedMessagesView(self.db).render()
     def _grading_section(self, kind, item_id, item_title, max_score, saved_rubric=""):
         st.divider()
         st.subheader("🔍 Search & Grade Students")
