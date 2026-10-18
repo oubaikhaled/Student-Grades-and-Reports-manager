@@ -188,6 +188,9 @@ def _upload_thumbnail(file_id: str, _raw_bytes: bytes):
     register_heif_opener()
     try:
         with PILImage.open(io.BytesIO(_raw_bytes)) as raw_im:
+            # Decode JPEGs at reduced scale: a 50 MP phone photo would otherwise take
+            # hundreds of MB of server memory just to make a small preview.
+            raw_im.draft("RGB", (660, 660))
             im = ImageOps.exif_transpose(raw_im).convert("RGB")
             im.thumbnail((330, 330))
             out = io.BytesIO()
@@ -1239,21 +1242,33 @@ class GradePortalApp:
 
                 st.markdown("#### 📄 4️⃣ Upload Homework Photos or PDF")
                 st.caption(
-                    "**How to upload multiple pages:** Take the photos with your phone camera first, "
-                    "then tap below, choose **Photo Library / Gallery**, select all your photos in order, and tap Submit."
+                    "**How to upload multiple pages:** Take the photos with your phone camera first. "
+                    "Then tap **Upload** and pick **up to 4 photos at a time**, in order. "
+                    "Tap **+** to add the next photos, then tap Submit."
                 )
 
                 # No st.form here: inside a form the script never sees the selected files until
                 # Submit, so it cannot show previews. Each pick reruns the script and the files
                 # come back in the order they were added. MIME types (not extensions) are used so
                 # phone photos whose names have no extension (some Android gallery pickers) are
-                # accepted. .heic/.heif cover iPhone photos the browser reports with no MIME type;
-                # the server converts them.
-                uploaded_files = st.file_uploader(
-                    "Select Homework Photos or PDF",
-                    type=["image/*", "application/pdf", ".heic", ".heif"],
+                # accepted. HEIC/HEIF photos are image/* too; the server converts them.
+                # Photos only: with PDF in the accept list, Android Chrome opens the full Gallery /
+                # Photos app instead of its lightweight photo picker. While that app is open,
+                # Android can kill the Chrome tab to free memory, and selecting several large
+                # photos then reloads the page and loses them. PDFs get their own uploader below.
+                # Don't add file extensions here: Streamlit then adds a non-image type to the
+                # input's accept list and Chrome falls back to the Gallery app again.
+                photo_files = st.file_uploader(
+                    "Select Homework Photos",
+                    type=["image/*"],
                     accept_multiple_files=True,
                     key="hw_upload_widget",
+                )
+                pdf_files = st.file_uploader(
+                    "Or upload a PDF instead",
+                    type=["application/pdf"],
+                    accept_multiple_files=True,
+                    key="hw_pdf_widget",
                 )
                 # Streamlit caps the file list at a small scroll box (about 4 files on a phone),
                 # so newly added photos land out of sight and it looks as if they weren't added.
@@ -1265,6 +1280,7 @@ class GradePortalApp:
                     "{max-height:none !important; overflow-y:visible !important;}"
                     "</style>"
                 )
+                uploaded_files = (photo_files or []) + (pdf_files or [])
 
                 if uploaded_files:
                     st.caption(
