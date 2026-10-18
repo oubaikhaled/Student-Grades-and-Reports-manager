@@ -1255,6 +1255,16 @@ class GradePortalApp:
                     accept_multiple_files=True,
                     key="hw_upload_widget",
                 )
+                # Streamlit caps the file list at a small scroll box (about 4 files on a phone),
+                # so newly added photos land out of sight and it looks as if they weren't added.
+                # Let the list grow to show every file. (Style-only st.html takes no space.)
+                st.html(
+                    "<style>"
+                    ".st-key-hw_upload_widget [data-testid='stFileChips'],"
+                    ".st-key-hw_upload_widget [data-testid='stFileChips'] > div"
+                    "{max-height:none !important; overflow-y:visible !important;}"
+                    "</style>"
+                )
 
                 if uploaded_files:
                     st.caption(
