@@ -32,47 +32,55 @@ EXCITING_MORNING_SENTENCES = [
     "🎯 Precision, passion, and progress! Wishing you a super productive and rewarding day of lectures!",
 ]
 
-# Thread-safe runtime diagnostics for the background daemon
-_DAEMON_LOCK = threading.Lock()
-_DAEMON_STATE = {
-    "running": False,
-    "last_tick": None,
-    "last_error": None,
-    "last_action": "Waiting for first tick...",
-    "cached_url": DEFAULT_GOWA_URL,
-    "cached_auth": "",
-    "cached_teacher_phone": "",
-}
+
+@st.cache_resource(show_spinner=False)
+def get_daemon_runtime():
+    """
+    Server-wide persistent singleton that survives Streamlit script reruns and module reloads.
+    Holds the lock, the background thread reference, cached secrets, and diagnostic logs.
+    """
+    return {
+        "lock": threading.Lock(),
+        "thread": None,
+        "last_tick": None,
+        "last_tick_ts": 0.0,
+        "last_error": None,
+        "last_action": "Initialized — waiting for first check...",
+        "last_grade_status": "No grade saved in this session yet.",
+        "cached_url": DEFAULT_GOWA_URL,
+        "cached_auth": "",
+        "cached_teacher_phone": "",
+    }
 
 
 def _sync_secrets_to_cache_and_db(db=None):
     """
-    Safely reads st.secrets from the main Streamlit thread and caches them in memory
-    (and persists fallback defaults into bot_settings) so background threads never fail
-    when accessing credentials without a Streamlit ScriptRunContext.
+    Safely reads st.secrets on the main Streamlit thread and stores them in the
+    @st.cache_resource singleton + database so background threads never lose credentials.
     """
+    rt = get_daemon_runtime()
     try:
         s_url = st.secrets.get("WHATSAPP_API_URL", "")
         s_auth = st.secrets.get("WHATSAPP_API_AUTH", "")
         s_tphone = st.secrets.get("TEACHER_PHONE", "")
-        with _DAEMON_LOCK:
+        with rt["lock"]:
             if s_url:
-                _DAEMON_STATE["cached_url"] = str(s_url).strip()
+                rt["cached_url"] = str(s_url).strip()
             if s_auth:
-                _DAEMON_STATE["cached_auth"] = str(s_auth).strip()
+                rt["cached_auth"] = str(s_auth).strip()
             if s_tphone:
-                _DAEMON_STATE["cached_teacher_phone"] = str(s_tphone).strip()
+                rt["cached_teacher_phone"] = str(s_tphone).strip()
     except Exception:
         pass
 
     if db is not None:
         try:
-            if not get_bot_setting(db, "gowa_url", "") and _DAEMON_STATE["cached_url"]:
-                set_bot_setting(db, "gowa_url", _DAEMON_STATE["cached_url"])
-            if not get_bot_setting(db, "gowa_auth", "") and _DAEMON_STATE["cached_auth"]:
-                set_bot_setting(db, "gowa_auth", _DAEMON_STATE["cached_auth"])
-            if not get_bot_setting(db, "teacher_phone", "") and _DAEMON_STATE["cached_teacher_phone"]:
-                set_bot_setting(db, "teacher_phone", _DAEMON_STATE["cached_teacher_phone"])
+            if not get_bot_setting(db, "gowa_url", "") and rt["cached_url"]:
+                set_bot_setting(db, "gowa_url", rt["cached_url"])
+            if not get_bot_setting(db, "gowa_auth", "") and rt["cached_auth"]:
+                set_bot_setting(db, "gowa_auth", rt["cached_auth"])
+            if not get_bot_setting(db, "teacher_phone", "") and rt["cached_teacher_phone"]:
+                set_bot_setting(db, "teacher_phone", rt["cached_teacher_phone"])
         except Exception:
             pass
 
@@ -82,10 +90,13 @@ def clean_wa_phone(p_str: str) -> str | None:
     if p_str is None or pd.isna(p_str):
         return None
     s = str(p_str).strip()
-    if not s or s.lower() == "nan" or s.lower() == "none":
+    if not s or s.lower() in ("nan", "none", "null", ""):
         return None
     if "@g.us" in s or "@s.whatsapp.net" in s:
         return s
+    # Handle float-formatted strings from pandas like '1012345678.0'
+    if s.endswith(".0"):
+        s = s[:-2]
     digits = re.sub(r"\D", "", s)
     if not digits or len(digits) < 10:
         return None
@@ -113,9 +124,10 @@ class GowaClient:
 
     @classmethod
     def from_secrets(cls, db=None):
-        with _DAEMON_LOCK:
-            url = _DAEMON_STATE.get("cached_url") or DEFAULT_GOWA_URL
-            auth = _DAEMON_STATE.get("cached_auth") or ""
+        rt = get_daemon_runtime()
+        with rt["lock"]:
+            url = rt.get("cached_url") or DEFAULT_GOWA_URL
+            auth = rt.get("cached_auth") or ""
 
         try:
             url = st.secrets.get("WHATSAPP_API_URL", url)
@@ -132,24 +144,6 @@ class GowaClient:
                 auth = saved_auth
         return cls(base_url=url, basic_auth=auth)
 
-    def ensure_awake(self, max_wait_seconds: int = 75) -> tuple[bool, str]:
-        """
-        Wakes up the Render GOWA instance if it is hibernating (cold start can take 45-60s).
-        Retries until the server responds or max_wait_seconds is reached.
-        """
-        deadline = time.time() + max_wait_seconds
-        last_err = "Unknown error"
-        while time.time() < deadline:
-            ok, msg = self.check_status(timeout=25)
-            if ok:
-                return True, msg
-            last_err = msg
-            # If the server is online but explicitly says no device linked, don't keep looping
-            if "no WhatsApp device is linked" in msg:
-                return False, msg
-            time.sleep(5)
-        return False, f"GOWA wake-up timed out: {last_err}"
-
     def check_status(self, timeout: int = 20) -> tuple[bool, str]:
         """Pings the GOWA server to check if it is awake and logged in."""
         try:
@@ -164,8 +158,22 @@ class GowaClient:
         except Exception as e:
             return False, f"Connection error: {e}"
 
+    def ensure_awake(self, max_wait_seconds: int = 60) -> tuple[bool, str]:
+        """Wakes up Render GOWA instance if hibernating."""
+        deadline = time.time() + max_wait_seconds
+        last_err = "Unknown error"
+        while time.time() < deadline:
+            ok, msg = self.check_status(timeout=20)
+            if ok:
+                return True, msg
+            last_err = msg
+            if "no WhatsApp device is linked" in msg:
+                return False, msg
+            time.sleep(4)
+        return False, f"Wake-up timeout: {last_err}"
+
     def send_text(self, recipient: str, message: str, retries: int = 2) -> tuple[bool, str]:
-        """Sends a WhatsApp text message to a phone number or group JID (@g.us) with retry for Render cold starts."""
+        """Sends a WhatsApp text message to a phone number or group JID (@g.us)."""
         target = clean_wa_phone(recipient)
         if not target:
             return False, f"Invalid phone/recipient: {recipient}"
@@ -181,7 +189,7 @@ class GowaClient:
                     f"{self.base_url}/send/message",
                     json=payload,
                     auth=self.auth,
-                    timeout=65,
+                    timeout=50,
                 )
                 if resp.status_code in (200, 201):
                     return True, "Sent"
@@ -189,14 +197,19 @@ class GowaClient:
             except Exception as e:
                 last_err = str(e)
             if attempt < retries:
-                time.sleep(4)
+                time.sleep(3)
         return False, last_err
 
-    def send_pdf(self, recipient: str, pdf_bytes: bytes, filename: str, caption: str = "", retries: int = 2) -> tuple[bool, str]:
-        """Sends a PDF file with an optional caption via GOWA /send/file with fresh BytesIO on each retry."""
+    def send_pdf(self, recipient: str, pdf_bytes: bytes, filename: str, caption: str = "", retries: int = 1) -> tuple[bool, str]:
+        """Sends a PDF file via GOWA /send/file using an ASCII-safe filename."""
         target = clean_wa_phone(recipient)
         if not target:
             return False, f"Invalid phone/recipient: {recipient}"
+
+        # Make filename strictly ASCII-safe for multipart/form-data compatibility with GOWA (Go fiber)
+        safe_ascii_name = re.sub(r"[^A-Za-z0-9_\-.]", "_", str(filename or "Report.pdf"))
+        if not safe_ascii_name.lower().endswith(".pdf"):
+            safe_ascii_name += ".pdf"
 
         data = {
             "phone": target,
@@ -205,7 +218,7 @@ class GowaClient:
         last_err = ""
         for attempt in range(retries + 1):
             files = {
-                "file": (filename, io.BytesIO(pdf_bytes), "application/pdf"),
+                "file": (safe_ascii_name, io.BytesIO(pdf_bytes), "application/pdf"),
             }
             try:
                 resp = requests.post(
@@ -213,7 +226,7 @@ class GowaClient:
                     data=data,
                     files=files,
                     auth=self.auth,
-                    timeout=75,
+                    timeout=65,
                 )
                 if resp.status_code in (200, 201):
                     return True, "PDF Sent"
@@ -221,11 +234,7 @@ class GowaClient:
             except Exception as e:
                 last_err = str(e)
             if attempt < retries:
-                time.sleep(4)
-
-        # Fallback: if PDF upload failed, still attempt to deliver caption text
-        if caption:
-            self.send_text(target, caption, retries=1)
+                time.sleep(3)
         return False, last_err
 
 
@@ -297,11 +306,12 @@ def set_bot_setting(db, key: str, value: str):
 
 
 def get_resolved_teacher_phone(db) -> str | None:
-    """Gets teacher phone from DB first, then memory cache, then st.secrets."""
+    """Gets teacher phone from DB first, then singleton cache, then st.secrets."""
     t_phone = get_bot_setting(db, "teacher_phone", "")
     if not t_phone:
-        with _DAEMON_LOCK:
-            t_phone = _DAEMON_STATE.get("cached_teacher_phone", "")
+        rt = get_daemon_runtime()
+        with rt["lock"]:
+            t_phone = rt.get("cached_teacher_phone", "")
     if not t_phone:
         try:
             t_phone = st.secrets.get("TEACHER_PHONE", "")
@@ -332,6 +342,41 @@ def mark_dispatched(db, dispatch_key: str):
 
 
 # ---------------------------------------------------------------------------
+# Safe PDF Generator Helper (Handles any signature of PDFGenerator.generate_student_report)
+# ---------------------------------------------------------------------------
+def _safe_generate_student_pdf(
+    student_name: str,
+    item_title: str,
+    score: float,
+    max_score: float,
+    perc: float,
+    report_text: str,
+    img_bytes: bytes | None,
+    video_link: str | None = None,
+) -> bytes | None:
+    try:
+        if video_link:
+            try:
+                buf = PDFGenerator.generate_student_report(
+                    student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link=video_link
+                )
+            except TypeError:
+                buf = PDFGenerator.generate_student_report(
+                    student_name, item_title, score, max_score, perc, report_text, img_bytes
+                )
+        else:
+            buf = PDFGenerator.generate_student_report(
+                student_name, item_title, score, max_score, perc, report_text, img_bytes
+            )
+        return buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
+    except Exception as e:
+        rt = get_daemon_runtime()
+        with rt["lock"]:
+            rt["last_error"] = f"PDF Generation Error ({student_name}): {e}"
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Instant Post-Grading Parent & Student Sender (Triggered right after Save Grade)
 # ---------------------------------------------------------------------------
 def trigger_post_grade_whatsapp(
@@ -347,41 +392,64 @@ def trigger_post_grade_whatsapp(
     img_bytes: bytes | None = None,
 ):
     """
-    Runs in a background thread immediately after an admin grades a student
-    so saving a grade stays instant while the parent receives the grade + PDF report.
+    Runs immediately after an admin clicks Save Grade.
+    1. Fetches student & parent phone numbers on the main thread before Streamlit reruns.
+    2. Spawns a worker that sends the WhatsApp text notification FIRST (using the proven send_text method),
+       and then attaches & sends the PDF report card.
     """
-    # Sync secrets while still on the main Streamlit thread before spawning worker
     _sync_secrets_to_cache_and_db(db)
+    rt = get_daemon_runtime()
+
+    auto_enabled = get_bot_setting(db, "auto_send_on_grade", "true").lower() == "true"
+    if not auto_enabled:
+        with rt["lock"]:
+            rt["last_grade_status"] = "Skipped (auto_send_on_grade is disabled in Settings)"
+        return
+
+     also_student = get_bot_setting(db, "also_send_grade_to_student", "false").lower() == "true"
+
+    # Fetch student data and client credentials synchronously BEFORE st.rerun()
+    try:
+        stu_df = db.fetch_dataframe(
+            "SELECT name, phone, phone_parent FROM students WHERE id = %s",
+            (str(student_id),),
+        )
+        if stu_df.empty:
+            with rt["lock"]:
+                rt["last_grade_status"] = f"Student ID {student_id} not found in DB."
+            return
+        stu = stu_df.iloc[0]
+        student_name = str(stu["name"])
+        parent_phone = clean_wa_phone(stu.get("phone_parent"))
+        student_phone = clean_wa_phone(stu.get("phone"))
+    except Exception as e:
+        with rt["lock"]:
+            rt["last_grade_status"] = f"DB fetch error on grade save: {e}"
+        return
+
+    if not parent_phone and not (also_student and student_phone):
+        with rt["lock"]:
+            rt["last_grade_status"] = (
+                f"No valid phone for {student_name} (Parent: {stu.get('phone_parent')}, "
+                f"Student: {stu.get('phone')}, AlsoSendStudent={also_student})"
+            )
+        return
+
+    video_link = None
+    if kind == "homework":
+        try:
+            hw_df = db.fetch_dataframe(
+                "SELECT video_link FROM homeworks WHERE homework_id = %s", (int(item_id),)
+            )
+            if not hw_df.empty and pd.notna(hw_df.iloc[0]["video_link"]):
+                video_link = str(hw_df.iloc[0]["video_link"]).strip() or None
+        except Exception:
+            pass
+
     client = GowaClient.from_secrets(db)
 
     def _worker():
         try:
-            auto_enabled = get_bot_setting(db, "auto_send_on_grade", "true").lower() == "true"
-            if not auto_enabled:
-                return
-
-            stu_df = db.fetch_dataframe(
-                "SELECT name, phone, phone_parent FROM students WHERE id = %s",
-                (str(student_id),),
-            )
-            if stu_df.empty:
-                return
-            stu = stu_df.iloc[0]
-            student_name = str(stu["name"])
-            parent_phone = clean_wa_phone(stu.get("phone_parent"))
-            student_phone = clean_wa_phone(stu.get("phone"))
-
-            if not parent_phone and not student_phone:
-                return
-
-            video_link = None
-            if kind == "homework":
-                hw_df = db.fetch_dataframe(
-                    "SELECT video_link FROM homeworks WHERE homework_id = %s", (int(item_id),)
-                )
-                if not hw_df.empty and pd.notna(hw_df.iloc[0]["video_link"]):
-                    video_link = str(hw_df.iloc[0]["video_link"]).strip() or None
-
             score_str = str(int(score)) if float(score).is_integer() else f"{score:.1f}"
             max_str = str(int(max_score)) if float(max_score).is_integer() else f"{max_score:.1f}"
             type_label = "Quiz" if kind == "quiz" else "Homework"
@@ -395,34 +463,53 @@ def trigger_post_grade_whatsapp(
                 f"Mathematics Team – Eng. Mahmoud Adel"
             )
 
-            extra = {"video_link": video_link} if video_link else {}
-            pdf_buf = PDFGenerator.generate_student_report(
-                student_name, item_title, score, max_score, perc, report_text, img_bytes, **extra
+            stu_msg = emoji.emojize(
+                f":bar_chart: درجة الـ {item_title}\n\n"
+                f"أهلاً بك يا *{student_name}*،\n"
+                f"لقد حصلت على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n"
+                f"مرفق تقرير الملاحظات الخاص بك. استمر في الاجتهاد! :glowing_star:\n\n"
+                f"Mathematics Team – Eng. Mahmoud Adel"
             )
-            pdf_bytes = pdf_buf.getvalue()
-            pdf_filename = f"{student_name}_{item_title}_Report.pdf".replace(" ", "_")
 
-            # Wake GOWA if sleeping on Render
-            client.ensure_awake(max_wait_seconds=60)
+            # Build PDF report card safely
+            pdf_bytes = _safe_generate_student_pdf(
+                student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link
+            )
+            pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
 
+            status_parts = []
+
+            # 1. Send to Parent
             if parent_phone:
-                ok, err = client.send_pdf(parent_phone, pdf_bytes, pdf_filename, caption=parent_msg)
-                with _DAEMON_LOCK:
-                    _DAEMON_STATE["last_action"] = f"Post-grade parent send ({student_name}): {'OK' if ok else err}"
+                # Always send text message first (100% reliable, same endpoint as manual broadcast)
+                ok_txt, err_txt = client.send_text(parent_phone, parent_msg)
+                if pdf_bytes:
+                    ok_pdf, err_pdf = client.send_pdf(
+                        parent_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
+                    )
+                    status_parts.append(f"Parent({parent_phone}): Text={'OK' if ok_txt else err_txt}, PDF={'OK' if ok_pdf else err_pdf}")
+                else:
+                    status_parts.append(f"Parent({parent_phone}): Text={'OK' if ok_txt else err_txt} (No PDF)")
 
-            if student_phone and get_bot_setting(db, "also_send_grade_to_student", "false").lower() == "true":
-                stu_msg = emoji.emojize(
-                    f":bar_chart: درجة الـ {item_title}\n\n"
-                    f"أهلاً بك يا *{student_name}*،\n"
-                    f"لقد حصلت على *{score_str} / {max_str}* في الـ {type_label} الأخير.\n"
-                    f"مرفق تقرير الملاحظات الخاص بك. استمر في الاجتهاد! :glowing_star:\n\n"
-                    f"Mathematics Team – Eng. Mahmoud Adel"
-                )
-                client.send_pdf(student_phone, pdf_bytes, pdf_filename, caption=stu_msg)
+            # 2. Send to Student (if enabled OR if parent_phone is missing and student_phone exists)
+            if student_phone and (also_student or not parent_phone):
+                ok_stxt, err_stxt = client.send_text(student_phone, stu_msg)
+                if pdf_bytes:
+                    ok_spdf, err_spdf = client.send_pdf(
+                        student_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
+                    )
+                    status_parts.append(f"Student({student_phone}): Text={'OK' if ok_stxt else err_stxt}, PDF={'OK' if ok_spdf else err_spdf}")
+                else:
+                    status_parts.append(f"Student({student_phone}): Text={'OK' if ok_stxt else err_stxt}")
+
+            summary = " | ".join(status_parts)
+            with rt["lock"]:
+                rt["last_grade_status"] = f"{student_name}: {summary}"
+                rt["last_action"] = f"Post-Grade -> {student_name}"
         except Exception as e:
-            with _DAEMON_LOCK:
-                _DAEMON_STATE["last_error"] = f"Post-Grade Error: {e}"
-            print(f"[WhatsApp Auto-Grade Send Error]: {e}")
+            with rt["lock"]:
+                rt["last_error"] = f"Post-Grade Exception ({student_name}): {e}"
+                rt["last_grade_status"] = f"Error for {student_name}: {e}"
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -486,7 +573,6 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
         lines.append(f"\n{exciting_line}")
         msg = "\n".join(lines)
 
-    client.ensure_awake(max_wait_seconds=60)
     return client.send_text(teacher_phone_clean, msg)
 
 
@@ -500,12 +586,14 @@ def run_scheduled_checks_once(db):
     2. 10-Minute Pre-Group Homework & Quiz Master PDF Reports to Teacher.
     3. 6-Hour Pre-Group Homework & Quiz Reminders to Students who haven't submitted.
     """
+    rt = get_daemon_runtime()
     now = datetime.datetime.now(CAIRO_TZ)
     today_str = now.strftime("%Y-%m-%d")
     today_day = now.strftime("%a")  # 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'
 
-    with _DAEMON_LOCK:
-        _DAEMON_STATE["last_tick"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    with rt["lock"]:
+        rt["last_tick"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        rt["last_tick_ts"] = time.time()
 
     teacher_phone_clean = get_resolved_teacher_phone(db)
     client = GowaClient.from_secrets(db)
@@ -521,19 +609,18 @@ def run_scheduled_checks_once(db):
         morning_dt = now.replace(hour=8, minute=0, second=0, microsecond=0)
 
     morning_key = f"morning_sched_{today_str}"
-    # Allow catch-up anytime within 6 hours after scheduled morning time if not yet sent today
-    if teacher_phone_clean and now >= morning_dt and (now - morning_dt).total_seconds() <= 21600:
+    if teacher_phone_clean and now >= morning_dt and (now - morning_dt).total_seconds() <= 28800:
         if not has_dispatched(db, morning_key):
             ok, err = send_morning_schedule_to_teacher(db, client, teacher_phone_clean, now)
             if ok:
                 mark_dispatched(db, morning_key)
-                with _DAEMON_LOCK:
-                    _DAEMON_STATE["last_action"] = f"Sent Morning Schedule ({today_str})"
+                with rt["lock"]:
+                    rt["last_action"] = f"Sent Morning Schedule ({today_str})"
             else:
-                with _DAEMON_LOCK:
-                    _DAEMON_STATE["last_error"] = f"Morning Schedule Failed: {err}"
+                with rt["lock"]:
+                    rt["last_error"] = f"Morning Schedule Failed: {err}"
 
-    # Fetch all configured meetings and group configs using TRIM() so whitespace never breaks the join
+    # Fetch today's meetings
     meetings_df = db.fetch_dataframe(
         """
         SELECT m.meeting_id, TRIM(m.group_number) AS group_number, m.day_of_week, m.meeting_time,
@@ -558,9 +645,6 @@ def run_scheduled_checks_once(db):
     for _, r in qz_df.iterrows():
         qz_map[int(r["quiz_id"])] = (str(r["title"]), float(r["max_score"]))
 
-    # -----------------------------------------------------------------------
-    # Check Each of Today's Meetings for 10-Min Teacher Report & 6-Hr Student Reminders
-    # -----------------------------------------------------------------------
     for _, m_row in meetings_df.iterrows():
         grp = str(m_row["group_number"]).strip()
         mtime = str(m_row["meeting_time"]).strip()
@@ -576,7 +660,6 @@ def run_scheduled_checks_once(db):
 
         # -------------------------------------------------------------------
         # WORKFLOW 2: 10 Minutes Before Group -> Send HW & Quiz Reports to Teacher
-        # (Triggers when minutes_until_lecture is between -5 and 15 minutes)
         # -------------------------------------------------------------------
         pre10_key = f"teacher_10min_{today_str}_grp_{grp}_{mtime}"
         if teacher_phone_clean and -5 <= minutes_until_lecture <= 15 and not has_dispatched(db, pre10_key):
@@ -585,15 +668,14 @@ def run_scheduled_checks_once(db):
             )
             if ok:
                 mark_dispatched(db, pre10_key)
-                with _DAEMON_LOCK:
-                    _DAEMON_STATE["last_action"] = f"Sent 10-min Report for Group {grp}"
+                with rt["lock"]:
+                    rt["last_action"] = f"Sent 10-min Report for Group {grp}"
             else:
-                with _DAEMON_LOCK:
-                    _DAEMON_STATE["last_error"] = f"10-min Report failed for Group {grp}"
+                with rt["lock"]:
+                    rt["last_error"] = f"10-min Report failed for Group {grp}"
 
         # -------------------------------------------------------------------
         # WORKFLOW 3: 6 Hours (360 mins) Before Group -> Remind Students Who Didn't Submit HW
-        # (Triggers when minutes_until_lecture is between 300 and 380 minutes)
         # -------------------------------------------------------------------
         rem6h_key = f"student_6hr_{today_str}_grp_{grp}_{mtime}"
         if (hw_id or qz_id) and 300 <= minutes_until_lecture <= 380 and not has_dispatched(db, rem6h_key):
@@ -602,11 +684,11 @@ def run_scheduled_checks_once(db):
             )
             if ok:
                 mark_dispatched(db, rem6h_key)
-                with _DAEMON_LOCK:
-                    _DAEMON_STATE["last_action"] = f"Sent 6-hr Reminders for Group {grp}"
+                with rt["lock"]:
+                    rt["last_action"] = f"Sent 6-hr Reminders for Group {grp}"
             else:
-                with _DAEMON_LOCK:
-                    _DAEMON_STATE["last_error"] = f"6-hr Reminders failed for Group {grp}"
+                with rt["lock"]:
+                    rt["last_error"] = f"6-hr Reminders failed for Group {grp}"
 
 
 def send_group_master_reports_to_teacher(
@@ -620,8 +702,6 @@ def send_group_master_reports_to_teacher(
     )
     if students_df.empty:
         return False
-
-    client.ensure_awake(max_wait_seconds=60)
 
     intro_msg = (
         f"⏰ *Upcoming Session in 10 Minutes!*\n"
@@ -660,13 +740,14 @@ def send_group_master_reports_to_teacher(
             f"📌 *Assignment:* {hw_title}\n"
             f"✅ *Submitted/Graded:* {submitted_cnt} / {len(students_df)}"
         )
-        ok_hw, _ = client.send_pdf(
+        ok_hw_txt, _ = client.send_text(teacher_phone, caption)
+        ok_hw_pdf, _ = client.send_pdf(
             teacher_phone,
             pdf_buf.getvalue(),
-            f"Group_{grp}_{hw_title}_HW_Report.pdf".replace(" ", "_"),
+            f"Group_{grp}_HW_{hw_id}_Report.pdf",
             caption=caption,
         )
-        any_sent = any_sent or ok_hw
+        any_sent = any_sent or ok_hw_txt or ok_hw_pdf
 
     if qz_id and qz_id in qz_map:
         qz_title, qz_max = qz_map[qz_id]
@@ -693,13 +774,14 @@ def send_group_master_reports_to_teacher(
             f"📌 *Quiz:* {qz_title}\n"
             f"✅ *Graded:* {attended_cnt} / {len(students_df)}"
         )
-        ok_qz, _ = client.send_pdf(
+        ok_qz_txt, _ = client.send_text(teacher_phone, caption_q)
+        ok_qz_pdf, _ = client.send_pdf(
             teacher_phone,
             pdf_buf_q.getvalue(),
-            f"Group_{grp}_{qz_title}_Quiz_Report.pdf".replace(" ", "_"),
+            f"Group_{grp}_Quiz_{qz_id}_Report.pdf",
             caption=caption_q,
         )
-        any_sent = any_sent or ok_qz
+        any_sent = any_sent or ok_qz_txt or ok_qz_pdf
 
     return any_sent
 
@@ -734,11 +816,9 @@ def send_6hr_unsubmitted_reminders(
         if str(stu["id"]) not in submitted_ids
     ]
     if not unsubmitted_rows:
-        return True  # Everyone submitted; nothing to remind
+        return True
 
-    client.ensure_awake(max_wait_seconds=60)
     sent_any = False
-
     for stu in unsubmitted_rows:
         stu_name = str(stu["name"])
         stu_phone = clean_wa_phone(stu.get("phone"))
@@ -756,45 +836,50 @@ def send_6hr_unsubmitted_reminders(
             ok, _ = client.send_text(stu_phone, reminder_msg)
             if ok:
                 sent_any = True
-            time.sleep(5)  # Safe anti-ban pacing between messages
+            time.sleep(4)
 
     return sent_any
 
 
-@st.cache_resource(show_spinner=False)
 def start_background_automation_daemon(_db):
-    """Starts a single daemon thread per server process that checks the schedule every 60 seconds."""
+    """
+    Ensures the background daemon thread is alive and running.
+    Because it checks `thread.is_alive()` on the @st.cache_resource singleton,
+    it never gets stuck in 'Stopped' state across code reloads.
+    """
     init_automation_tables(_db)
     _sync_secrets_to_cache_and_db(_db)
+    rt = get_daemon_runtime()
 
-    with _DAEMON_LOCK:
-        if _DAEMON_STATE["running"]:
-            return True
-        _DAEMON_STATE["running"] = True
+    with rt["lock"]:
+        existing_thread = rt.get("thread")
+        is_alive = existing_thread is not None and existing_thread.is_alive()
 
-    def _loop():
-        while True:
-            try:
-                run_scheduled_checks_once(_db)
-            except Exception as e:
-                with _DAEMON_LOCK:
-                    _DAEMON_STATE["last_error"] = str(e)
-                print(f"[Automation Daemon Error]: {e}")
-            time.sleep(60)
+    if not is_alive:
+        def _loop():
+            while True:
+                try:
+                    run_scheduled_checks_once(_db)
+                except Exception as e:
+                    with rt["lock"]:
+                        rt["last_error"] = str(e)
+                    print(f"[Automation Daemon Error]: {e}")
+                time.sleep(60)
 
-    t = threading.Thread(target=_loop, daemon=True, name="WhatsAppAutomationDaemon")
-    t.start()
+        t = threading.Thread(target=_loop, daemon=True, name="WhatsAppAutomationDaemon")
+        t.start()
+        with rt["lock"]:
+            rt["thread"] = t
+
     return True
 
 
 # ---------------------------------------------------------------------------
-# UI Renderer for the New "🤖 Automated Messages" Tab
+# UI Renderer for the "🤖 Automated Messages" Tab
 # ---------------------------------------------------------------------------
 class AutomatedMessagesView:
     def __init__(self, db):
         self.db = db
-        init_automation_tables(self.db)
-        _sync_secrets_to_cache_and_db(self.db)
         start_background_automation_daemon(self.db)
 
     def render(self):
@@ -804,18 +889,22 @@ class AutomatedMessagesView:
             "and manage automated teacher/student/parent WhatsApp notifications."
         )
 
-        # Live Daemon Status Bar
+        # Live Daemon & Post-Grade Status Bar
+        rt = get_daemon_runtime()
         now_cairo = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        with _DAEMON_LOCK:
-            d_running = _DAEMON_STATE["running"]
-            d_tick = _DAEMON_STATE["last_tick"] or "Starting..."
-            d_action = _DAEMON_STATE["last_action"]
-            d_err = _DAEMON_STATE["last_error"]
+        with rt["lock"]:
+            t_obj = rt.get("thread")
+            d_running = t_obj is not None and t_obj.is_alive()
+            d_tick = rt["last_tick"] or "Running initial check..."
+            d_action = rt["last_action"]
+            d_grade = rt["last_grade_status"]
+            d_err = rt["last_error"]
 
         status_col1, status_col2, status_col3 = st.columns(3)
-        status_col1.caption(f"🟢 **Daemon:** {'Active' if d_running else 'Stopped'} | 🕒 **Cairo Time:** `{now_cairo}`")
+        status_col1.caption(f"{'🟢 **Daemon: Active**' if d_running else '🔴 **Daemon: Stopped**'} | 🕒 `{now_cairo}`")
         status_col2.caption(f"🔄 **Last Check:** `{d_tick}`")
         status_col3.caption(f"📌 **Last Event:** `{d_action}`")
+        st.caption(f"📨 **Last Post-Grade Auto-Send Status:** `{d_grade}`")
         if d_err:
             st.warning(f"⚠️ Last Background Warning/Error: `{d_err}`")
 
@@ -928,7 +1017,6 @@ class AutomatedMessagesView:
                                 st.success(f"Added {', '.join(sel_days)} at {t_str} to Group {sel_grp_time}!")
                                 st.rerun()
 
-                        # Show existing timings for this group with delete buttons
                         grp_m = meetings_df[meetings_df["group_number"].astype(str).str.strip() == sel_grp_time]
                         if not grp_m.empty:
                             st.markdown(f"**Current Timings for Group {sel_grp_time}:**")
@@ -1002,7 +1090,7 @@ class AutomatedMessagesView:
                         if not t_phone:
                             st.error("Please save the Teacher's WhatsApp Phone in the '⚙️ Bot & Teacher Settings' tab first!")
                         else:
-                            with st.spinner("Waking bot and sending Morning Schedule to Teacher..."):
+                            with st.spinner("Sending Morning Schedule to Teacher..."):
                                 now_c = datetime.datetime.now(CAIRO_TZ)
                                 ok, err = send_morning_schedule_to_teacher(
                                     self.db, GowaClient.from_secrets(self.db), t_phone, now_c
@@ -1142,7 +1230,7 @@ class AutomatedMessagesView:
 
                                 prog.progress((idx + 1) / total_rows, text=f"Sent to {s_name} ({idx + 1}/{total_rows})...")
                                 if idx < total_rows - 1:
-                                    time.sleep(4)  # Anti-ban pacing
+                                    time.sleep(4)
                             prog.empty()
                             st.success(f"🎉 Broadcast complete! Successfully sent {sent_count} WhatsApp message(s).")
 
@@ -1151,9 +1239,9 @@ class AutomatedMessagesView:
         # ===================================================================
         with tab_settings:
             st.markdown("#### ⚙️ GOWA Bot Connection & Teacher Preferences")
-            cur_url = get_bot_setting(self.db, "gowa_url", _DAEMON_STATE.get("cached_url", DEFAULT_GOWA_URL))
-            cur_auth = get_bot_setting(self.db, "gowa_auth", _DAEMON_STATE.get("cached_auth", ""))
-            cur_t_phone = get_bot_setting(self.db, "teacher_phone", _DAEMON_STATE.get("cached_teacher_phone", ""))
+            cur_url = get_bot_setting(self.db, "gowa_url", rt.get("cached_url", DEFAULT_GOWA_URL))
+            cur_auth = get_bot_setting(self.db, "gowa_auth", rt.get("cached_auth", ""))
+            cur_t_phone = get_bot_setting(self.db, "teacher_phone", rt.get("cached_teacher_phone", ""))
             cur_m_time = get_bot_setting(self.db, "morning_schedule_time", "08:00")
             cur_auto_grade = get_bot_setting(self.db, "auto_send_on_grade", "true").lower() == "true"
             cur_also_stu = get_bot_setting(self.db, "also_send_grade_to_student", "false").lower() == "true"
@@ -1161,7 +1249,7 @@ class AutomatedMessagesView:
             col_st1, col_st2 = st.columns([1, 1])
             with col_st1:
                 if st.button("🔌 Test GOWA Connection", use_container_width=True):
-                    with st.spinner("Pinging GOWA server (may take up to 50s if Render is waking up)..."):
+                    with st.spinner("Pinging GOWA server..."):
                         ok, status_msg = GowaClient.from_secrets(self.db).ensure_awake(max_wait_seconds=60)
                         if ok:
                             st.success(f"✅ {status_msg}")
