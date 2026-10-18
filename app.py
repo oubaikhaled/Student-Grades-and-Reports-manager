@@ -1043,8 +1043,8 @@ class GradePortalApp:
         with tab_student:
             st.subheader("📤 Submit Homework")
             st.caption(
-                "Select your homework, verify your identity with your Student ID and Parent Phone Number, "
-                "then upload your homework as a PDF or multiple page photos."
+                "1. Select your homework  •  2. Enter your Student ID & Parent Phone  •  "
+                "3. Select your homework photos or PDF and tap Submit."
             )
 
             hw_df = load_homeworks(self.db)
@@ -1053,7 +1053,7 @@ class GradePortalApp:
             else:
                 hw_options = {row["homework_id"]: f"{row['title']}" for _, row in hw_df.iterrows()}
                 selected_hw_id = st.selectbox(
-                    "Select Homework *",
+                    "1️⃣ Select Homework *",
                     options=list(hw_options.keys()),
                     index=None,
                     placeholder="Choose the homework you want to submit...",
@@ -1062,17 +1062,14 @@ class GradePortalApp:
                 )
                 selected_hw_title = hw_options[selected_hw_id] if selected_hw_id is not None else ""
 
-                if selected_hw_id is None:
-                    st.info("👆 Please select the **Homework** you are submitting from the dropdown above first.")
-
                 col1, col2 = st.columns(2)
                 student_id = col1.text_input(
-                    "Enter your Student ID",
-                    placeholder="e.g. 123456",
+                    "2️⃣ Enter your Student ID *",
+                    placeholder="e.g. 176109",
                     key="student_id_input",
                 ).strip()
                 verify_phone = col2.text_input(
-                    "Enter Parent Phone Number",
+                    "3️⃣ Enter Parent Phone Number *",
                     placeholder="e.g. 010...",
                     key="student_verify_phone_input",
                 ).strip()
@@ -1106,7 +1103,6 @@ class GradePortalApp:
                         db_parent_10 = _last10(cur_parent)
                         db_student_10 = _last10(cur_phone)
 
-                        # Verify against registered parent phone (or student phone if parent phone wasn't recorded yet)
                         if not entered_10:
                             st.warning("Please enter a valid 11-digit phone number to verify your identity.")
                         elif db_parent_10 and entered_10 == db_parent_10:
@@ -1114,7 +1110,6 @@ class GradePortalApp:
                         elif not db_parent_10 and db_student_10 and entered_10 == db_student_10:
                             is_verified = True
                         elif not db_parent_10 and not db_student_10:
-                            # Both phones are missing in DB; allow verification so student can fill them in
                             is_verified = True
                         else:
                             st.error(
@@ -1138,7 +1133,7 @@ class GradePortalApp:
                                 st.success(f"✅ Verified! Welcome, **{student_name}** (Group: {cur_group})")
                             else:
                                 st.warning(
-                                    f"⚠️ Identity verified! Please complete your missing profile details (**{', '.join(missing_fields)}**) to unlock homework submission."
+                                    f"⚠️ Identity verified! Please complete your missing profile details (**{', '.join(missing_fields)}**) below first."
                                 )
                                 with st.container(border=True):
                                     st.markdown("#### 📋 Complete Your Student Profile")
@@ -1168,14 +1163,14 @@ class GradePortalApp:
                                             ).strip()
 
                                         if st.form_submit_button(
-                                            "💾 Save & Unlock Homework Submission",
+                                            "💾 Save Profile",
                                             type="primary",
                                             use_container_width=True,
                                         ):
                                             digits_stu = re.sub(r"\D", "", in_phone)
                                             digits_par = re.sub(r"\D", "", in_parent)
                                             if not (in_name and in_group and in_phone and in_parent):
-                                                st.error("All fields are required to unlock homework submission.")
+                                                st.error("All fields are required.")
                                             elif len(digits_stu) < 10 or len(digits_par) < 10:
                                                 st.error("Please enter valid phone numbers (at least 10 digits).")
                                             elif digits_stu[-10:] == digits_par[-10:]:
@@ -1186,80 +1181,80 @@ class GradePortalApp:
                                                         "UPDATE students SET name = %s, phone = %s, phone_parent = %s, group_number = %s WHERE id = %s",
                                                         (in_name, in_phone, in_parent, in_group, student_id),
                                                     )])
-                                                    st.success("✅ Profile completed! You can now upload your homework below.")
+                                                    st.success("✅ Profile saved!")
                                                     st.rerun()
                                                 except Exception as e:
                                                     st.error(f"Could not save profile: {e}")
-                elif student_id and not verify_phone:
-                    st.info("🔒 Please enter your **Parent Phone Number** to verify your identity.")
 
-                can_upload = bool(selected_hw_id is not None and profile_complete)
+                st.divider()
 
-                if not can_upload:
-                    st.info(
-                        "🔒 **Step 3 (Upload Homework)** will appear automatically right here "
-                        "as soon as you select your Homework above and verify your Student ID & Parent Phone."
-                    )
-                else:
-                    st.markdown("#### 📄 Step 3: Upload Your Homework Pages")
-                    st.caption(
-                        "📱 **On Mobile:** Tap **Browse files** below to select your homework PDF, "
-                        "or select multiple photos of your notebook pages from your gallery/camera."
-                    )
-                    uploaded_files = st.file_uploader(
-                        "Upload PDF or Page Photos",
-                        type=["pdf", "png", "jpg", "jpeg", "webp", "heic", "heif"],
-                        accept_multiple_files=True,
-                        key=f"hw_upload_{selected_hw_id}_{student_id}",
-                    )
+                # ALWAYS keep the uploader mounted at the top level (never conditionally hidden or disabled)
+                # and omit strict client-side `type=` filtering so mobile .JPG/.HEIC/camera uploads never get blocked
+                st.markdown("#### 📄 4️⃣ Upload Homework Photos or PDF")
+                st.caption(
+                    "Select all your homework page photos (in order) or a PDF file, then tap **🚀 Submit Homework**."
+                )
+                uploaded_files = st.file_uploader(
+                    "Select Homework Photos or PDF",
+                    accept_multiple_files=True,
+                    key="hw_upload_widget",
+                )
 
-                    if uploaded_files:
-                        st.info(
-                            f"📎 **{len(uploaded_files)} file(s) ready** for **{selected_hw_title}** "
-                            f"({', '.join(f.name for f in uploaded_files[:4])}{'...' if len(uploaded_files) > 4 else ''})."
-                        )
+                if uploaded_files:
+                    st.info(f"📎 **{len(uploaded_files)} file(s) attached and ready to submit.**")
 
-                        if st.button(
-                            "🚀 Submit Homework Now",
-                            type="primary",
-                            key=f"btn_submit_hw_{selected_hw_id}_{student_id}",
-                            use_container_width=True,
-                        ):
-                            with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
-                                try:
-                                    pdf_bytes = convert_uploads_to_pdf_bytes(uploaded_files)
-                                    base64_data = base64.b64encode(pdf_bytes).decode("utf-8")
-                                    file_name = build_drive_hw_filename(
-                                        student_id, selected_hw_id, selected_hw_title
-                                    )
+                if st.button(
+                    "🚀 Submit Homework",
+                    type="primary",
+                    key="btn_submit_hw_main",
+                    use_container_width=True,
+                ):
+                    if selected_hw_id is None:
+                        st.error("⚠️ Please select the **Homework** from dropdown 1️⃣ at the top first.")
+                    elif not student_id or not verify_phone:
+                        st.error("⚠️ Please enter both your **Student ID** and **Parent Phone Number** above.")
+                    elif not is_verified:
+                        st.error("⚠️ Your Student ID and Parent Phone Number could not be verified.")
+                    elif not profile_complete:
+                        st.error("⚠️ Please complete and save your missing profile details in the box above first.")
+                    elif not uploaded_files:
+                        st.error("⚠️ Please attach your homework photos or PDF file before clicking Submit.")
+                    else:
+                        with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
+                            try:
+                                pdf_bytes = convert_uploads_to_pdf_bytes(uploaded_files)
+                                base64_data = base64.b64encode(pdf_bytes).decode("utf-8")
+                                file_name = build_drive_hw_filename(
+                                    student_id, selected_hw_id, selected_hw_title
+                                )
 
-                                    script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
-                                    payload = {
-                                        "filename": file_name,
-                                        "subfolder": selected_hw_title,
-                                        "mimeType": "application/pdf",
-                                        "base64": base64_data,
-                                    }
+                                script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
+                                payload = {
+                                    "filename": file_name,
+                                    "subfolder": selected_hw_title,
+                                    "mimeType": "application/pdf",
+                                    "base64": base64_data,
+                                }
 
-                                    response = requests.post(script_url, json=payload, timeout=90)
-                                    if response.status_code == 200:
-                                        res_json = response.json()
-                                        if res_json.get("status") == "success":
-                                            mark_homework_submitted(self.db, selected_hw_id, student_id)
-                                            st.success(
-                                                f"✅ Homework **{selected_hw_title}** submitted successfully!"
-                                            )
-                                            st.balloons()
-                                        else:
-                                            st.error(
-                                                f"Error from Google Drive: {res_json.get('message', 'Unknown error')}"
-                                            )
+                                response = requests.post(script_url, json=payload, timeout=90)
+                                if response.status_code == 200:
+                                    res_json = response.json()
+                                    if res_json.get("status") == "success":
+                                        mark_homework_submitted(self.db, selected_hw_id, student_id)
+                                        st.success(
+                                            f"✅ Homework **{selected_hw_title}** submitted successfully!"
+                                        )
+                                        st.balloons()
                                     else:
                                         st.error(
-                                            f"Failed to connect to Google Drive. Status Code: {response.status_code}"
+                                            f"Error from Google Drive: {res_json.get('message', 'Unknown error')}"
                                         )
-                                except Exception as e:
-                                    st.error(f"An error occurred while processing your files: {e}")
+                                else:
+                                    st.error(
+                                        f"Failed to connect to Google Drive. Status Code: {response.status_code}"
+                                    )
+                            except Exception as e:
+                                st.error(f"An error occurred while processing your files: {e}")
 
     def _render_admin_login(self):
         col1, col2, col3 = st.columns([1, 2, 1])
