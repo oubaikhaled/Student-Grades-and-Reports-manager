@@ -22,8 +22,11 @@ from auth import AuthManager
 from database import DatabaseManager
 from pdf_utils import PDFGenerator
 from student_profile import StudentProfileView
-from whatsapp_automation import start_background_automation_daemon
-start_background_automation_daemon(db)
+from whatsapp_automation import (
+    AutomatedMessagesView,
+    start_background_automation_daemon,
+    trigger_post_grade_whatsapp,
+)
 
 # 1. Page Config MUST be the very first Streamlit command
 st.set_page_config(
@@ -991,9 +994,6 @@ def whatsapp_fragment(db, kind, item_id, title, total, vid_link, df):
 # App
 # ---------------------------------------------------------------------------
 class GradePortalApp:
-    def __init__(self):
-        self.db = get_db()
-        self.auth = AuthManager()
     def __init__(self):
         self.db = get_db()
         self.auth = AuthManager()
