@@ -1188,73 +1188,75 @@ class GradePortalApp:
 
                 st.divider()
 
-                # ALWAYS keep the uploader mounted at the top level (never conditionally hidden or disabled)
-                # and omit strict client-side `type=` filtering so mobile .JPG/.HEIC/camera uploads never get blocked
                 st.markdown("#### 📄 4️⃣ Upload Homework Photos or PDF")
                 st.caption(
-                    "Select all your homework page photos (in order) or a PDF file, then tap **🚀 Submit Homework**."
-                )
-                uploaded_files = st.file_uploader(
-                    "Select Homework Photos or PDF",
-                    accept_multiple_files=True,
-                    key="hw_upload_widget",
+                    "**How to upload multiple pages:** Take the photos with your phone camera first, "
+                    "then tap below, choose **Photo Library / Gallery**, select all your photos in order, and tap Submit."
                 )
 
-                if uploaded_files:
-                    st.info(f"📎 **{len(uploaded_files)} file(s) attached and ready to submit.**")
+                # Wrapping the uploader in a form PREVENTS the mobile browser from dropping 
+                # multiple files by batching the upload only when they tap submit.
+                with st.form("hw_submission_form", clear_on_submit=False):
+                    uploaded_files = st.file_uploader(
+                        "Select Homework Photos or PDF",
+                        type=["pdf", "png", "jpg", "jpeg", "webp", "heic", "heif"],
+                        accept_multiple_files=True,
+                        key="hw_upload_widget",
+                    )
 
-                if st.button(
-                    "🚀 Submit Homework",
-                    type="primary",
-                    key="btn_submit_hw_main",
-                    use_container_width=True,
-                ):
-                    if selected_hw_id is None:
-                        st.error("⚠️ Please select the **Homework** from dropdown 1️⃣ at the top first.")
-                    elif not student_id or not verify_phone:
-                        st.error("⚠️ Please enter both your **Student ID** and **Parent Phone Number** above.")
-                    elif not is_verified:
-                        st.error("⚠️ Your Student ID and Parent Phone Number could not be verified.")
-                    elif not profile_complete:
-                        st.error("⚠️ Please complete and save your missing profile details in the box above first.")
-                    elif not uploaded_files:
-                        st.error("⚠️ Please attach your homework photos or PDF file before clicking Submit.")
-                    else:
-                        with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
-                            try:
-                                pdf_bytes = convert_uploads_to_pdf_bytes(uploaded_files)
-                                base64_data = base64.b64encode(pdf_bytes).decode("utf-8")
-                                file_name = build_drive_hw_filename(
-                                    student_id, selected_hw_id, selected_hw_title
-                                )
+                    submit_hw_clicked = st.form_submit_button(
+                        "🚀 Submit Homework",
+                        type="primary",
+                        use_container_width=True,
+                    )
 
-                                script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
-                                payload = {
-                                    "filename": file_name,
-                                    "subfolder": selected_hw_title,
-                                    "mimeType": "application/pdf",
-                                    "base64": base64_data,
-                                }
+                    if submit_hw_clicked:
+                        if selected_hw_id is None:
+                            st.error("⚠️ Please select the **Homework** from dropdown 1️⃣ at the top first.")
+                        elif not student_id or not verify_phone:
+                            st.error("⚠️ Please enter both your **Student ID** and **Parent Phone Number** above.")
+                        elif not is_verified:
+                            st.error("⚠️ Your Student ID and Parent Phone Number could not be verified.")
+                        elif not profile_complete:
+                            st.error("⚠️ Please complete and save your missing profile details in the box above first.")
+                        elif not uploaded_files:
+                            st.error("⚠️ Please attach your homework photos or PDF file before clicking Submit.")
+                        else:
+                            with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
+                                try:
+                                    pdf_bytes = convert_uploads_to_pdf_bytes(uploaded_files)
+                                    base64_data = base64.b64encode(pdf_bytes).decode("utf-8")
+                                    file_name = build_drive_hw_filename(
+                                        student_id, selected_hw_id, selected_hw_title
+                                    )
 
-                                response = requests.post(script_url, json=payload, timeout=90)
-                                if response.status_code == 200:
-                                    res_json = response.json()
-                                    if res_json.get("status") == "success":
-                                        mark_homework_submitted(self.db, selected_hw_id, student_id)
-                                        st.success(
-                                            f"✅ Homework **{selected_hw_title}** submitted successfully!"
-                                        )
-                                        st.balloons()
+                                    script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
+                                    payload = {
+                                        "filename": file_name,
+                                        "subfolder": selected_hw_title,
+                                        "mimeType": "application/pdf",
+                                        "base64": base64_data,
+                                    }
+
+                                    response = requests.post(script_url, json=payload, timeout=90)
+                                    if response.status_code == 200:
+                                        res_json = response.json()
+                                        if res_json.get("status") == "success":
+                                            mark_homework_submitted(self.db, selected_hw_id, student_id)
+                                            st.success(
+                                                f"✅ Homework **{selected_hw_title}** submitted successfully!"
+                                            )
+                                            st.balloons()
+                                        else:
+                                            st.error(
+                                                f"Error from Google Drive: {res_json.get('message', 'Unknown error')}"
+                                            )
                                     else:
                                         st.error(
-                                            f"Error from Google Drive: {res_json.get('message', 'Unknown error')}"
+                                            f"Failed to connect to Google Drive. Status Code: {response.status_code}"
                                         )
-                                else:
-                                    st.error(
-                                        f"Failed to connect to Google Drive. Status Code: {response.status_code}"
-                                    )
-                            except Exception as e:
-                                st.error(f"An error occurred while processing your files: {e}")
+                                except Exception as e:
+                                    st.error(f"An error occurred while processing your files: {e}")
 
     def _render_admin_login(self):
         col1, col2, col3 = st.columns([1, 2, 1])
