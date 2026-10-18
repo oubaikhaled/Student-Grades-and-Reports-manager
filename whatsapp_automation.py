@@ -406,7 +406,7 @@ def trigger_post_grade_whatsapp(
             rt["last_grade_status"] = "Skipped (auto_send_on_grade is disabled in Settings)"
         return
 
-     also_student = get_bot_setting(db, "also_send_grade_to_student", "false").lower() == "true"
+    also_student = get_bot_setting(db, "also_send_grade_to_student", "false").lower() == "true"
 
     # Fetch student data and client credentials synchronously BEFORE st.rerun()
     try:
