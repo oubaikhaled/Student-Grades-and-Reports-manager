@@ -166,6 +166,55 @@ def stitch_images(uploaded_files):
         return None
 
 
+def register_heif_opener():
+    """Register the HEIC/HEIF opener for iPhone photos if pillow-heif is installed."""
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+
+
+def is_pdf_upload(f) -> bool:
+    """Phone pickers may drop the file extension, so also trust the browser's MIME type."""
+    return str(f.name).lower().endswith(".pdf") or getattr(f, "type", "") == "application/pdf"
+
+
+@st.cache_data(show_spinner=False, max_entries=200)
+def _upload_thumbnail(file_id: str, _raw_bytes: bytes):
+    """Small JPEG preview, rendered on the server so HEIC photos preview in every browser."""
+    from PIL import Image as PILImage, ImageOps
+
+    register_heif_opener()
+    try:
+        with PILImage.open(io.BytesIO(_raw_bytes)) as raw_im:
+            im = ImageOps.exif_transpose(raw_im).convert("RGB")
+            im.thumbnail((330, 330))
+            out = io.BytesIO()
+            im.save(out, format="JPEG", quality=80)
+            return out.getvalue()
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def _placeholder_tile(label: str):
+    from PIL import Image as PILImage, ImageDraw
+
+    im = PILImage.new("RGB", (330, 330), color=(235, 235, 235))
+    ImageDraw.Draw(im).text((165, 165), label, fill=(90, 90, 90), anchor="mm", font_size=48)
+    out = io.BytesIO()
+    im.save(out, format="PNG")
+    return out.getvalue()
+
+
+def upload_preview(f):
+    """Preview image for one uploaded file (a plain tile for PDFs and unreadable images)."""
+    if is_pdf_upload(f):
+        return _placeholder_tile("PDF")
+    return _upload_thumbnail(f.file_id, f.getvalue()) or _placeholder_tile("?")
+
+
 def convert_uploads_to_pdf_bytes(uploaded_files) -> bytes:
     """
     Converts mobile phone photos (JPG, PNG, WEBP, HEIC/HEIF) and/or PDFs
@@ -174,17 +223,12 @@ def convert_uploads_to_pdf_bytes(uploaded_files) -> bytes:
     import pymupdf
     from PIL import Image as PILImage, ImageOps
 
-    # Register HEIC/HEIF opener for iPhone photos if pillow-heif is installed
-    try:
-        import pillow_heif
-        pillow_heif.register_heif_opener()
-    except Exception:
-        pass
+    register_heif_opener()
 
     if not isinstance(uploaded_files, (list, tuple)):
         uploaded_files = [uploaded_files]
 
-    if len(uploaded_files) == 1 and str(uploaded_files[0].name).lower().endswith(".pdf"):
+    if len(uploaded_files) == 1 and is_pdf_upload(uploaded_files[0]):
         uploaded_files[0].seek(0)
         return uploaded_files[0].read()
 
@@ -192,12 +236,11 @@ def convert_uploads_to_pdf_bytes(uploaded_files) -> bytes:
     try:
         for f in uploaded_files:
             f.seek(0)
-            fname = str(f.name).lower()
             raw_bytes = f.read()
             if not raw_bytes:
                 continue
 
-            if fname.endswith(".pdf"):
+            if is_pdf_upload(f):
                 with pymupdf.open(stream=raw_bytes, filetype="pdf") as src_pdf:
                     merged_doc.insert_pdf(src_pdf)
             else:
@@ -1087,104 +1130,110 @@ class GradePortalApp:
                     digits = re.sub(r"\D", "", str(p_val or ""))
                     return digits[-10:] if len(digits) >= 10 else ""
 
-                if student_id and verify_phone:
-                    all_stu_df = load_students(self.db)
-                    match = all_stu_df[all_stu_df["id"].astype(str) == student_id]
-                    if match.empty:
-                        st.error("❌ Student ID not found. Please check your ID.")
-                    else:
-                        stu_row = match.iloc[0]
-                        cur_name = "" if _is_missing(stu_row.get("name")) else str(stu_row["name"]).strip()
-                        cur_phone = "" if _is_missing(stu_row.get("phone")) else str(stu_row["phone"]).strip()
-                        cur_parent = "" if _is_missing(stu_row.get("phone_parent")) else str(stu_row["phone_parent"]).strip()
-                        cur_group = "" if _is_missing(stu_row.get("group_number")) else str(stu_row["group_number"]).strip()
-
-                        entered_10 = _last10(verify_phone)
-                        db_parent_10 = _last10(cur_parent)
-                        db_student_10 = _last10(cur_phone)
-
-                        if not entered_10:
-                            st.warning("Please enter a valid 11-digit phone number to verify your identity.")
-                        elif db_parent_10 and entered_10 == db_parent_10:
-                            is_verified = True
-                        elif not db_parent_10 and db_student_10 and entered_10 == db_student_10:
-                            is_verified = True
-                        elif not db_parent_10 and not db_student_10:
-                            is_verified = True
+                # Keep every message that depends on verification inside ONE container so the
+                # uploader below always sits at the same position in the page. If the number of
+                # elements above it changes (e.g. the "Verified" banner appears when the phone
+                # field commits on blur as the student taps Upload), Streamlit re-mounts the
+                # uploader and photos picked into the old, detached input are silently lost.
+                with st.container():
+                    if student_id and verify_phone:
+                        all_stu_df = load_students(self.db)
+                        match = all_stu_df[all_stu_df["id"].astype(str) == student_id]
+                        if match.empty:
+                            st.error("❌ Student ID not found. Please check your ID.")
                         else:
-                            st.error(
-                                "❌ Verification failed: The phone number entered does not match the Parent Phone Number on file for this ID."
-                            )
+                            stu_row = match.iloc[0]
+                            cur_name = "" if _is_missing(stu_row.get("name")) else str(stu_row["name"]).strip()
+                            cur_phone = "" if _is_missing(stu_row.get("phone")) else str(stu_row["phone"]).strip()
+                            cur_parent = "" if _is_missing(stu_row.get("phone_parent")) else str(stu_row["phone_parent"]).strip()
+                            cur_group = "" if _is_missing(stu_row.get("group_number")) else str(stu_row["group_number"]).strip()
 
-                        if is_verified:
-                            missing_fields = []
-                            if not cur_name:
-                                missing_fields.append("Full Name")
-                            if not cur_phone:
-                                missing_fields.append("Student Phone")
-                            if not cur_parent:
-                                missing_fields.append("Parent Phone")
-                            if not cur_group:
-                                missing_fields.append("Group Number")
+                            entered_10 = _last10(verify_phone)
+                            db_parent_10 = _last10(cur_parent)
+                            db_student_10 = _last10(cur_phone)
 
-                            if not missing_fields:
-                                student_name = cur_name
-                                profile_complete = True
-                                st.success(f"✅ Verified! Welcome, **{student_name}** (Group: {cur_group})")
+                            if not entered_10:
+                                st.warning("Please enter a valid 11-digit phone number to verify your identity.")
+                            elif db_parent_10 and entered_10 == db_parent_10:
+                                is_verified = True
+                            elif not db_parent_10 and db_student_10 and entered_10 == db_student_10:
+                                is_verified = True
+                            elif not db_parent_10 and not db_student_10:
+                                is_verified = True
                             else:
-                                st.warning(
-                                    f"⚠️ Identity verified! Please complete your missing profile details (**{', '.join(missing_fields)}**) below first."
+                                st.error(
+                                    "❌ Verification failed: The phone number entered does not match the Parent Phone Number on file for this ID."
                                 )
-                                with st.container(border=True):
-                                    st.markdown("#### 📋 Complete Your Student Profile")
-                                    with st.form(f"complete_profile_form_{student_id}"):
-                                        c_p1, c_p2 = st.columns(2)
-                                        with c_p1:
-                                            in_name = st.text_input(
-                                                "Full Name *",
-                                                value=cur_name,
-                                                placeholder="Enter your full name",
-                                            ).strip()
-                                            in_group = st.text_input(
-                                                "Group Number *",
-                                                value=cur_group,
-                                                placeholder="e.g. 1, 2, Online...",
-                                            ).strip()
-                                        with c_p2:
-                                            in_phone = st.text_input(
-                                                "Your Phone Number *",
-                                                value=cur_phone,
-                                                placeholder="010...",
-                                            ).strip()
-                                            in_parent = st.text_input(
-                                                "Parent Phone Number *",
-                                                value=cur_parent or verify_phone,
-                                                placeholder="010...",
-                                            ).strip()
 
-                                        if st.form_submit_button(
-                                            "💾 Save Profile",
-                                            type="primary",
-                                            use_container_width=True,
-                                        ):
-                                            digits_stu = re.sub(r"\D", "", in_phone)
-                                            digits_par = re.sub(r"\D", "", in_parent)
-                                            if not (in_name and in_group and in_phone and in_parent):
-                                                st.error("All fields are required.")
-                                            elif len(digits_stu) < 10 or len(digits_par) < 10:
-                                                st.error("Please enter valid phone numbers (at least 10 digits).")
-                                            elif digits_stu[-10:] == digits_par[-10:]:
-                                                st.error("Parent Phone Number must be different from Student Phone Number.")
-                                            else:
-                                                try:
-                                                    self._write([(
-                                                        "UPDATE students SET name = %s, phone = %s, phone_parent = %s, group_number = %s WHERE id = %s",
-                                                        (in_name, in_phone, in_parent, in_group, student_id),
-                                                    )])
-                                                    st.success("✅ Profile saved!")
-                                                    st.rerun()
-                                                except Exception as e:
-                                                    st.error(f"Could not save profile: {e}")
+                            if is_verified:
+                                missing_fields = []
+                                if not cur_name:
+                                    missing_fields.append("Full Name")
+                                if not cur_phone:
+                                    missing_fields.append("Student Phone")
+                                if not cur_parent:
+                                    missing_fields.append("Parent Phone")
+                                if not cur_group:
+                                    missing_fields.append("Group Number")
+
+                                if not missing_fields:
+                                    student_name = cur_name
+                                    profile_complete = True
+                                    st.success(f"✅ Verified! Welcome, **{student_name}** (Group: {cur_group})")
+                                else:
+                                    st.warning(
+                                        f"⚠️ Identity verified! Please complete your missing profile details (**{', '.join(missing_fields)}**) below first."
+                                    )
+                                    with st.container(border=True):
+                                        st.markdown("#### 📋 Complete Your Student Profile")
+                                        with st.form(f"complete_profile_form_{student_id}"):
+                                            c_p1, c_p2 = st.columns(2)
+                                            with c_p1:
+                                                in_name = st.text_input(
+                                                    "Full Name *",
+                                                    value=cur_name,
+                                                    placeholder="Enter your full name",
+                                                ).strip()
+                                                in_group = st.text_input(
+                                                    "Group Number *",
+                                                    value=cur_group,
+                                                    placeholder="e.g. 1, 2, Online...",
+                                                ).strip()
+                                            with c_p2:
+                                                in_phone = st.text_input(
+                                                    "Your Phone Number *",
+                                                    value=cur_phone,
+                                                    placeholder="010...",
+                                                ).strip()
+                                                in_parent = st.text_input(
+                                                    "Parent Phone Number *",
+                                                    value=cur_parent or verify_phone,
+                                                    placeholder="010...",
+                                                ).strip()
+
+                                            if st.form_submit_button(
+                                                "💾 Save Profile",
+                                                type="primary",
+                                                use_container_width=True,
+                                            ):
+                                                digits_stu = re.sub(r"\D", "", in_phone)
+                                                digits_par = re.sub(r"\D", "", in_parent)
+                                                if not (in_name and in_group and in_phone and in_parent):
+                                                    st.error("All fields are required.")
+                                                elif len(digits_stu) < 10 or len(digits_par) < 10:
+                                                    st.error("Please enter valid phone numbers (at least 10 digits).")
+                                                elif digits_stu[-10:] == digits_par[-10:]:
+                                                    st.error("Parent Phone Number must be different from Student Phone Number.")
+                                                else:
+                                                    try:
+                                                        self._write([(
+                                                            "UPDATE students SET name = %s, phone = %s, phone_parent = %s, group_number = %s WHERE id = %s",
+                                                            (in_name, in_phone, in_parent, in_group, student_id),
+                                                        )])
+                                                        st.success("✅ Profile saved!")
+                                                        st.rerun()
+                                                    except Exception as e:
+                                                        st.error(f"Could not save profile: {e}")
 
                 st.divider()
 
@@ -1194,69 +1243,84 @@ class GradePortalApp:
                     "then tap below, choose **Photo Library / Gallery**, select all your photos in order, and tap Submit."
                 )
 
-                # Wrapping the uploader in a form PREVENTS the mobile browser from dropping 
-                # multiple files by batching the upload only when they tap submit.
-                with st.form("hw_submission_form", clear_on_submit=False):
-                    uploaded_files = st.file_uploader(
-                        "Select Homework Photos or PDF",
-                        type=["pdf", "png", "jpg", "jpeg", "webp", "heic", "heif"],
-                        accept_multiple_files=True,
-                        key="hw_upload_widget",
+                # No st.form here: inside a form the script never sees the selected files until
+                # Submit, so it cannot show previews. Each pick reruns the script and the files
+                # come back in the order they were added. MIME types (not extensions) are used so
+                # phone photos whose names have no extension (some Android gallery pickers) are
+                # accepted. .heic/.heif cover iPhone photos the browser reports with no MIME type;
+                # the server converts them.
+                uploaded_files = st.file_uploader(
+                    "Select Homework Photos or PDF",
+                    type=["image/*", "application/pdf", ".heic", ".heif"],
+                    accept_multiple_files=True,
+                    key="hw_upload_widget",
+                )
+
+                if uploaded_files:
+                    st.caption(
+                        f"📎 **{len(uploaded_files)} file(s) attached**, merged into one PDF in this order. "
+                        "Tap **+** to add more, or **✕** next to a file to remove it."
+                    )
+                    st.image(
+                        [upload_preview(f) for f in uploaded_files],
+                        caption=[f"{i}. {f.name}" for i, f in enumerate(uploaded_files, 1)],
+                        width=110,
                     )
 
-                    submit_hw_clicked = st.form_submit_button(
-                        "🚀 Submit Homework",
-                        type="primary",
-                        use_container_width=True,
-                    )
+                submit_hw_clicked = st.button(
+                    "🚀 Submit Homework",
+                    type="primary",
+                    key="btn_submit_hw_main",
+                    use_container_width=True,
+                )
 
-                    if submit_hw_clicked:
-                        if selected_hw_id is None:
-                            st.error("⚠️ Please select the **Homework** from dropdown 1️⃣ at the top first.")
-                        elif not student_id or not verify_phone:
-                            st.error("⚠️ Please enter both your **Student ID** and **Parent Phone Number** above.")
-                        elif not is_verified:
-                            st.error("⚠️ Your Student ID and Parent Phone Number could not be verified.")
-                        elif not profile_complete:
-                            st.error("⚠️ Please complete and save your missing profile details in the box above first.")
-                        elif not uploaded_files:
-                            st.error("⚠️ Please attach your homework photos or PDF file before clicking Submit.")
-                        else:
-                            with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
-                                try:
-                                    pdf_bytes = convert_uploads_to_pdf_bytes(uploaded_files)
-                                    base64_data = base64.b64encode(pdf_bytes).decode("utf-8")
-                                    file_name = build_drive_hw_filename(
-                                        student_id, selected_hw_id, selected_hw_title
-                                    )
+                if submit_hw_clicked:
+                    if selected_hw_id is None:
+                        st.error("⚠️ Please select the **Homework** from dropdown 1️⃣ at the top first.")
+                    elif not student_id or not verify_phone:
+                        st.error("⚠️ Please enter both your **Student ID** and **Parent Phone Number** above.")
+                    elif not is_verified:
+                        st.error("⚠️ Your Student ID and Parent Phone Number could not be verified.")
+                    elif not profile_complete:
+                        st.error("⚠️ Please complete and save your missing profile details in the box above first.")
+                    elif not uploaded_files:
+                        st.error("⚠️ Please attach your homework photos or PDF file before clicking Submit.")
+                    else:
+                        with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
+                            try:
+                                pdf_bytes = convert_uploads_to_pdf_bytes(uploaded_files)
+                                base64_data = base64.b64encode(pdf_bytes).decode("utf-8")
+                                file_name = build_drive_hw_filename(
+                                    student_id, selected_hw_id, selected_hw_title
+                                )
 
-                                    script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
-                                    payload = {
-                                        "filename": file_name,
-                                        "subfolder": selected_hw_title,
-                                        "mimeType": "application/pdf",
-                                        "base64": base64_data,
-                                    }
+                                script_url = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
+                                payload = {
+                                    "filename": file_name,
+                                    "subfolder": selected_hw_title,
+                                    "mimeType": "application/pdf",
+                                    "base64": base64_data,
+                                }
 
-                                    response = requests.post(script_url, json=payload, timeout=90)
-                                    if response.status_code == 200:
-                                        res_json = response.json()
-                                        if res_json.get("status") == "success":
-                                            mark_homework_submitted(self.db, selected_hw_id, student_id)
-                                            st.success(
-                                                f"✅ Homework **{selected_hw_title}** submitted successfully!"
-                                            )
-                                            st.balloons()
-                                        else:
-                                            st.error(
-                                                f"Error from Google Drive: {res_json.get('message', 'Unknown error')}"
-                                            )
+                                response = requests.post(script_url, json=payload, timeout=90)
+                                if response.status_code == 200:
+                                    res_json = response.json()
+                                    if res_json.get("status") == "success":
+                                        mark_homework_submitted(self.db, selected_hw_id, student_id)
+                                        st.success(
+                                            f"✅ Homework **{selected_hw_title}** submitted successfully!"
+                                        )
+                                        st.balloons()
                                     else:
                                         st.error(
-                                            f"Failed to connect to Google Drive. Status Code: {response.status_code}"
+                                            f"Error from Google Drive: {res_json.get('message', 'Unknown error')}"
                                         )
-                                except Exception as e:
-                                    st.error(f"An error occurred while processing your files: {e}")
+                                else:
+                                    st.error(
+                                        f"Failed to connect to Google Drive. Status Code: {response.status_code}"
+                                    )
+                            except Exception as e:
+                                st.error(f"An error occurred while processing your files: {e}")
 
     def _render_admin_login(self):
         col1, col2, col3 = st.columns([1, 2, 1])
