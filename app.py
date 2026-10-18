@@ -41,6 +41,8 @@ CACHE_TTL = 120              # seconds; every write also clears the cache immedi
 PAGE_SIZE = 20               # rows per page on the WhatsApp screen
 MAX_IMG_WIDTH = 1200         # uploaded feedback images are downscaled to this width
 LOCK_TIMEOUT_SECONDS = 600   # 10 minutes: auto-releases if an admin closes their tab without saving
+MAX_PHOTO_MB = 30            # per homework photo; full-size photos from 50-200 MP phone cameras fit
+MAX_TOTAL_UPLOAD_MB = 200    # all files in one homework submission together
 
 KINDS = {
     "homework": {
@@ -1263,6 +1265,7 @@ class GradePortalApp:
                     type=["image/*"],
                     accept_multiple_files=True,
                     key="hw_upload_widget",
+                    max_upload_size=MAX_PHOTO_MB,
                 )
                 pdf_files = st.file_uploader(
                     "Or upload a PDF instead",
@@ -1281,12 +1284,19 @@ class GradePortalApp:
                     "</style>"
                 )
                 uploaded_files = (photo_files or []) + (pdf_files or [])
+                total_upload_mb = sum(f.size for f in uploaded_files) / (1024 * 1024)
 
                 if uploaded_files:
                     st.caption(
-                        f"📎 **{len(uploaded_files)} file(s) attached**, merged into one PDF in this order. "
+                        f"📎 **{len(uploaded_files)} file(s) attached** ({total_upload_mb:.1f} MB of "
+                        f"{MAX_TOTAL_UPLOAD_MB} MB), merged into one PDF in this order. "
                         "Tap **+** to add more, or **✕** next to a file to remove it."
                     )
+                    if total_upload_mb > MAX_TOTAL_UPLOAD_MB:
+                        st.error(
+                            f"⚠️ Your files add up to {total_upload_mb:.0f} MB. The limit is "
+                            f"{MAX_TOTAL_UPLOAD_MB} MB in total, so please remove some files."
+                        )
                     st.image(
                         [upload_preview(f) for f in uploaded_files],
                         caption=[f"{i}. {f.name}" for i, f in enumerate(uploaded_files, 1)],
@@ -1311,6 +1321,11 @@ class GradePortalApp:
                         st.error("⚠️ Please complete and save your missing profile details in the box above first.")
                     elif not uploaded_files:
                         st.error("⚠️ Please attach your homework photos or PDF file before clicking Submit.")
+                    elif total_upload_mb > MAX_TOTAL_UPLOAD_MB:
+                        st.error(
+                            f"⚠️ Your files are over the {MAX_TOTAL_UPLOAD_MB} MB total limit. "
+                            "Please remove some files before submitting."
+                        )
                     else:
                         with st.spinner("Converting pages to PDF & uploading to Google Drive..."):
                             try:
