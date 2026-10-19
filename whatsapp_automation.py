@@ -301,6 +301,18 @@ def init_automation_tables(db):
                 )
                 """
             )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assistants (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    phone TEXT NOT NULL UNIQUE,
+                    notify_hw_submit BOOLEAN DEFAULT TRUE,
+                    notify_daily_schedule BOOLEAN DEFAULT TRUE,
+                    notify_grade_submitted BOOLEAN DEFAULT FALSE
+                )
+                """
+            )
         conn.commit()
 
 
@@ -670,7 +682,7 @@ def trigger_post_grade_whatsapp(
 # Reusable Morning Schedule Builder & Sender
 # ---------------------------------------------------------------------------
 def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean: str, now: datetime.datetime) -> tuple[bool, str]:
-    """Builds and sends today's morning schedule + exciting sentence to the teacher."""
+    """Builds and sends today's morning schedule + exciting sentence to the teacher and eligible assistants."""
     today_str = now.strftime("%Y-%m-%d")
     today_day = now.strftime("%a")
 
@@ -725,7 +737,22 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
         lines.append(f"\n{exciting_line}")
         msg = "\n".join(lines)
 
-    return client.send_text(teacher_phone_clean, msg)
+    # 1. Send to the Teacher
+    ok, err = client.send_text(teacher_phone_clean, msg)
+
+    # 2. Send to eligible Assistants
+    try:
+        asst_df = db.fetch_dataframe("SELECT name, phone FROM assistants WHERE notify_daily_schedule = TRUE")
+        for _, row in asst_df.iterrows():
+            asst_phone = clean_wa_phone(row["phone"])
+            if asst_phone:
+                # Personalize the message greeting for the assistant
+                asst_msg = msg.replace("Eng. Mahmoud Adel", str(row["name"]).strip())
+                client.send_text(asst_phone, asst_msg)
+    except Exception as e:
+        print(f"Failed to send schedule to assistants: {e}")
+
+    return ok, err
 
 
 # ---------------------------------------------------------------------------
@@ -1519,15 +1546,13 @@ class AutomatedMessagesView:
         # TAB 3: BOT & TEACHER SETTINGS
         # ===================================================================
         with tab_settings:
-            st.markdown("#### ⚙️ GOWA Bot Connection, Teacher & Assistant Preferences")
+            st.markdown("#### ⚙️ Bot Connection & Teacher Settings")
             cur_url = get_bot_setting(self.db, "gowa_url", rt.get("cached_url", DEFAULT_GOWA_URL))
             cur_auth = get_bot_setting(self.db, "gowa_auth", rt.get("cached_auth", ""))
             cur_t_phone = get_bot_setting(self.db, "teacher_phone", rt.get("cached_teacher_phone", ""))
-            cur_a_phone = get_bot_setting(self.db, "assistant_phone", rt.get("cached_assistant_phone", ""))
             cur_m_time = get_bot_setting(self.db, "morning_schedule_time", "08:00")
             cur_auto_grade = get_bot_setting(self.db, "auto_send_on_grade", "true").lower() == "true"
             cur_also_stu = get_bot_setting(self.db, "also_send_grade_to_student", "false").lower() == "true"
-            cur_notify_asst = get_bot_setting(self.db, "notify_assistant_on_hw_submit", "true").lower() == "true"
 
             try:
                 parsed_morning_time = datetime.datetime.strptime(cur_m_time.strip(), "%H:%M").time()
@@ -1562,11 +1587,6 @@ class AutomatedMessagesView:
                     value=cur_t_phone,
                     placeholder="e.g. 010...",
                 )
-                in_a_phone = st.text_input(
-                    "👩‍🏫 Assistant's WhatsApp Phone Number (Receives Instant Alert Whenever a Student Submits HW)",
-                    value=cur_a_phone,
-                    placeholder="e.g. 010...",
-                )
                 in_m_time = st.time_input(
                     "☀️ Daily Morning Schedule Send Time (Cairo time)",
                     value=parsed_morning_time,
@@ -1579,12 +1599,8 @@ class AutomatedMessagesView:
                     "🎓 Also send Grade + PDF Report to Student's phone right after saving a grade",
                     value=cur_also_stu,
                 )
-                in_notify_asst = st.checkbox(
-                    "📥 Automatically notify Assistant on WhatsApp whenever a student submits a Homework to correct it",
-                    value=cur_notify_asst,
-                )
 
-                if st.form_submit_button("💾 Save Bot Settings", type="primary", use_container_width=True):
+                if st.form_submit_button("💾 Save Teacher & Bot Settings", type="primary", use_container_width=True):
                     m_time_formatted = (
                         in_m_time.strftime("%H:%M")
                         if isinstance(in_m_time, datetime.time)
@@ -1593,11 +1609,67 @@ class AutomatedMessagesView:
                     set_bot_setting(self.db, "gowa_url", in_url.strip() or DEFAULT_GOWA_URL)
                     set_bot_setting(self.db, "gowa_auth", in_auth.strip())
                     set_bot_setting(self.db, "teacher_phone", in_t_phone.strip())
-                    set_bot_setting(self.db, "assistant_phone", in_a_phone.strip())
                     set_bot_setting(self.db, "morning_schedule_time", m_time_formatted)
                     set_bot_setting(self.db, "auto_send_on_grade", "true" if in_auto_grade else "false")
                     set_bot_setting(self.db, "also_send_grade_to_student", "true" if in_also_stu else "false")
-                    set_bot_setting(self.db, "notify_assistant_on_hw_submit", "true" if in_notify_asst else "false")
                     _sync_secrets_to_cache_and_db(self.db)
-                    st.success("✅ Bot settings saved!")
+                    st.success("✅ Teacher & Bot settings saved!")
                     st.rerun()
+
+            st.divider()
+            st.markdown("#### 👩‍🏫 Manage Assistants & Notification Permissions")
+            
+            asst_df = self.db.fetch_dataframe(
+                "SELECT id, name, phone, notify_hw_submit, notify_daily_schedule, notify_grade_submitted FROM assistants ORDER BY id ASC"
+            )
+            
+            if not asst_df.empty:
+                st.dataframe(
+                    asst_df, 
+                    hide_index=True, 
+                    use_container_width=True,
+                    column_config={
+                        "id": None,
+                        "name": "Assistant Name",
+                        "phone": "WhatsApp Phone",
+                        "notify_hw_submit": "HW Submits",
+                        "notify_daily_schedule": "Daily Schedule",
+                        "notify_grade_submitted": "Grade Saved"
+                    }
+                )
+                
+                del_asst_dict = {str(row["id"]): f"{row['name']} ({row['phone']})" for _, row in asst_df.iterrows()}
+                c_del1, c_del2 = st.columns([3, 1])
+                del_sel = c_del1.selectbox("Select Assistant to Remove", list(del_asst_dict.keys()), format_func=lambda x: del_asst_dict[x])
+                if c_del2.button("🗑️ Remove Assistant", use_container_width=True):
+                    self.db.execute_query("DELETE FROM assistants WHERE id = %s", (int(del_sel),))
+                    st.rerun()
+            else:
+                st.info("No assistants registered yet.")
+
+            with st.expander("➕ Add New Assistant", expanded=True):
+                with st.form("add_assistant_form"):
+                    a_name = st.text_input("Assistant Name")
+                    a_phone = st.text_input("WhatsApp Phone Number", placeholder="010...")
+                    
+                    st.markdown("**Notification Permissions:**")
+                    a_hw = st.checkbox("📥 Receive New Homework Submission Alerts", value=True)
+                    a_sched = st.checkbox("☀️ Receive Morning Schedule", value=True)
+                    a_grade = st.checkbox("✅ Receive Grade Saved Alerts", value=False)
+                    
+                    if st.form_submit_button("💾 Add Assistant", type="primary"):
+                        if not a_name.strip() or not a_phone.strip():
+                            st.error("Name and Phone are required.")
+                        else:
+                            try:
+                                self.db.execute_query(
+                                    """
+                                    INSERT INTO assistants (name, phone, notify_hw_submit, notify_daily_schedule, notify_grade_submitted) 
+                                    VALUES (%s, %s, %s, %s, %s)
+                                    """,
+                                    (a_name.strip(), a_phone.strip(), a_hw, a_sched, a_grade)
+                                )
+                                st.success(f"Assistant {a_name} added successfully!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to add assistant (Phone might already exist): {e}")
