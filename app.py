@@ -24,6 +24,8 @@ from pdf_utils import PDFGenerator
 from student_profile import StudentProfileView
 from whatsapp_automation import (
     AutomatedMessagesView,
+    start_background_automation_daemon,
+    trigger_hw_submission_assistant_whatsapp,
     trigger_post_grade_whatsapp,
 )
 
@@ -1044,6 +1046,7 @@ class GradePortalApp:
     def __init__(self):
         self.db = get_db()
         self.auth = AuthManager()
+        start_background_automation_daemon(self.db)
     def run(self):
         query_params = st.query_params
         is_admin_route = "admin" in query_params
@@ -1346,6 +1349,14 @@ class GradePortalApp:
                                     res_json = response.json()
                                     if res_json.get("status") == "success":
                                         mark_homework_submitted(self.db, selected_hw_id, student_id)
+                                        trigger_hw_submission_assistant_whatsapp(
+                                            db=self.db,
+                                            student_id=student_id,
+                                            homework_id=selected_hw_id,
+                                            homework_title=selected_hw_title,
+                                            student_name=student_name,
+                                            group_number=cur_group,
+                                        )
                                         st.success(
                                             f"✅ Homework **{selected_hw_title}** submitted successfully!"
                                         )
@@ -1464,6 +1475,7 @@ class GradePortalApp:
             self._admin_whatsapp_parents()
         elif menu == "🤖 Automated Messages":
             AutomatedMessagesView(self.db).render()
+
     def _grading_section(self, kind, item_id, item_title, max_score, saved_rubric=""):
         st.divider()
         st.subheader("🔍 Search & Grade Students")
