@@ -28,7 +28,4 @@ jobs:
       - name: Run scheduler tick
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          WHATSAPP_API_URL: ${{ secrets.WHATSAPP_API_URL }}
-          WHATSAPP_API_AUTH: ${{ secrets.WHATSAPP_API_AUTH }}
-          TEACHER_PHONE: ${{ secrets.TEACHER_PHONE }}
         run: python scheduler.py
