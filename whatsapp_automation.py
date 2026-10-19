@@ -1,5 +1,6 @@
 import datetime
 import io
+import os
 import random
 import re
 import threading
@@ -33,43 +34,59 @@ EXCITING_MORNING_SENTENCES = [
 ]
 
 
+def _get_secret_or_env(key: str, default: str = "") -> str:
+    """Safely reads from st.secrets when inside Streamlit, falling back to os.environ."""
+    val = ""
+    try:
+        val = st.secrets.get(key, "")
+    except Exception:
+        val = ""
+    if not val:
+        val = os.environ.get(key, default)
+    return str(val).strip() if val is not None else default
+
+
 @st.cache_resource(show_spinner=False)
 def get_daemon_runtime():
     """
     Server-wide persistent singleton that survives Streamlit script reruns and module reloads.
-    Holds the lock, the background thread reference, cached secrets, and diagnostic logs.
+    Holds the lock, cached secrets, and diagnostic logs.
     """
     return {
         "lock": threading.Lock(),
-        "thread": None,
         "last_tick": None,
         "last_tick_ts": 0.0,
         "last_error": None,
         "last_action": "Initialized — waiting for first check...",
         "last_grade_status": "No grade saved in this session yet.",
+        "last_hw_sub_status": "No homework submission alert sent in this session yet.",
         "cached_url": DEFAULT_GOWA_URL,
         "cached_auth": "",
         "cached_teacher_phone": "",
+        "cached_assistant_phone": "",
     }
 
 
 def _sync_secrets_to_cache_and_db(db=None):
     """
-    Safely reads st.secrets on the main Streamlit thread and stores them in the
-    @st.cache_resource singleton + database so background threads never lose credentials.
+    Safely reads st.secrets (or environment variables) and stores them in the
+    @st.cache_resource singleton + database so background/external processes never lose credentials.
     """
     rt = get_daemon_runtime()
     try:
-        s_url = st.secrets.get("WHATSAPP_API_URL", "")
-        s_auth = st.secrets.get("WHATSAPP_API_AUTH", "")
-        s_tphone = st.secrets.get("TEACHER_PHONE", "")
+        s_url = _get_secret_or_env("WHATSAPP_API_URL", "")
+        s_auth = _get_secret_or_env("WHATSAPP_API_AUTH", "")
+        s_tphone = _get_secret_or_env("TEACHER_PHONE", "")
+        s_aphone = _get_secret_or_env("ASSISTANT_PHONE", "")
         with rt["lock"]:
             if s_url:
-                rt["cached_url"] = str(s_url).strip()
+                rt["cached_url"] = s_url
             if s_auth:
-                rt["cached_auth"] = str(s_auth).strip()
+                rt["cached_auth"] = s_auth
             if s_tphone:
-                rt["cached_teacher_phone"] = str(s_tphone).strip()
+                rt["cached_teacher_phone"] = s_tphone
+            if s_aphone:
+                rt["cached_assistant_phone"] = s_aphone
     except Exception:
         pass
 
@@ -81,6 +98,8 @@ def _sync_secrets_to_cache_and_db(db=None):
                 set_bot_setting(db, "gowa_auth", rt["cached_auth"])
             if not get_bot_setting(db, "teacher_phone", "") and rt["cached_teacher_phone"]:
                 set_bot_setting(db, "teacher_phone", rt["cached_teacher_phone"])
+            if not get_bot_setting(db, "assistant_phone", "") and rt["cached_assistant_phone"]:
+                set_bot_setting(db, "assistant_phone", rt["cached_assistant_phone"])
         except Exception:
             pass
 
@@ -129,11 +148,12 @@ class GowaClient:
             url = rt.get("cached_url") or DEFAULT_GOWA_URL
             auth = rt.get("cached_auth") or ""
 
-        try:
-            url = st.secrets.get("WHATSAPP_API_URL", url)
-            auth = st.secrets.get("WHATSAPP_API_AUTH", auth)
-        except Exception:
-            pass
+        s_url = _get_secret_or_env("WHATSAPP_API_URL", "")
+        s_auth = _get_secret_or_env("WHATSAPP_API_AUTH", "")
+        if s_url and url == DEFAULT_GOWA_URL:
+            url = s_url
+        if s_auth and not auth:
+            auth = s_auth
 
         if db is not None:
             saved_url = get_bot_setting(db, "gowa_url", "")
@@ -306,18 +326,27 @@ def set_bot_setting(db, key: str, value: str):
 
 
 def get_resolved_teacher_phone(db) -> str | None:
-    """Gets teacher phone from DB first, then singleton cache, then st.secrets."""
+    """Gets teacher phone from DB first, then singleton cache, then st.secrets / env."""
     t_phone = get_bot_setting(db, "teacher_phone", "")
     if not t_phone:
         rt = get_daemon_runtime()
         with rt["lock"]:
             t_phone = rt.get("cached_teacher_phone", "")
     if not t_phone:
-        try:
-            t_phone = st.secrets.get("TEACHER_PHONE", "")
-        except Exception:
-            pass
+        t_phone = _get_secret_or_env("TEACHER_PHONE", "")
     return clean_wa_phone(t_phone)
+
+
+def get_resolved_assistant_phone(db) -> str | None:
+    """Gets assistant phone from DB first, then singleton cache, then st.secrets / env."""
+    a_phone = get_bot_setting(db, "assistant_phone", "")
+    if not a_phone:
+        rt = get_daemon_runtime()
+        with rt["lock"]:
+            a_phone = rt.get("cached_assistant_phone", "")
+    if not a_phone:
+        a_phone = _get_secret_or_env("ASSISTANT_PHONE", "")
+    return clean_wa_phone(a_phone)
 
 
 def has_dispatched(db, dispatch_key: str) -> bool:
@@ -339,6 +368,34 @@ def mark_dispatched(db, dispatch_key: str):
         )
     except Exception:
         pass
+
+
+def claim_dispatch(db, key: str) -> bool:
+    """Atomically claims a dispatch key so concurrent or overlapping runs never double-send."""
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    "INSERT INTO automated_dispatch_log (dispatch_key) VALUES (%s) ON CONFLICT DO NOTHING",
+                    (key,),
+                )
+                claimed = c.rowcount == 1
+            conn.commit()
+        return claimed
+    except Exception as e:
+        print(f"[Dispatch] Failed to claim key '{key}': {e}")
+        return False
+
+
+def release_dispatch(db, key: str):
+    """Releases a claimed dispatch key if sending failed so the next tick can retry."""
+    try:
+        db.execute_query(
+            "DELETE FROM automated_dispatch_log WHERE dispatch_key = %s",
+            (key,),
+        )
+    except Exception as e:
+        print(f"[Dispatch] Failed to release key '{key}': {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +431,101 @@ def _safe_generate_student_pdf(
         with rt["lock"]:
             rt["last_error"] = f"PDF Generation Error ({student_name}): {e}"
         return None
+
+
+# ---------------------------------------------------------------------------
+# Instant Homework Submission Alert to Assistant (Triggered when Student submits HW)
+# ---------------------------------------------------------------------------
+def trigger_hw_submission_assistant_whatsapp(
+    db,
+    student_id: str,
+    homework_id: int | None = None,
+    homework_title: str | None = None,
+    student_name: str | None = None,
+    group_number: str | None = None,
+):
+    """
+    Runs immediately when a student submits a homework (and is also checked by the background scheduler).
+    Sends a WhatsApp notification to the Assistant's phone number so she knows to grade it.
+    """
+    _sync_secrets_to_cache_and_db(db)
+    rt = get_daemon_runtime()
+
+    notify_enabled = get_bot_setting(db, "notify_assistant_on_hw_submit", "true").lower() == "true"
+    if not notify_enabled:
+        with rt["lock"]:
+            rt["last_hw_sub_status"] = "Skipped (notify_assistant_on_hw_submit is disabled in Settings)"
+        return
+
+    assistant_phone = get_resolved_assistant_phone(db)
+    if not assistant_phone:
+        with rt["lock"]:
+            rt["last_hw_sub_status"] = "Skipped (Assistant phone is not configured in Settings)"
+        return
+
+    # Resolve missing student details synchronously before Streamlit reruns
+    if not student_name or not group_number:
+        try:
+            stu_df = db.fetch_dataframe(
+                "SELECT name, group_number FROM students WHERE id = %s",
+                (str(student_id),),
+            )
+            if not stu_df.empty:
+                student_name = student_name or str(stu_df.iloc[0]["name"])
+                group_number = group_number or str(stu_df.iloc[0].get("group_number") or "N/A").strip()
+        except Exception:
+            pass
+
+    student_name = student_name or f"Student #{student_id}"
+    group_number = group_number or "N/A"
+
+    # Resolve missing homework title synchronously
+    if not homework_title and homework_id is not None:
+        try:
+            hw_df = db.fetch_dataframe(
+                "SELECT title FROM homeworks WHERE homework_id = %s",
+                (int(homework_id),),
+            )
+            if not hw_df.empty:
+                homework_title = str(hw_df.iloc[0]["title"])
+        except Exception:
+            pass
+
+    homework_title = homework_title or (f"Homework #{homework_id}" if homework_id else "Homework")
+
+    # Pre-mark dispatch key if homework_id is known so the 5-min cron doesn't send a duplicate alert
+    if homework_id is not None:
+        sub_key = f"asst_hw_sub_hw_{int(homework_id)}_stu_{str(student_id).strip()}"
+        mark_dispatched(db, sub_key)
+
+    client = GowaClient.from_secrets(db)
+    submitted_at_str = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M")
+
+    def _worker():
+        try:
+            msg = emoji.emojize(
+                f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
+                f"👩‍🏫 *تنبيه للمساعدة:*\n"
+                f"قام الطالب *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*) بتسليم الواجب:\n"
+                f"📘 *{homework_title}*\n"
+                f"🕒 *وقت التسليم:* {submitted_at_str}\n\n"
+                f"برجاء الدخول على المنصة لمراجعة الواجب وتصحيحه. :check_mark_button:\n\n"
+                f"Mathematics Team – Eng. Mahmoud Adel"
+            )
+            ok, err = client.send_text(assistant_phone, msg)
+            with rt["lock"]:
+                if ok:
+                    rt["last_hw_sub_status"] = f"Sent to Assistant ({assistant_phone}) for {student_name} ({homework_title})"
+                    rt["last_action"] = f"HW Sub Alert -> Assistant ({student_name})"
+                else:
+                    rt["last_hw_sub_status"] = f"Failed for {student_name}: {err}"
+                    rt["last_error"] = f"Assistant HW Sub Alert Error: {err}"
+        except Exception as e:
+            with rt["lock"]:
+                rt["last_error"] = f"Assistant HW Sub Exception ({student_name}): {e}"
+                rt["last_hw_sub_status"] = f"Exception for {student_name}: {e}"
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -577,48 +729,172 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
 
 
 # ---------------------------------------------------------------------------
-# Background Scheduler Tick (Checks Morning Schedule, 10-Min Teacher Reports, 6-Hr Reminders)
+# Background Check: Pending Uncorrected Homework Submissions for Assistant
 # ---------------------------------------------------------------------------
+def check_and_notify_assistant_pending_submissions(
+    db, client: GowaClient, assistant_phone_clean: str, now: datetime.datetime, rt
+):
+    """
+    Checks `homework_grades` for any rows where `submitted = TRUE` and `correct_answers IS NULL`
+    (meaning the student submitted the homework and it is waiting for the assistant to correct it).
+    Uses `claim_dispatch` per (homework_id, student_id) so each submission notifies the assistant once.
+    """
+    notify_enabled = get_bot_setting(db, "notify_assistant_on_hw_submit", "true").lower() == "true"
+    if not notify_enabled:
+        print("[Scheduler] Assistant HW submission check skipped: disabled in settings.")
+        return
+
+    if not assistant_phone_clean:
+        print("[Scheduler] Assistant HW submission check skipped: assistant phone not configured.")
+        return
+
+    try:
+        pending_df = db.fetch_dataframe(
+            """
+            SELECT hg.homework_id, hg.student_id, s.name AS student_name, s.group_number, h.title AS hw_title
+            FROM homework_grades hg
+            JOIN students s ON s.id = hg.student_id
+            JOIN homeworks h ON h.homework_id = hg.homework_id
+            WHERE COALESCE(hg.submitted, FALSE) = TRUE
+              AND hg.correct_answers IS NULL
+            """
+        )
+    except Exception as e:
+        print(f"[Scheduler] Failed to query pending homework submissions: {e}")
+        return
+
+    if pending_df.empty:
+        print("[Scheduler] Assistant HW check: no new ungraded homework submissions.")
+        return
+
+    now_fmt = now.strftime("%Y-%m-%d %H:%M")
+    for _, row in pending_df.iterrows():
+        hw_id = int(row["homework_id"])
+        stu_id = str(row["student_id"]).strip()
+        stu_name = str(row.get("student_name") or f"Student #{stu_id}")
+        grp = str(row.get("group_number") or "N/A").strip()
+        hw_title = str(row.get("hw_title") or f"Homework #{hw_id}")
+
+        sub_key = f"asst_hw_sub_hw_{hw_id}_stu_{stu_id}"
+        if claim_dispatch(db, sub_key):
+            msg = emoji.emojize(
+                f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
+                f"👩‍🏫 *تنبيه للمساعدة:*\n"
+                f"قام الطالب *{stu_name}* (كود: `{stu_id}` — مجموعة *{grp}*) بتسليم الواجب:\n"
+                f"📘 *{hw_title}*\n"
+                f"🕒 *وقت الإشعار:* {now_fmt}\n\n"
+                f"برجاء الدخول على المنصة لمراجعة الواجب وتصحيحه. :check_mark_button:\n\n"
+                f"Mathematics Team – Eng. Mahmoud Adel"
+            )
+            ok, err = client.send_text(assistant_phone_clean, msg)
+            if ok:
+                action_msg = f"Notified Assistant: HW submitted by {stu_name} ({hw_title})"
+                _record_scheduler_action(db, rt, action_msg)
+                with rt["lock"]:
+                    rt["last_hw_sub_status"] = f"Sent to Assistant ({assistant_phone_clean}) for {stu_name}"
+                print(f"[Scheduler] {action_msg}.")
+            else:
+                release_dispatch(db, sub_key)
+                err_msg = f"Assistant HW Sub Alert Failed ({stu_name}): {err}"
+                _record_scheduler_error(db, rt, err_msg)
+                print(f"[Scheduler] {err_msg} (released '{sub_key}' for retry).")
+            time.sleep(3)
+
+
+# ---------------------------------------------------------------------------
+# Background Scheduler Tick (Checks Morning Schedule, Assistant Alerts, 10-Min Teacher Reports, 6-Hr Reminders)
+# ---------------------------------------------------------------------------
+def _parse_hhmm_tolerant(time_str: str, default_hr: int = 8, default_min: int = 0) -> tuple[int, int]:
+    """Tolerantly parses '3:21', '03:21', '15:21', etc. Falls back to default only if unparseable."""
+    try:
+        m = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{1,2})", str(time_str or ""))
+        if m:
+            hr, mn = int(m.group(1)), int(m.group(2))
+            if 0 <= hr <= 23 and 0 <= mn <= 59:
+                return hr, mn
+    except Exception:
+        pass
+    return default_hr, default_min
+
+
+def _record_scheduler_action(db, rt, action_msg: str):
+    with rt["lock"]:
+        rt["last_action"] = action_msg
+    try:
+        set_bot_setting(db, "last_scheduler_action", action_msg)
+    except Exception:
+        pass
+
+
+def _record_scheduler_error(db, rt, err_msg: str):
+    with rt["lock"]:
+        rt["last_error"] = err_msg
+    try:
+        set_bot_setting(db, "last_scheduler_error", err_msg)
+    except Exception:
+        pass
+
+
 def run_scheduled_checks_once(db):
     """
-    Evaluates current Cairo time against all scheduled group timings:
+    Evaluates current Cairo time against all scheduled group timings & pending submissions:
     1. Morning Teacher Schedule + Random Exciting Sentence.
-    2. 10-Minute Pre-Group Homework & Quiz Master PDF Reports to Teacher.
-    3. 6-Hour Pre-Group Homework & Quiz Reminders to Students who haven't submitted.
+    2. Pending Uncorrected Homework Submissions -> Notify Assistant to grade them.
+    3. 10-Minute Pre-Group Homework & Quiz Master PDF Reports to Teacher.
+    4. 6-Hour Pre-Group Homework & Quiz Reminders to Students who haven't submitted.
     """
     rt = get_daemon_runtime()
     now = datetime.datetime.now(CAIRO_TZ)
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
     today_str = now.strftime("%Y-%m-%d")
     today_day = now.strftime("%a")  # 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'
 
     with rt["lock"]:
-        rt["last_tick"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        rt["last_tick"] = now_str
         rt["last_tick_ts"] = time.time()
 
+    try:
+        set_bot_setting(db, "last_scheduler_tick", now_str)
+    except Exception as e:
+        print(f"[Scheduler] Warning: could not persist last_scheduler_tick: {e}")
+
+    print(f"[Scheduler] Tick started at {now_str} Cairo time ({today_day}).")
+
     teacher_phone_clean = get_resolved_teacher_phone(db)
+    assistant_phone_clean = get_resolved_assistant_phone(db)
     client = GowaClient.from_secrets(db)
+
+    # -----------------------------------------------------------------------
+    # WORKFLOW 0: Notify Assistant of Any New Homework Submissions to Correct
+    # -----------------------------------------------------------------------
+    check_and_notify_assistant_pending_submissions(db, client, assistant_phone_clean, now, rt)
 
     # -----------------------------------------------------------------------
     # WORKFLOW 1: Daily Morning Schedule to Teacher
     # -----------------------------------------------------------------------
     morning_time_str = get_bot_setting(db, "morning_schedule_time", "08:00")
-    try:
-        m_hr, m_min = [int(x) for x in morning_time_str.strip().split(":")[:2]]
-        morning_dt = now.replace(hour=m_hr, minute=m_min, second=0, microsecond=0)
-    except Exception:
-        morning_dt = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    m_hr, m_min = _parse_hhmm_tolerant(morning_time_str, default_hr=8, default_min=0)
+    morning_dt = now.replace(hour=m_hr, minute=m_min, second=0, microsecond=0)
 
     morning_key = f"morning_sched_{today_str}"
-    if teacher_phone_clean and now >= morning_dt and (now - morning_dt).total_seconds() <= 28800:
-        if not has_dispatched(db, morning_key):
+    if not teacher_phone_clean:
+        print("[Scheduler] Morning schedule skipped: teacher phone not configured.")
+    elif now >= morning_dt and (now - morning_dt).total_seconds() <= 28800:
+        if claim_dispatch(db, morning_key):
             ok, err = send_morning_schedule_to_teacher(db, client, teacher_phone_clean, now)
             if ok:
-                mark_dispatched(db, morning_key)
-                with rt["lock"]:
-                    rt["last_action"] = f"Sent Morning Schedule ({today_str})"
+                action_msg = f"Sent Morning Schedule ({today_str})"
+                _record_scheduler_action(db, rt, action_msg)
+                print(f"[Scheduler] {action_msg} to {teacher_phone_clean}.")
             else:
-                with rt["lock"]:
-                    rt["last_error"] = f"Morning Schedule Failed: {err}"
+                release_dispatch(db, morning_key)
+                err_msg = f"Morning Schedule Failed: {err}"
+                _record_scheduler_error(db, rt, err_msg)
+                print(f"[Scheduler] {err_msg} (released '{morning_key}' for retry).")
+        else:
+            print(f"[Scheduler] Morning schedule skipped: already dispatched ({morning_key}).")
+    else:
+        print(f"[Scheduler] Morning schedule skipped: outside time window (target {m_hr:02d}:{m_min:02d}).")
 
     # Fetch today's meetings
     meetings_df = db.fetch_dataframe(
@@ -633,6 +909,7 @@ def run_scheduled_checks_once(db):
         (today_day,),
     )
     if meetings_df.empty:
+        print(f"[Scheduler] No group sessions scheduled for {today_day}.")
         return
 
     hw_map = {}
@@ -652,6 +929,7 @@ def run_scheduled_checks_once(db):
             hr, mn = [int(x) for x in mtime.split(":")[:2]]
             lecture_dt = now.replace(hour=hr, minute=mn, second=0, microsecond=0)
         except Exception:
+            print(f"[Scheduler] Group {grp}: invalid meeting_time '{mtime}', skipping.")
             continue
 
         minutes_until_lecture = (lecture_dt - now).total_seconds() / 60.0
@@ -662,33 +940,47 @@ def run_scheduled_checks_once(db):
         # WORKFLOW 2: 10 Minutes Before Group -> Send HW & Quiz Reports to Teacher
         # -------------------------------------------------------------------
         pre10_key = f"teacher_10min_{today_str}_grp_{grp}_{mtime}"
-        if teacher_phone_clean and -5 <= minutes_until_lecture <= 15 and not has_dispatched(db, pre10_key):
-            ok = send_group_master_reports_to_teacher(
-                db, client, teacher_phone_clean, grp, mtime, hw_id, qz_id, hw_map, qz_map
-            )
-            if ok:
-                mark_dispatched(db, pre10_key)
-                with rt["lock"]:
-                    rt["last_action"] = f"Sent 10-min Report for Group {grp}"
+        if teacher_phone_clean and -5 <= minutes_until_lecture <= 15:
+            if claim_dispatch(db, pre10_key):
+                ok = send_group_master_reports_to_teacher(
+                    db, client, teacher_phone_clean, grp, mtime, hw_id, qz_id, hw_map, qz_map
+                )
+                if ok:
+                    action_msg = f"Sent 10-min Report for Group {grp}"
+                    _record_scheduler_action(db, rt, action_msg)
+                    print(f"[Scheduler] {action_msg} ({mtime}).")
+                else:
+                    release_dispatch(db, pre10_key)
+                    err_msg = f"10-min Report failed for Group {grp}"
+                    _record_scheduler_error(db, rt, err_msg)
+                    print(f"[Scheduler] {err_msg} (released '{pre10_key}' for retry).")
             else:
-                with rt["lock"]:
-                    rt["last_error"] = f"10-min Report failed for Group {grp}"
+                print(f"[Scheduler] Group {grp} ({mtime}) 10-min report skipped: already dispatched.")
+        else:
+            print(f"[Scheduler] Group {grp} ({mtime}) 10-min report skipped: {minutes_until_lecture:.1f} min until lecture.")
 
         # -------------------------------------------------------------------
         # WORKFLOW 3: 6 Hours (360 mins) Before Group -> Remind Students Who Didn't Submit HW
         # -------------------------------------------------------------------
         rem6h_key = f"student_6hr_{today_str}_grp_{grp}_{mtime}"
-        if (hw_id or qz_id) and 300 <= minutes_until_lecture <= 380 and not has_dispatched(db, rem6h_key):
-            ok = send_6hr_unsubmitted_reminders(
-                db, client, grp, mtime, hw_id, qz_id, hw_map, qz_map
-            )
-            if ok:
-                mark_dispatched(db, rem6h_key)
-                with rt["lock"]:
-                    rt["last_action"] = f"Sent 6-hr Reminders for Group {grp}"
+        if (hw_id or qz_id) and 300 <= minutes_until_lecture <= 380:
+            if claim_dispatch(db, rem6h_key):
+                ok = send_6hr_unsubmitted_reminders(
+                    db, client, grp, mtime, hw_id, qz_id, hw_map, qz_map
+                )
+                if ok:
+                    action_msg = f"Sent 6-hr Reminders for Group {grp}"
+                    _record_scheduler_action(db, rt, action_msg)
+                    print(f"[Scheduler] {action_msg} ({mtime}).")
+                else:
+                    release_dispatch(db, rem6h_key)
+                    err_msg = f"6-hr Reminders failed for Group {grp}"
+                    _record_scheduler_error(db, rt, err_msg)
+                    print(f"[Scheduler] {err_msg} (released '{rem6h_key}' for retry).")
             else:
-                with rt["lock"]:
-                    rt["last_error"] = f"6-hr Reminders failed for Group {grp}"
+                print(f"[Scheduler] Group {grp} ({mtime}) 6-hr reminders skipped: already dispatched.")
+        else:
+            print(f"[Scheduler] Group {grp} ({mtime}) 6-hr reminders skipped: {minutes_until_lecture:.1f} min until lecture (hw_id={hw_id}, qz_id={qz_id}).")
 
 
 def send_group_master_reports_to_teacher(
@@ -841,70 +1133,60 @@ def send_6hr_unsubmitted_reminders(
     return sent_any
 
 
-def start_background_automation_daemon(_db):
-    """
-    Ensures the background daemon thread is alive and running.
-    Because it checks `thread.is_alive()` on the @st.cache_resource singleton,
-    it never gets stuck in 'Stopped' state across code reloads.
-    """
-    init_automation_tables(_db)
-    _sync_secrets_to_cache_and_db(_db)
-    rt = get_daemon_runtime()
-
-    with rt["lock"]:
-        existing_thread = rt.get("thread")
-        is_alive = existing_thread is not None and existing_thread.is_alive()
-
-    if not is_alive:
-        def _loop():
-            while True:
-                try:
-                    run_scheduled_checks_once(_db)
-                except Exception as e:
-                    with rt["lock"]:
-                        rt["last_error"] = str(e)
-                    print(f"[Automation Daemon Error]: {e}")
-                time.sleep(60)
-
-        t = threading.Thread(target=_loop, daemon=True, name="WhatsAppAutomationDaemon")
-        t.start()
-        with rt["lock"]:
-            rt["thread"] = t
-
-    return True
-
-
 # ---------------------------------------------------------------------------
 # UI Renderer for the "🤖 Automated Messages" Tab
 # ---------------------------------------------------------------------------
 class AutomatedMessagesView:
     def __init__(self, db):
         self.db = db
-        start_background_automation_daemon(self.db)
+        init_automation_tables(self.db)
+        _sync_secrets_to_cache_and_db(self.db)
 
     def render(self):
         st.subheader("🤖 Automated WhatsApp Bot & Group Schedules")
         st.caption(
             "Configure group lecture timings, assign each group's latest Homework & Quiz, "
-            "and manage automated teacher/student/parent WhatsApp notifications."
+            "and manage automated teacher/assistant/student/parent WhatsApp notifications."
         )
 
-        # Live Daemon & Post-Grade Status Bar
+        # Live External Scheduler & Post-Grade Status Bar
         rt = get_daemon_runtime()
-        now_cairo = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        now_dt = datetime.datetime.now(CAIRO_TZ)
+        now_cairo = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        db_last_tick = get_bot_setting(self.db, "last_scheduler_tick", "")
+        db_last_action = get_bot_setting(self.db, "last_scheduler_action", "")
+        db_last_error = get_bot_setting(self.db, "last_scheduler_error", "")
+
         with rt["lock"]:
-            t_obj = rt.get("thread")
-            d_running = t_obj is not None and t_obj.is_alive()
-            d_tick = rt["last_tick"] or "Running initial check..."
-            d_action = rt["last_action"]
+            d_tick = db_last_tick or rt["last_tick"] or "No tick recorded yet"
+            d_action = db_last_action or rt["last_action"]
             d_grade = rt["last_grade_status"]
-            d_err = rt["last_error"]
+            d_hw_sub = rt["last_hw_sub_status"]
+            d_err = db_last_error or rt["last_error"]
+
+        scheduler_active = False
+        if db_last_tick:
+            try:
+                tick_dt = datetime.datetime.strptime(db_last_tick, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CAIRO_TZ)
+                if (now_dt - tick_dt).total_seconds() < 15 * 60:
+                    scheduler_active = True
+            except Exception:
+                scheduler_active = False
 
         status_col1, status_col2, status_col3 = st.columns(3)
-        status_col1.caption(f"{'🟢 **Daemon: Active**' if d_running else '🔴 **Daemon: Stopped**'} | 🕒 `{now_cairo}`")
+        status_label = (
+            "🟢 **Scheduler: Active**"
+            if scheduler_active
+            else "🔴 **Scheduler: No recent tick (check GitHub Actions)**"
+        )
+        status_col1.caption(f"{status_label} | 🕒 `{now_cairo}`")
         status_col2.caption(f"🔄 **Last Check:** `{d_tick}`")
         status_col3.caption(f"📌 **Last Event:** `{d_action}`")
-        st.caption(f"📨 **Last Post-Grade Auto-Send Status:** `{d_grade}`")
+        st.caption(
+            f"📨 **Last Post-Grade Auto-Send:** `{d_grade}` | "
+            f"📥 **Last Assistant HW Sub Alert:** `{d_hw_sub}`"
+        )
         if d_err:
             st.warning(f"⚠️ Last Background Warning/Error: `{d_err}`")
 
@@ -1096,7 +1378,6 @@ class AutomatedMessagesView:
                                     self.db, GowaClient.from_secrets(self.db), t_phone, now_c
                                 )
                                 if ok:
-                                    mark_dispatched(self.db, f"morning_sched_{now_c.strftime('%Y-%m-%d')}")
                                     st.success("Morning schedule + exciting quote sent to Teacher!")
                                 else:
                                     st.error(f"Failed to send Morning Schedule: {err}")
@@ -1238,13 +1519,20 @@ class AutomatedMessagesView:
         # TAB 3: BOT & TEACHER SETTINGS
         # ===================================================================
         with tab_settings:
-            st.markdown("#### ⚙️ GOWA Bot Connection & Teacher Preferences")
+            st.markdown("#### ⚙️ GOWA Bot Connection, Teacher & Assistant Preferences")
             cur_url = get_bot_setting(self.db, "gowa_url", rt.get("cached_url", DEFAULT_GOWA_URL))
             cur_auth = get_bot_setting(self.db, "gowa_auth", rt.get("cached_auth", ""))
             cur_t_phone = get_bot_setting(self.db, "teacher_phone", rt.get("cached_teacher_phone", ""))
+            cur_a_phone = get_bot_setting(self.db, "assistant_phone", rt.get("cached_assistant_phone", ""))
             cur_m_time = get_bot_setting(self.db, "morning_schedule_time", "08:00")
             cur_auto_grade = get_bot_setting(self.db, "auto_send_on_grade", "true").lower() == "true"
             cur_also_stu = get_bot_setting(self.db, "also_send_grade_to_student", "false").lower() == "true"
+            cur_notify_asst = get_bot_setting(self.db, "notify_assistant_on_hw_submit", "true").lower() == "true"
+
+            try:
+                parsed_morning_time = datetime.datetime.strptime(cur_m_time.strip(), "%H:%M").time()
+            except Exception:
+                parsed_morning_time = datetime.time(8, 0)
 
             col_st1, col_st2 = st.columns([1, 1])
             with col_st1:
@@ -1274,9 +1562,14 @@ class AutomatedMessagesView:
                     value=cur_t_phone,
                     placeholder="e.g. 010...",
                 )
-                in_m_time = st.text_input(
-                    "☀️ Daily Morning Schedule Send Time (24h Cairo Time, e.g. 08:00)",
-                    value=cur_m_time,
+                in_a_phone = st.text_input(
+                    "👩‍🏫 Assistant's WhatsApp Phone Number (Receives Instant Alert Whenever a Student Submits HW)",
+                    value=cur_a_phone,
+                    placeholder="e.g. 010...",
+                )
+                in_m_time = st.time_input(
+                    "☀️ Daily Morning Schedule Send Time (Cairo time)",
+                    value=parsed_morning_time,
                 )
                 in_auto_grade = st.checkbox(
                     "✅ Automatically send Grade + PDF Report to Parent on WhatsApp right after saving a grade",
@@ -1286,14 +1579,25 @@ class AutomatedMessagesView:
                     "🎓 Also send Grade + PDF Report to Student's phone right after saving a grade",
                     value=cur_also_stu,
                 )
+                in_notify_asst = st.checkbox(
+                    "📥 Automatically notify Assistant on WhatsApp whenever a student submits a Homework to correct it",
+                    value=cur_notify_asst,
+                )
 
                 if st.form_submit_button("💾 Save Bot Settings", type="primary", use_container_width=True):
+                    m_time_formatted = (
+                        in_m_time.strftime("%H:%M")
+                        if isinstance(in_m_time, datetime.time)
+                        else "08:00"
+                    )
                     set_bot_setting(self.db, "gowa_url", in_url.strip() or DEFAULT_GOWA_URL)
                     set_bot_setting(self.db, "gowa_auth", in_auth.strip())
                     set_bot_setting(self.db, "teacher_phone", in_t_phone.strip())
-                    set_bot_setting(self.db, "morning_schedule_time", in_m_time.strip() or "08:00")
+                    set_bot_setting(self.db, "assistant_phone", in_a_phone.strip())
+                    set_bot_setting(self.db, "morning_schedule_time", m_time_formatted)
                     set_bot_setting(self.db, "auto_send_on_grade", "true" if in_auto_grade else "false")
                     set_bot_setting(self.db, "also_send_grade_to_student", "true" if in_also_stu else "false")
+                    set_bot_setting(self.db, "notify_assistant_on_hw_submit", "true" if in_notify_asst else "false")
                     _sync_secrets_to_cache_and_db(self.db)
                     st.success("✅ Bot settings saved!")
                     st.rerun()
