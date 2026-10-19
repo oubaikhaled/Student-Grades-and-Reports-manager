@@ -1044,7 +1044,6 @@ class GradePortalApp:
     def __init__(self):
         self.db = get_db()
         self.auth = AuthManager()
-        start_background_automation_daemon(self.db)
     def run(self):
         query_params = st.query_params
         is_admin_route = "admin" in query_params
