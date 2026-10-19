@@ -760,15 +760,7 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
         for _, m_row in meetings_df.iterrows():
             grp = m_row["group_number"]
             mtime = m_row["meeting_time"]
-            hw_id = m_row.get("latest_hw_id")
-            qz_id = m_row.get("latest_quiz_id")
-            hw_label = hw_map.get(int(hw_id), "Not Set") if pd.notna(hw_id) else "Not Set"
-            qz_label = qz_map.get(int(qz_id), "Not Set") if pd.notna(qz_id) else "Not Set"
-            lines.append(
-                f"🕒 *{mtime}* — *Group {grp}*\n"
-                f"   • 📝 HW: {hw_label}\n"
-                f"   • 📊 Quiz: {qz_label}"
-            )
+            
         lines.append(f"\n{exciting_line}")
         msg = "\n".join(lines)
 
