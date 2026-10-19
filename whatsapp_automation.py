@@ -54,6 +54,7 @@ def get_daemon_runtime():
     """
     return {
         "lock": threading.Lock(),
+        "daemon_started": False,
         "last_tick": None,
         "last_tick_ts": 0.0,
         "last_error": None,
@@ -113,7 +114,6 @@ def clean_wa_phone(p_str: str) -> str | None:
         return None
     if "@g.us" in s or "@s.whatsapp.net" in s:
         return s
-    # Handle float-formatted strings from pandas like '1012345678.0'
     if s.endswith(".0"):
         s = s[:-2]
     digits = re.sub(r"\D", "", s)
@@ -226,7 +226,6 @@ class GowaClient:
         if not target:
             return False, f"Invalid phone/recipient: {recipient}"
 
-        # Make filename strictly ASCII-safe for multipart/form-data compatibility with GOWA (Go fiber)
         safe_ascii_name = re.sub(r"[^A-Za-z0-9_\-.]", "_", str(filename or "Report.pdf"))
         if not safe_ascii_name.lower().endswith(".pdf"):
             safe_ascii_name += ".pdf"
@@ -361,6 +360,33 @@ def get_resolved_assistant_phone(db) -> str | None:
     return clean_wa_phone(a_phone)
 
 
+def get_eligible_assistants(db, perm_col: str) -> list[tuple[str, str]]:
+    """
+    Returns a list of (name, clean_phone) for assistants who have `perm_col` = TRUE.
+    Also falls back to the single `assistant_phone` setting if the `assistants` table is empty.
+    """
+    results = []
+    seen_phones = set()
+    try:
+        df = db.fetch_dataframe(
+            f"SELECT name, phone FROM assistants WHERE COALESCE({perm_col}, FALSE) = TRUE ORDER BY id ASC"
+        )
+        for _, r in df.iterrows():
+            p = clean_wa_phone(r.get("phone"))
+            if p and p not in seen_phones:
+                seen_phones.add(p)
+                results.append((str(r.get("name") or "Assistant").strip(), p))
+    except Exception as e:
+        print(f"[Assistants] Query error ({perm_col}): {e}")
+
+    if not results and perm_col == "notify_hw_submit":
+        fallback_p = get_resolved_assistant_phone(db)
+        if fallback_p and fallback_p not in seen_phones:
+            results.append(("Assistant", fallback_p))
+
+    return results
+
+
 def has_dispatched(db, dispatch_key: str) -> bool:
     try:
         cnt = db.execute_scalar(
@@ -411,7 +437,7 @@ def release_dispatch(db, key: str):
 
 
 # ---------------------------------------------------------------------------
-# Safe PDF Generator Helper (Handles any signature of PDFGenerator.generate_student_report)
+# Safe PDF Generator Helper
 # ---------------------------------------------------------------------------
 def _safe_generate_student_pdf(
     student_name: str,
@@ -446,7 +472,7 @@ def _safe_generate_student_pdf(
 
 
 # ---------------------------------------------------------------------------
-# Instant Homework Submission Alert to Assistant (Triggered when Student submits HW)
+# Instant Homework Submission Alert to Assistant
 # ---------------------------------------------------------------------------
 def trigger_hw_submission_assistant_whatsapp(
     db,
@@ -457,25 +483,18 @@ def trigger_hw_submission_assistant_whatsapp(
     group_number: str | None = None,
 ):
     """
-    Runs immediately when a student submits a homework (and is also checked by the background scheduler).
-    Sends a WhatsApp notification to the Assistant's phone number so she knows to grade it.
+    Runs immediately when a student submits a homework.
+    Fetches all DB data synchronously on the main thread, then wakes GOWA and sends in background.
     """
     _sync_secrets_to_cache_and_db(db)
     rt = get_daemon_runtime()
 
-    notify_enabled = get_bot_setting(db, "notify_assistant_on_hw_submit", "true").lower() == "true"
-    if not notify_enabled:
+    recipients = get_eligible_assistants(db, "notify_hw_submit")
+    if not recipients:
         with rt["lock"]:
-            rt["last_hw_sub_status"] = "Skipped (notify_assistant_on_hw_submit is disabled in Settings)"
+            rt["last_hw_sub_status"] = "Skipped (No assistants have 'HW Submits' enabled in Settings)"
         return
 
-    assistant_phone = get_resolved_assistant_phone(db)
-    if not assistant_phone:
-        with rt["lock"]:
-            rt["last_hw_sub_status"] = "Skipped (Assistant phone is not configured in Settings)"
-        return
-
-    # Resolve missing student details synchronously before Streamlit reruns
     if not student_name or not group_number:
         try:
             stu_df = db.fetch_dataframe(
@@ -491,7 +510,6 @@ def trigger_hw_submission_assistant_whatsapp(
     student_name = student_name or f"Student #{student_id}"
     group_number = group_number or "N/A"
 
-    # Resolve missing homework title synchronously
     if not homework_title and homework_id is not None:
         try:
             hw_df = db.fetch_dataframe(
@@ -505,7 +523,6 @@ def trigger_hw_submission_assistant_whatsapp(
 
     homework_title = homework_title or (f"Homework #{homework_id}" if homework_id else "Homework")
 
-    # Pre-mark dispatch key if homework_id is known so the 5-min cron doesn't send a duplicate alert
     if homework_id is not None:
         sub_key = f"asst_hw_sub_hw_{int(homework_id)}_stu_{str(student_id).strip()}"
         mark_dispatched(db, sub_key)
@@ -515,23 +532,33 @@ def trigger_hw_submission_assistant_whatsapp(
 
     def _worker():
         try:
-            msg = emoji.emojize(
-                f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
-                f"👩‍🏫 *تنبيه للمساعدة:*\n"
-                f"قام الطالب *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*) بتسليم الواجب:\n"
-                f"📘 *{homework_title}*\n"
-                f"🕒 *وقت التسليم:* {submitted_at_str}\n\n"
-                f"برجاء الدخول على المنصة لمراجعة الواجب وتصحيحه. :check_mark_button:\n\n"
-                f"Mathematics Team – Eng. Mahmoud Adel"
-            )
-            ok, err = client.send_text(assistant_phone, msg)
-            with rt["lock"]:
+            client.ensure_awake(max_wait_seconds=45)
+
+            sent_to = []
+            errors = []
+            for asst_name, asst_phone in recipients:
+                msg = emoji.emojize(
+                    f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
+                    f"👩‍🏫 *تنبيه يا {asst_name}:*\n"
+                    f"قام الطالب *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*) بتسليم الواجب:\n"
+                    f"📘 *{homework_title}*\n"
+                    f"🕒 *وقت التسليم:* {submitted_at_str}\n\n"
+                    f"برجاء الدخول على المنصة لمراجعة الواجب وتصحيحه. :check_mark_button:\n\n"
+                    f"Mathematics Team – Eng. Mahmoud Adel"
+                )
+                ok, err = client.send_text(asst_phone, msg)
                 if ok:
-                    rt["last_hw_sub_status"] = f"Sent to Assistant ({assistant_phone}) for {student_name} ({homework_title})"
-                    rt["last_action"] = f"HW Sub Alert -> Assistant ({student_name})"
+                    sent_to.append(f"{asst_name}({asst_phone})")
                 else:
-                    rt["last_hw_sub_status"] = f"Failed for {student_name}: {err}"
-                    rt["last_error"] = f"Assistant HW Sub Alert Error: {err}"
+                    errors.append(f"{asst_name}: {err}")
+
+            with rt["lock"]:
+                if sent_to:
+                    rt["last_hw_sub_status"] = f"Sent to {', '.join(sent_to)} for {student_name} ({homework_title})"
+                    rt["last_action"] = f"HW Sub Alert -> {len(sent_to)} Assistant(s)"
+                else:
+                    rt["last_hw_sub_status"] = f"Failed for {student_name}: {'; '.join(errors)}"
+                    rt["last_error"] = f"Assistant HW Sub Alert Error: {'; '.join(errors)}"
         except Exception as e:
             with rt["lock"]:
                 rt["last_error"] = f"Assistant HW Sub Exception ({student_name}): {e}"
@@ -541,7 +568,7 @@ def trigger_hw_submission_assistant_whatsapp(
 
 
 # ---------------------------------------------------------------------------
-# Instant Post-Grading Parent & Student Sender (Triggered right after Save Grade)
+# Instant Post-Grading Parent, Student & Assistant Sender
 # ---------------------------------------------------------------------------
 def trigger_post_grade_whatsapp(
     db,
@@ -557,25 +584,24 @@ def trigger_post_grade_whatsapp(
 ):
     """
     Runs immediately after an admin clicks Save Grade.
-    1. Fetches student & parent phone numbers on the main thread before Streamlit reruns.
-    2. Spawns a worker that sends the WhatsApp text notification FIRST (using the proven send_text method),
-       and then attaches & sends the PDF report card.
+    Fetches all DB records on the main thread BEFORE Streamlit reruns,
+    then wakes GOWA and dispatches messages + PDF in the background.
     """
     _sync_secrets_to_cache_and_db(db)
     rt = get_daemon_runtime()
 
     auto_enabled = get_bot_setting(db, "auto_send_on_grade", "true").lower() == "true"
-    if not auto_enabled:
+    also_student = get_bot_setting(db, "also_send_grade_to_student", "false").lower() == "true"
+    grade_assistants = get_eligible_assistants(db, "notify_grade_submitted")
+
+    if not auto_enabled and not grade_assistants:
         with rt["lock"]:
-            rt["last_grade_status"] = "Skipped (auto_send_on_grade is disabled in Settings)"
+            rt["last_grade_status"] = "Skipped (auto_send_on_grade is disabled & no assistants subscribed)"
         return
 
-    also_student = get_bot_setting(db, "also_send_grade_to_student", "false").lower() == "true"
-
-    # Fetch student data and client credentials synchronously BEFORE st.rerun()
     try:
         stu_df = db.fetch_dataframe(
-            "SELECT name, phone, phone_parent FROM students WHERE id = %s",
+            "SELECT name, phone, phone_parent, group_number FROM students WHERE id = %s",
             (str(student_id),),
         )
         if stu_df.empty:
@@ -584,19 +610,12 @@ def trigger_post_grade_whatsapp(
             return
         stu = stu_df.iloc[0]
         student_name = str(stu["name"])
+        group_number = str(stu.get("group_number") or "N/A").strip()
         parent_phone = clean_wa_phone(stu.get("phone_parent"))
         student_phone = clean_wa_phone(stu.get("phone"))
     except Exception as e:
         with rt["lock"]:
             rt["last_grade_status"] = f"DB fetch error on grade save: {e}"
-        return
-
-    if not parent_phone and not (also_student and student_phone):
-        with rt["lock"]:
-            rt["last_grade_status"] = (
-                f"No valid phone for {student_name} (Parent: {stu.get('phone_parent')}, "
-                f"Student: {stu.get('phone')}, AlsoSendStudent={also_student})"
-            )
         return
 
     video_link = None
@@ -614,59 +633,75 @@ def trigger_post_grade_whatsapp(
 
     def _worker():
         try:
+            client.ensure_awake(max_wait_seconds=45)
+
             score_str = str(int(score)) if float(score).is_integer() else f"{score:.1f}"
             max_str = str(int(max_score)) if float(max_score).is_integer() else f"{max_score:.1f}"
             type_label = "Quiz" if kind == "quiz" else "Homework"
 
-            parent_msg = emoji.emojize(
-                f":bar_chart: درجة الـ {item_title}\n\n"
-                f"ولي الأمر الكريم،\n"
-                f"نحيط حضرتكم علمًا بأن الطالب *{student_name}* حصل على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n\n"
-                f"مرفق لحضرتكم تقرير الأداء التفصيلي (PDF).\n"
-                f"نتمنى له مزيدًا من التقدم والنجاح! :glowing_star:\n\n"
-                f"Mathematics Team – Eng. Mahmoud Adel"
-            )
-
-            stu_msg = emoji.emojize(
-                f":bar_chart: درجة الـ {item_title}\n\n"
-                f"أهلاً بك يا *{student_name}*،\n"
-                f"لقد حصلت على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n"
-                f"مرفق تقرير الملاحظات الخاص بك. استمر في الاجتهاد! :glowing_star:\n\n"
-                f"Mathematics Team – Eng. Mahmoud Adel"
-            )
-
-            # Build PDF report card safely
-            pdf_bytes = _safe_generate_student_pdf(
-                student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link
-            )
-            pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
-
             status_parts = []
 
-            # 1. Send to Parent
-            if parent_phone:
-                # Always send text message first (100% reliable, same endpoint as manual broadcast)
-                ok_txt, err_txt = client.send_text(parent_phone, parent_msg)
-                if pdf_bytes:
-                    ok_pdf, err_pdf = client.send_pdf(
-                        parent_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
-                    )
-                    status_parts.append(f"Parent({parent_phone}): Text={'OK' if ok_txt else err_txt}, PDF={'OK' if ok_pdf else err_pdf}")
-                else:
-                    status_parts.append(f"Parent({parent_phone}): Text={'OK' if ok_txt else err_txt} (No PDF)")
+            if auto_enabled:
+                parent_msg = emoji.emojize(
+                    f":bar_chart: درجة الـ {item_title}\n\n"
+                    f"ولي الأمر الكريم،\n"
+                    f"نحيط حضرتكم علمًا بأن الطالب *{student_name}* حصل على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n\n"
+                    f"مرفق لحضرتكم تقرير الأداء التفصيلي (PDF).\n"
+                    f"نتمنى له مزيدًا من التقدم والنجاح! :glowing_star:\n\n"
+                    f"Mathematics Team – Eng. Mahmoud Adel"
+                )
 
-            # 2. Send to Student (if enabled OR if parent_phone is missing and student_phone exists)
-            if student_phone and (also_student or not parent_phone):
-                ok_stxt, err_stxt = client.send_text(student_phone, stu_msg)
-                if pdf_bytes:
-                    ok_spdf, err_spdf = client.send_pdf(
-                        student_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
-                    )
-                    status_parts.append(f"Student({student_phone}): Text={'OK' if ok_stxt else err_stxt}, PDF={'OK' if ok_spdf else err_spdf}")
-                else:
-                    status_parts.append(f"Student({student_phone}): Text={'OK' if ok_stxt else err_stxt}")
+                stu_msg = emoji.emojize(
+                    f":bar_chart: درجة الـ {item_title}\n\n"
+                    f"أهلاً بك يا *{student_name}*،\n"
+                    f"لقد حصلت على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n"
+                    f"مرفق تقرير الملاحظات الخاص بك. استمر في الاجتهاد! :glowing_star:\n\n"
+                    f"Mathematics Team – Eng. Mahmoud Adel"
+                )
 
-            summary = " | ".join(status_parts)
+                pdf_bytes = _safe_generate_student_pdf(
+                    student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link
+                )
+                pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
+
+                if parent_phone:
+                    ok_txt, err_txt = client.send_text(parent_phone, parent_msg)
+                    if pdf_bytes:
+                        ok_pdf, err_pdf = client.send_pdf(
+                            parent_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
+                        )
+                        status_parts.append(f"Parent({parent_phone}): Txt={'OK' if ok_txt else err_txt}, PDF={'OK' if ok_pdf else err_pdf}")
+                    else:
+                        status_parts.append(f"Parent({parent_phone}): Txt={'OK' if ok_txt else err_txt}")
+                else:
+                    status_parts.append("Parent: No valid phone")
+
+                if student_phone and (also_student or not parent_phone):
+                    ok_stxt, err_stxt = client.send_text(student_phone, stu_msg)
+                    if pdf_bytes:
+                        ok_spdf, err_spdf = client.send_pdf(
+                            student_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
+                        )
+                        status_parts.append(f"Student({student_phone}): Txt={'OK' if ok_stxt else err_stxt}, PDF={'OK' if ok_spdf else err_spdf}")
+                    else:
+                        status_parts.append(f"Student({student_phone}): Txt={'OK' if ok_stxt else err_stxt}")
+
+            if grade_assistants:
+                asst_sent = 0
+                for asst_name, asst_phone in grade_assistants:
+                    asst_msg = emoji.emojize(
+                        f":check_mark_button: *تم رصد درجة جديدة*\n\n"
+                        f"👩‍🏫 *إشعار يا {asst_name}:*\n"
+                        f"تم تصحيح {type_label}: *{item_title}*\n"
+                        f"الطالب: *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*)\n"
+                        f"الدرجة: *{score_str} / {max_str}* ({perc:.1f}%)"
+                    )
+                    ok_a, _ = client.send_text(asst_phone, asst_msg)
+                    if ok_a:
+                        asst_sent += 1
+                status_parts.append(f"Assistants: {asst_sent}/{len(grade_assistants)} sent")
+
+            summary = " | ".join(status_parts) if status_parts else "No recipients configured"
             with rt["lock"]:
                 rt["last_grade_status"] = f"{student_name}: {summary}"
                 rt["last_action"] = f"Post-Grade -> {student_name}"
@@ -742,13 +777,10 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
 
     # 2. Send to eligible Assistants
     try:
-        asst_df = db.fetch_dataframe("SELECT name, phone FROM assistants WHERE notify_daily_schedule = TRUE")
-        for _, row in asst_df.iterrows():
-            asst_phone = clean_wa_phone(row["phone"])
-            if asst_phone:
-                # Personalize the message greeting for the assistant
-                asst_msg = msg.replace("Eng. Mahmoud Adel", str(row["name"]).strip())
-                client.send_text(asst_phone, asst_msg)
+        asst_recipients = get_eligible_assistants(db, "notify_daily_schedule")
+        for asst_name, asst_phone in asst_recipients:
+            asst_msg = msg.replace("Eng. Mahmoud Adel", asst_name)
+            client.send_text(asst_phone, asst_msg)
     except Exception as e:
         print(f"Failed to send schedule to assistants: {e}")
 
@@ -761,18 +793,8 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
 def check_and_notify_assistant_pending_submissions(
     db, client: GowaClient, assistant_phone_clean: str, now: datetime.datetime, rt
 ):
-    """
-    Checks `homework_grades` for any rows where `submitted = TRUE` and `correct_answers IS NULL`
-    (meaning the student submitted the homework and it is waiting for the assistant to correct it).
-    Uses `claim_dispatch` per (homework_id, student_id) so each submission notifies the assistant once.
-    """
-    notify_enabled = get_bot_setting(db, "notify_assistant_on_hw_submit", "true").lower() == "true"
-    if not notify_enabled:
-        print("[Scheduler] Assistant HW submission check skipped: disabled in settings.")
-        return
-
-    if not assistant_phone_clean:
-        print("[Scheduler] Assistant HW submission check skipped: assistant phone not configured.")
+    recipients = get_eligible_assistants(db, "notify_hw_submit")
+    if not recipients:
         return
 
     try:
@@ -791,7 +813,6 @@ def check_and_notify_assistant_pending_submissions(
         return
 
     if pending_df.empty:
-        print("[Scheduler] Assistant HW check: no new ungraded homework submissions.")
         return
 
     now_fmt = now.strftime("%Y-%m-%d %H:%M")
@@ -804,35 +825,37 @@ def check_and_notify_assistant_pending_submissions(
 
         sub_key = f"asst_hw_sub_hw_{hw_id}_stu_{stu_id}"
         if claim_dispatch(db, sub_key):
-            msg = emoji.emojize(
-                f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
-                f"👩‍🏫 *تنبيه للمساعدة:*\n"
-                f"قام الطالب *{stu_name}* (كود: `{stu_id}` — مجموعة *{grp}*) بتسليم الواجب:\n"
-                f"📘 *{hw_title}*\n"
-                f"🕒 *وقت الإشعار:* {now_fmt}\n\n"
-                f"برجاء الدخول على المنصة لمراجعة الواجب وتصحيحه. :check_mark_button:\n\n"
-                f"Mathematics Team – Eng. Mahmoud Adel"
-            )
-            ok, err = client.send_text(assistant_phone_clean, msg)
-            if ok:
-                action_msg = f"Notified Assistant: HW submitted by {stu_name} ({hw_title})"
+            any_sent = False
+            for asst_name, asst_phone in recipients:
+                msg = emoji.emojize(
+                    f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
+                    f"👩‍🏫 *تنبيه يا {asst_name}:*\n"
+                    f"قام الطالب *{stu_name}* (كود: `{stu_id}` — مجموعة *{grp}*) بتسليم الواجب:\n"
+                    f"📘 *{hw_title}*\n"
+                    f"🕒 *وقت الإشعار:* {now_fmt}\n\n"
+                    f"برجاء الدخول على المنصة لمراجعة الواجب وتصحيحه. :check_mark_button:\n\n"
+                    f"Mathematics Team – Eng. Mahmoud Adel"
+                )
+                ok, err = client.send_text(asst_phone, msg)
+                if ok:
+                    any_sent = True
+
+            if any_sent:
+                action_msg = f"Notified Assistants: HW submitted by {stu_name} ({hw_title})"
                 _record_scheduler_action(db, rt, action_msg)
                 with rt["lock"]:
-                    rt["last_hw_sub_status"] = f"Sent to Assistant ({assistant_phone_clean}) for {stu_name}"
-                print(f"[Scheduler] {action_msg}.")
+                    rt["last_hw_sub_status"] = f"Sent to assistants for {stu_name}"
             else:
                 release_dispatch(db, sub_key)
-                err_msg = f"Assistant HW Sub Alert Failed ({stu_name}): {err}"
+                err_msg = f"Assistant HW Sub Alert Failed ({stu_name})"
                 _record_scheduler_error(db, rt, err_msg)
-                print(f"[Scheduler] {err_msg} (released '{sub_key}' for retry).")
             time.sleep(3)
 
 
 # ---------------------------------------------------------------------------
-# Background Scheduler Tick (Checks Morning Schedule, Assistant Alerts, 10-Min Teacher Reports, 6-Hr Reminders)
+# Background Scheduler Tick
 # ---------------------------------------------------------------------------
 def _parse_hhmm_tolerant(time_str: str, default_hr: int = 8, default_min: int = 0) -> tuple[int, int]:
-    """Tolerantly parses '3:21', '03:21', '15:21', etc. Falls back to default only if unparseable."""
     try:
         m = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{1,2})", str(time_str or ""))
         if m:
@@ -863,18 +886,11 @@ def _record_scheduler_error(db, rt, err_msg: str):
 
 
 def run_scheduled_checks_once(db):
-    """
-    Evaluates current Cairo time against all scheduled group timings & pending submissions:
-    1. Morning Teacher Schedule + Random Exciting Sentence.
-    2. Pending Uncorrected Homework Submissions -> Notify Assistant to grade them.
-    3. 10-Minute Pre-Group Homework & Quiz Master PDF Reports to Teacher.
-    4. 6-Hour Pre-Group Homework & Quiz Reminders to Students who haven't submitted.
-    """
     rt = get_daemon_runtime()
     now = datetime.datetime.now(CAIRO_TZ)
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
     today_str = now.strftime("%Y-%m-%d")
-    today_day = now.strftime("%a")  # 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'
+    today_day = now.strftime("%a")
 
     with rt["lock"]:
         rt["last_tick"] = now_str
@@ -885,20 +901,12 @@ def run_scheduled_checks_once(db):
     except Exception as e:
         print(f"[Scheduler] Warning: could not persist last_scheduler_tick: {e}")
 
-    print(f"[Scheduler] Tick started at {now_str} Cairo time ({today_day}).")
-
     teacher_phone_clean = get_resolved_teacher_phone(db)
     assistant_phone_clean = get_resolved_assistant_phone(db)
     client = GowaClient.from_secrets(db)
 
-    # -----------------------------------------------------------------------
-    # WORKFLOW 0: Notify Assistant of Any New Homework Submissions to Correct
-    # -----------------------------------------------------------------------
     check_and_notify_assistant_pending_submissions(db, client, assistant_phone_clean, now, rt)
 
-    # -----------------------------------------------------------------------
-    # WORKFLOW 1: Daily Morning Schedule to Teacher
-    # -----------------------------------------------------------------------
     morning_time_str = get_bot_setting(db, "morning_schedule_time", "08:00")
     m_hr, m_min = _parse_hhmm_tolerant(morning_time_str, default_hr=8, default_min=0)
     morning_dt = now.replace(hour=m_hr, minute=m_min, second=0, microsecond=0)
@@ -912,18 +920,11 @@ def run_scheduled_checks_once(db):
             if ok:
                 action_msg = f"Sent Morning Schedule ({today_str})"
                 _record_scheduler_action(db, rt, action_msg)
-                print(f"[Scheduler] {action_msg} to {teacher_phone_clean}.")
             else:
                 release_dispatch(db, morning_key)
                 err_msg = f"Morning Schedule Failed: {err}"
                 _record_scheduler_error(db, rt, err_msg)
-                print(f"[Scheduler] {err_msg} (released '{morning_key}' for retry).")
-        else:
-            print(f"[Scheduler] Morning schedule skipped: already dispatched ({morning_key}).")
-    else:
-        print(f"[Scheduler] Morning schedule skipped: outside time window (target {m_hr:02d}:{m_min:02d}).")
 
-    # Fetch today's meetings
     meetings_df = db.fetch_dataframe(
         """
         SELECT m.meeting_id, TRIM(m.group_number) AS group_number, m.day_of_week, m.meeting_time,
@@ -936,7 +937,6 @@ def run_scheduled_checks_once(db):
         (today_day,),
     )
     if meetings_df.empty:
-        print(f"[Scheduler] No group sessions scheduled for {today_day}.")
         return
 
     hw_map = {}
@@ -956,16 +956,12 @@ def run_scheduled_checks_once(db):
             hr, mn = [int(x) for x in mtime.split(":")[:2]]
             lecture_dt = now.replace(hour=hr, minute=mn, second=0, microsecond=0)
         except Exception:
-            print(f"[Scheduler] Group {grp}: invalid meeting_time '{mtime}', skipping.")
             continue
 
         minutes_until_lecture = (lecture_dt - now).total_seconds() / 60.0
         hw_id = int(m_row["latest_hw_id"]) if pd.notna(m_row.get("latest_hw_id")) else None
         qz_id = int(m_row["latest_quiz_id"]) if pd.notna(m_row.get("latest_quiz_id")) else None
 
-        # -------------------------------------------------------------------
-        # WORKFLOW 2: 10 Minutes Before Group -> Send HW & Quiz Reports to Teacher
-        # -------------------------------------------------------------------
         pre10_key = f"teacher_10min_{today_str}_grp_{grp}_{mtime}"
         if teacher_phone_clean and -5 <= minutes_until_lecture <= 15:
             if claim_dispatch(db, pre10_key):
@@ -975,20 +971,11 @@ def run_scheduled_checks_once(db):
                 if ok:
                     action_msg = f"Sent 10-min Report for Group {grp}"
                     _record_scheduler_action(db, rt, action_msg)
-                    print(f"[Scheduler] {action_msg} ({mtime}).")
                 else:
                     release_dispatch(db, pre10_key)
                     err_msg = f"10-min Report failed for Group {grp}"
                     _record_scheduler_error(db, rt, err_msg)
-                    print(f"[Scheduler] {err_msg} (released '{pre10_key}' for retry).")
-            else:
-                print(f"[Scheduler] Group {grp} ({mtime}) 10-min report skipped: already dispatched.")
-        else:
-            print(f"[Scheduler] Group {grp} ({mtime}) 10-min report skipped: {minutes_until_lecture:.1f} min until lecture.")
 
-        # -------------------------------------------------------------------
-        # WORKFLOW 3: 6 Hours (360 mins) Before Group -> Remind Students Who Didn't Submit HW
-        # -------------------------------------------------------------------
         rem6h_key = f"student_6hr_{today_str}_grp_{grp}_{mtime}"
         if (hw_id or qz_id) and 300 <= minutes_until_lecture <= 380:
             if claim_dispatch(db, rem6h_key):
@@ -998,23 +985,16 @@ def run_scheduled_checks_once(db):
                 if ok:
                     action_msg = f"Sent 6-hr Reminders for Group {grp}"
                     _record_scheduler_action(db, rt, action_msg)
-                    print(f"[Scheduler] {action_msg} ({mtime}).")
                 else:
                     release_dispatch(db, rem6h_key)
                     err_msg = f"6-hr Reminders failed for Group {grp}"
                     _record_scheduler_error(db, rt, err_msg)
-                    print(f"[Scheduler] {err_msg} (released '{rem6h_key}' for retry).")
-            else:
-                print(f"[Scheduler] Group {grp} ({mtime}) 6-hr reminders skipped: already dispatched.")
-        else:
-            print(f"[Scheduler] Group {grp} ({mtime}) 6-hr reminders skipped: {minutes_until_lecture:.1f} min until lecture (hw_id={hw_id}, qz_id={qz_id}).")
 
 
 def send_group_master_reports_to_teacher(
     db, client: GowaClient, teacher_phone: str, grp: str, mtime: str,
     hw_id: int | None, qz_id: int | None, hw_map: dict, qz_map: dict
 ) -> bool:
-    """Generates and sends the Master Homework PDF and Master Quiz PDF for a group to the teacher."""
     students_df = db.fetch_dataframe(
         "SELECT id, name FROM students WHERE TRIM(group_number) = %s ORDER BY name ASC",
         (grp,),
@@ -1109,7 +1089,6 @@ def send_6hr_unsubmitted_reminders(
     db, client: GowaClient, grp: str, mtime: str,
     hw_id: int | None, qz_id: int | None, hw_map: dict, qz_map: dict
 ) -> bool:
-    """Finds students in Group `grp` who haven't submitted `hw_id` and sends a 6-hr reminder."""
     students_df = db.fetch_dataframe(
         "SELECT id, name, phone, phone_parent FROM students WHERE TRIM(group_number) = %s",
         (grp,),
@@ -1160,6 +1139,29 @@ def send_6hr_unsubmitted_reminders(
     return sent_any
 
 
+def start_background_automation_daemon(db):
+    """Starts a single background daemon thread across the Streamlit server process."""
+    init_automation_tables(db)
+    _sync_secrets_to_cache_and_db(db)
+    rt = get_daemon_runtime()
+
+    with rt["lock"]:
+        if rt.get("daemon_started"):
+            return
+        rt["daemon_started"] = True
+
+    def _daemon_loop():
+        while True:
+            try:
+                run_scheduled_checks_once(db)
+            except Exception as e:
+                with rt["lock"]:
+                    rt["last_error"] = f"Daemon loop error: {e}"
+            time.sleep(60)
+
+    threading.Thread(target=_daemon_loop, daemon=True, name="WhatsAppAutomationDaemon").start()
+
+
 # ---------------------------------------------------------------------------
 # UI Renderer for the "🤖 Automated Messages" Tab
 # ---------------------------------------------------------------------------
@@ -1176,7 +1178,6 @@ class AutomatedMessagesView:
             "and manage automated teacher/assistant/student/parent WhatsApp notifications."
         )
 
-        # Live External Scheduler & Post-Grade Status Bar
         rt = get_daemon_runtime()
         now_dt = datetime.datetime.now(CAIRO_TZ)
         now_cairo = now_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -1186,11 +1187,11 @@ class AutomatedMessagesView:
         db_last_error = get_bot_setting(self.db, "last_scheduler_error", "")
 
         with rt["lock"]:
-            d_tick = db_last_tick or rt["last_tick"] or "No tick recorded yet"
-            d_action = db_last_action or rt["last_action"]
-            d_grade = rt["last_grade_status"]
-            d_hw_sub = rt["last_hw_sub_status"]
-            d_err = db_last_error or rt["last_error"]
+            d_tick = db_last_tick or rt.get("last_tick") or "No tick recorded yet"
+            d_action = db_last_action or rt.get("last_action", "Initialized — waiting for first check...")
+            d_grade = rt.get("last_grade_status", "No grade saved in this session yet.")
+            d_hw_sub = rt.get("last_hw_sub_status", "No homework submission alert sent in this session yet.")
+            d_err = db_last_error or rt.get("last_error")
 
         scheduler_active = False
         if db_last_tick:
@@ -1205,7 +1206,7 @@ class AutomatedMessagesView:
         status_label = (
             "🟢 **Scheduler: Active**"
             if scheduler_active
-            else "🔴 **Scheduler: No recent tick (check GitHub Actions)**"
+            else "🔴 **Scheduler: Idle/Inactive**"
         )
         status_col1.caption(f"{status_label} | 🕒 `{now_cairo}`")
         status_col2.caption(f"🔄 **Last Check:** `{d_tick}`")
@@ -1223,7 +1224,6 @@ class AutomatedMessagesView:
             "⚙️ Bot & Teacher Settings",
         ])
 
-        # Load common data
         students_df = self.db.fetch_dataframe(
             "SELECT id, name, phone, phone_parent, group_number FROM students ORDER BY name ASC"
         )
@@ -1245,7 +1245,7 @@ class AutomatedMessagesView:
             qz_options[int(r["quiz_id"])] = str(r["title"])
 
         # ===================================================================
-        # TAB 1: GROUP SCHEDULE TABLE (4 COLUMNS + MULTI-TIMING MANAGER)
+        # TAB 1: GROUP SCHEDULE TABLE
         # ===================================================================
         with tab_sched:
             if not groups:
@@ -1261,7 +1261,6 @@ class AutomatedMessagesView:
                     "FROM group_meeting_times ORDER BY meeting_time ASC"
                 )
 
-                # --- 4-COLUMN MASTER SCHEDULE OVERVIEW TABLE ---
                 st.markdown("#### 📋 Master Group Schedule & Pace Overview")
                 overview_rows = []
                 for g in groups:
@@ -1286,7 +1285,6 @@ class AutomatedMessagesView:
 
                 st.divider()
 
-                # --- EDIT GROUP TIMINGS, LATEST HW, AND LATEST QUIZ ---
                 col_left, col_right = st.columns([1.2, 1.3])
 
                 with col_left:
@@ -1447,7 +1445,7 @@ class AutomatedMessagesView:
                             st.success(f"Started sending reminders in the background to unsubmitted students in Group {test_grp}!")
 
         # ===================================================================
-        # TAB 2: MANUAL BROADCAST TAB (PRIVATE OR WHATSAPP GROUP)
+        # TAB 2: MANUAL BROADCAST TAB
         # ===================================================================
         with tab_broadcast:
             st.markdown("#### 📢 Custom Automated Broadcast")
@@ -1618,15 +1616,15 @@ class AutomatedMessagesView:
 
             st.divider()
             st.markdown("#### 👩‍🏫 Manage Assistants & Notification Permissions")
-            
+
             asst_df = self.db.fetch_dataframe(
                 "SELECT id, name, phone, notify_hw_submit, notify_daily_schedule, notify_grade_submitted FROM assistants ORDER BY id ASC"
             )
-            
+
             if not asst_df.empty:
                 st.dataframe(
-                    asst_df, 
-                    hide_index=True, 
+                    asst_df,
+                    hide_index=True,
                     use_container_width=True,
                     column_config={
                         "id": None,
@@ -1637,7 +1635,7 @@ class AutomatedMessagesView:
                         "notify_grade_submitted": "Grade Saved"
                     }
                 )
-                
+
                 del_asst_dict = {str(row["id"]): f"{row['name']} ({row['phone']})" for _, row in asst_df.iterrows()}
                 c_del1, c_del2 = st.columns([3, 1])
                 del_sel = c_del1.selectbox("Select Assistant to Remove", list(del_asst_dict.keys()), format_func=lambda x: del_asst_dict[x])
@@ -1651,12 +1649,12 @@ class AutomatedMessagesView:
                 with st.form("add_assistant_form"):
                     a_name = st.text_input("Assistant Name")
                     a_phone = st.text_input("WhatsApp Phone Number", placeholder="010...")
-                    
+
                     st.markdown("**Notification Permissions:**")
                     a_hw = st.checkbox("📥 Receive New Homework Submission Alerts", value=True)
                     a_sched = st.checkbox("☀️ Receive Morning Schedule", value=True)
                     a_grade = st.checkbox("✅ Receive Grade Saved Alerts", value=False)
-                    
+
                     if st.form_submit_button("💾 Add Assistant", type="primary"):
                         if not a_name.strip() or not a_phone.strip():
                             st.error("Name and Phone are required.")
