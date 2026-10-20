@@ -363,11 +363,14 @@ def get_resolved_assistant_phone(db) -> str | None:
 def get_eligible_assistants(db, perm_col: str) -> list[tuple[str, str]]:
     """
     Returns a list of (name, clean_phone) for assistants who have `perm_col` = TRUE.
-    Also falls back to the single `assistant_phone` setting if the `assistants` table is empty.
+    Only falls back to legacy single `assistant_phone` if the `assistants` table has 0 rows total.
     """
     results = []
     seen_phones = set()
+    total_assistants_in_table = 0
     try:
+        cnt = db.execute_scalar("SELECT COUNT(*) FROM assistants")
+        total_assistants_in_table = int(cnt or 0)
         df = db.fetch_dataframe(
             f"SELECT name, phone FROM assistants WHERE COALESCE({perm_col}, FALSE) = TRUE ORDER BY id ASC"
         )
@@ -379,12 +382,36 @@ def get_eligible_assistants(db, perm_col: str) -> list[tuple[str, str]]:
     except Exception as e:
         print(f"[Assistants] Query error ({perm_col}): {e}")
 
-    if not results and perm_col == "notify_hw_submit":
+    if total_assistants_in_table == 0 and not results and perm_col == "notify_hw_submit":
         fallback_p = get_resolved_assistant_phone(db)
         if fallback_p and fallback_p not in seen_phones:
             results.append(("Assistant", fallback_p))
 
     return results
+
+
+def get_effective_group_pace(
+    cfg_row: dict | pd.Series | None,
+    default_latest_hw_id: int | None,
+    default_latest_qz_id: int | None,
+) -> tuple[int | None, int | None, bool, bool]:
+    """
+    Returns (effective_hw_id, effective_qz_id, is_hw_manual, is_qz_manual).
+    Automatically falls back to the newest created HW / Quiz unless manually overridden.
+    """
+    manual_hw = None
+    manual_qz = None
+    if cfg_row is not None:
+        raw_hw = cfg_row.get("latest_hw_id")
+        if pd.notna(raw_hw) and int(raw_hw) > 0:
+            manual_hw = int(raw_hw)
+        raw_qz = cfg_row.get("latest_quiz_id")
+        if pd.notna(raw_qz) and int(raw_qz) > 0:
+            manual_qz = int(raw_qz)
+
+    eff_hw = manual_hw if manual_hw is not None else default_latest_hw_id
+    eff_qz = manual_qz if manual_qz is not None else default_latest_qz_id
+    return eff_hw, eff_qz, (manual_hw is not None), (manual_qz is not None)
 
 
 def has_dispatched(db, dispatch_key: str) -> bool:
@@ -472,7 +499,7 @@ def _safe_generate_student_pdf(
 
 
 # ---------------------------------------------------------------------------
-# Instant Homework Submission Alert to Assistant
+# Instant Homework Submission Alert to Assistant (Atomic Single-Send)
 # ---------------------------------------------------------------------------
 def trigger_hw_submission_assistant_whatsapp(
     db,
@@ -484,7 +511,8 @@ def trigger_hw_submission_assistant_whatsapp(
 ):
     """
     Runs immediately when a student submits a homework.
-    Fetches all DB data synchronously on the main thread, then wakes GOWA and sends in background.
+    Uses atomic `claim_dispatch` BEFORE starting the thread so neither the background daemon
+    nor a double-click can ever send a duplicate message to the assistants.
     """
     _sync_secrets_to_cache_and_db(db)
     rt = get_daemon_runtime()
@@ -494,6 +522,13 @@ def trigger_hw_submission_assistant_whatsapp(
         with rt["lock"]:
             rt["last_hw_sub_status"] = "Skipped (No assistants have 'HW Submits' enabled in Settings)"
         return
+
+    sub_key = None
+    if homework_id is not None:
+        sub_key = f"asst_hw_sub_hw_{int(homework_id)}_stu_{str(student_id).strip()}"
+        if not claim_dispatch(db, sub_key):
+            # Already claimed by either an earlier click or the background daemon!
+            return
 
     if not student_name or not group_number:
         try:
@@ -522,10 +557,6 @@ def trigger_hw_submission_assistant_whatsapp(
             pass
 
     homework_title = homework_title or (f"Homework #{homework_id}" if homework_id else "Homework")
-
-    if homework_id is not None:
-        sub_key = f"asst_hw_sub_hw_{int(homework_id)}_stu_{str(student_id).strip()}"
-        mark_dispatched(db, sub_key)
 
     client = GowaClient.from_secrets(db)
     submitted_at_str = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M")
@@ -557,9 +588,13 @@ def trigger_hw_submission_assistant_whatsapp(
                     rt["last_hw_sub_status"] = f"Sent to {', '.join(sent_to)} for {student_name} ({homework_title})"
                     rt["last_action"] = f"HW Sub Alert -> {len(sent_to)} Assistant(s)"
                 else:
+                    if sub_key:
+                        release_dispatch(db, sub_key)
                     rt["last_hw_sub_status"] = f"Failed for {student_name}: {'; '.join(errors)}"
                     rt["last_error"] = f"Assistant HW Sub Alert Error: {'; '.join(errors)}"
         except Exception as e:
+            if sub_key:
+                release_dispatch(db, sub_key)
             with rt["lock"]:
                 rt["last_error"] = f"Assistant HW Sub Exception ({student_name}): {e}"
                 rt["last_hw_sub_status"] = f"Exception for {student_name}: {e}"
@@ -724,7 +759,8 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
     meetings_df = db.fetch_dataframe(
         """
         SELECT m.meeting_id, TRIM(m.group_number) AS group_number, m.day_of_week, m.meeting_time,
-               c.latest_hw_id, c.latest_quiz_id
+               COALESCE(c.latest_hw_id, (SELECT MAX(homework_id) FROM homeworks)) AS latest_hw_id,
+               COALESCE(c.latest_quiz_id, (SELECT MAX(quiz_id) FROM quizzes)) AS latest_quiz_id
         FROM group_meeting_times m
         LEFT JOIN group_automation_config c ON TRIM(m.group_number) = TRIM(c.group_number)
         WHERE m.day_of_week = %s
@@ -760,7 +796,15 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
         for _, m_row in meetings_df.iterrows():
             grp = m_row["group_number"]
             mtime = m_row["meeting_time"]
-            
+            hw_id = m_row.get("latest_hw_id")
+            qz_id = m_row.get("latest_quiz_id")
+            hw_label = hw_map.get(int(hw_id), "Not Set") if pd.notna(hw_id) else "Not Set"
+            qz_label = qz_map.get(int(qz_id), "Not Set") if pd.notna(qz_id) else "Not Set"
+            lines.append(
+                f"🕒 *{mtime}* — *Group {grp}*\n"
+                f"   • 📝 HW: {hw_label}\n"
+                f"   • 📊 Quiz: {qz_label}"
+            )
         lines.append(f"\n{exciting_line}")
         msg = "\n".join(lines)
 
@@ -771,6 +815,8 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
     try:
         asst_recipients = get_eligible_assistants(db, "notify_daily_schedule")
         for asst_name, asst_phone in asst_recipients:
+            if teacher_phone_clean and asst_phone == teacher_phone_clean:
+                continue
             asst_msg = msg.replace("Eng. Mahmoud Adel", asst_name)
             client.send_text(asst_phone, asst_msg)
     except Exception as e:
@@ -920,7 +966,9 @@ def run_scheduled_checks_once(db):
     meetings_df = db.fetch_dataframe(
         """
         SELECT m.meeting_id, TRIM(m.group_number) AS group_number, m.day_of_week, m.meeting_time,
-               c.latest_hw_id, c.latest_quiz_id, c.wa_group_jid
+               COALESCE(c.latest_hw_id, (SELECT MAX(homework_id) FROM homeworks)) AS latest_hw_id,
+               COALESCE(c.latest_quiz_id, (SELECT MAX(quiz_id) FROM quizzes)) AS latest_quiz_id,
+               c.wa_group_jid
         FROM group_meeting_times m
         LEFT JOIN group_automation_config c ON TRIM(m.group_number) = TRIM(c.group_number)
         WHERE m.day_of_week = %s
@@ -1228,11 +1276,17 @@ class AutomatedMessagesView:
         hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions FROM homeworks ORDER BY homework_id DESC")
         qz_df = self.db.fetch_dataframe("SELECT quiz_id, title, max_score FROM quizzes ORDER BY quiz_id DESC")
 
-        hw_options = {0: "— None —"}
+        # Determine the global latest Homework and Quiz IDs (for automatic fallback)
+        default_latest_hw_id = int(hw_df.iloc[0]["homework_id"]) if not hw_df.empty else None
+        default_latest_qz_id = int(qz_df.iloc[0]["quiz_id"]) if not qz_df.empty else None
+        default_hw_title = str(hw_df.iloc[0]["title"]) if not hw_df.empty else "None"
+        default_qz_title = str(qz_df.iloc[0]["title"]) if not qz_df.empty else "None"
+
+        hw_options = {0: f"🔄 Auto (Latest: {default_hw_title})"}
         for _, r in hw_df.iterrows():
             hw_options[int(r["homework_id"])] = str(r["title"])
 
-        qz_options = {0: "— None —"}
+        qz_options = {0: f"🔄 Auto (Latest: {default_qz_title})"}
         for _, r in qz_df.iterrows():
             qz_options[int(r["quiz_id"])] = str(r["title"])
 
@@ -1265,13 +1319,21 @@ class AutomatedMessagesView:
                             for _, r in g_meetings.iterrows()
                         )
                     cfg_row = configs_map.get(g, {})
-                    cur_hw_id = int(cfg_row["latest_hw_id"]) if pd.notna(cfg_row.get("latest_hw_id")) else 0
-                    cur_qz_id = int(cfg_row["latest_quiz_id"]) if pd.notna(cfg_row.get("latest_quiz_id")) else 0
+                    eff_hw, eff_qz, is_hw_man, is_qz_man = get_effective_group_pace(
+                        cfg_row, default_latest_hw_id, default_latest_qz_id
+                    )
+                    hw_disp = hw_options.get(eff_hw, "— None —") if eff_hw else "— None —"
+                    qz_disp = qz_options.get(eff_qz, "— None —") if eff_qz else "— None —"
+                    if eff_hw and not is_hw_man:
+                        hw_disp = f"🔄 {hw_disp} (Auto)"
+                    if eff_qz and not is_qz_man:
+                        qz_disp = f"🔄 {qz_disp} (Auto)"
+
                     overview_rows.append({
                         "Group": f"Group {g}",
                         "Scheduled Timings": timings_str,
-                        "Latest Homework (Manual)": hw_options.get(cur_hw_id, "— None —"),
-                        "Latest Quiz (Manual)": qz_options.get(cur_qz_id, "— None —"),
+                        "Active Homework": hw_disp,
+                        "Active Quiz": qz_disp,
                     })
                 st.dataframe(pd.DataFrame(overview_rows), hide_index=True, use_container_width=True)
 
@@ -1333,7 +1395,7 @@ class AutomatedMessagesView:
                     with st.container(border=True):
                         st.markdown("#### 📌 Set Latest Homework & Latest Quiz per Group")
                         st.caption(
-                            "Used for the 10-min pre-lecture Teacher Reports and the 6-hour Student Reminders."
+                            "Defaults to **🔄 Auto (Latest Created)** automatically unless you manually select a specific Homework or Quiz for a group."
                         )
                         with st.form("update_group_pace_form"):
                             target_grp = st.selectbox("Select Group to Configure", groups, key="cfg_grp_sel")
@@ -1343,13 +1405,13 @@ class AutomatedMessagesView:
                             init_jid = str(cur_cfg.get("wa_group_jid") or "") if pd.notna(cur_cfg.get("wa_group_jid")) else ""
 
                             new_hw_id = st.selectbox(
-                                "3rd Column: Latest Homework for this Group",
+                                "3rd Column: Homework for this Group",
                                 options=list(hw_options.keys()),
                                 index=list(hw_options.keys()).index(init_hw),
                                 format_func=lambda k: hw_options[k],
                             )
                             new_qz_id = st.selectbox(
-                                "4th Column: Latest Quiz for this Group",
+                                "4th Column: Quiz for this Group",
                                 options=list(qz_options.keys()),
                                 index=list(qz_options.keys()).index(init_qz),
                                 format_func=lambda k: qz_options[k],
@@ -1377,7 +1439,7 @@ class AutomatedMessagesView:
                                         new_jid or None,
                                     ),
                                 )
-                                st.success(f"Saved Latest Homework & Quiz for Group {target_grp}!")
+                                st.success(f"Saved assignment pace for Group {target_grp}!")
                                 st.rerun()
 
                 st.divider()
@@ -1407,8 +1469,9 @@ class AutomatedMessagesView:
                         else:
                             with st.spinner(f"Generating & sending Group {test_grp} Master PDFs..."):
                                 cfg_r = configs_map.get(test_grp, {})
-                                hid = int(cfg_r["latest_hw_id"]) if pd.notna(cfg_r.get("latest_hw_id")) else None
-                                qid = int(cfg_r["latest_quiz_id"]) if pd.notna(cfg_r.get("latest_quiz_id")) else None
+                                hid, qid, _, _ = get_effective_group_pace(
+                                    cfg_r, default_latest_hw_id, default_latest_qz_id
+                                )
                                 hw_m = {int(r["homework_id"]): (str(r["title"]), int(r["total_questions"])) for _, r in hw_df.iterrows()}
                                 qz_m = {int(r["quiz_id"]): (str(r["title"]), float(r["max_score"])) for _, r in qz_df.iterrows()}
                                 ok = send_group_master_reports_to_teacher(
@@ -1421,10 +1484,11 @@ class AutomatedMessagesView:
                 with col_t3:
                     if st.button(f"🔔 Send Unsubmitted HW Reminders to Group {test_grp} Now", use_container_width=True):
                         cfg_r = configs_map.get(test_grp, {})
-                        hid = int(cfg_r["latest_hw_id"]) if pd.notna(cfg_r.get("latest_hw_id")) else None
-                        qid = int(cfg_r["latest_quiz_id"]) if pd.notna(cfg_r.get("latest_quiz_id")) else None
+                        hid, qid, _, _ = get_effective_group_pace(
+                            cfg_r, default_latest_hw_id, default_latest_qz_id
+                        )
                         if not hid:
-                            st.error(f"Please assign a Latest Homework to Group {test_grp} first!")
+                            st.error(f"No homeworks exist yet for Group {test_grp}!")
                         else:
                             hw_m = {int(r["homework_id"]): (str(r["title"]), int(r["total_questions"])) for _, r in hw_df.iterrows()}
                             qz_m = {int(r["quiz_id"]): (str(r["title"]), float(r["max_score"])) for _, r in qz_df.iterrows()}
