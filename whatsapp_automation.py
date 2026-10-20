@@ -1412,7 +1412,6 @@ class AutomatedMessagesView:
                         st.caption(
                             "Defaults to **🔄 Auto (Latest Created)** automatically unless you manually select a specific Homework or Quiz for a group."
                         )
-                        # MUST BE OUTSIDE st.form so changing the group immediately reloads the form below!
                         target_grp = str(
                             st.selectbox("Select Group to Configure", groups, key="cfg_grp_sel")
                         ).strip()
@@ -1473,56 +1472,6 @@ class AutomatedMessagesView:
                                     """,
                                     (
                                         target_grp,
-                                        int(new_hw_id) if new_hw_id else None,
-                                        int(new_qz_id) if new_qz_id else None,
-                                        new_jid or None,
-                                    ),
-                                )
-                                st.success(f"Saved assignment pace for Group {target_grp}!")
-                                st.rerun()
-                with col_right:
-                    with st.container(border=True):
-                        st.markdown("#### 📌 Set Latest Homework & Latest Quiz per Group")
-                        st.caption(
-                            "Defaults to **🔄 Auto (Latest Created)** automatically unless you manually select a specific Homework or Quiz for a group."
-                        )
-                        with st.form("update_group_pace_form"):
-                            target_grp = st.selectbox("Select Group to Configure", groups, key="cfg_grp_sel")
-                            cur_cfg = configs_map.get(target_grp, {})
-                            init_hw = int(cur_cfg["latest_hw_id"]) if pd.notna(cur_cfg.get("latest_hw_id")) and int(cur_cfg["latest_hw_id"]) in hw_options else 0
-                            init_qz = int(cur_cfg["latest_quiz_id"]) if pd.notna(cur_cfg.get("latest_quiz_id")) and int(cur_cfg["latest_quiz_id"]) in qz_options else 0
-                            init_jid = str(cur_cfg.get("wa_group_jid") or "") if pd.notna(cur_cfg.get("wa_group_jid")) else ""
-
-                            new_hw_id = st.selectbox(
-                                "3rd Column: Homework for this Group",
-                                options=list(hw_options.keys()),
-                                index=list(hw_options.keys()).index(init_hw),
-                                format_func=lambda k: hw_options[k],
-                            )
-                            new_qz_id = st.selectbox(
-                                "4th Column: Quiz for this Group",
-                                options=list(qz_options.keys()),
-                                index=list(qz_options.keys()).index(init_qz),
-                                format_func=lambda k: qz_options[k],
-                            )
-                            new_jid = st.text_input(
-                                "Optional: WhatsApp Group JID (for Group Chat Broadcasts)",
-                                value=init_jid,
-                                placeholder="e.g. 12036304...@g.us",
-                            ).strip()
-
-                            if st.form_submit_button("💾 Save Group Assignment Pace", type="primary", use_container_width=True):
-                                self.db.execute_query(
-                                    """
-                                    INSERT INTO group_automation_config (group_number, latest_hw_id, latest_quiz_id, wa_group_jid)
-                                    VALUES (%s, %s, %s, %s)
-                                    ON CONFLICT (group_number) DO UPDATE SET
-                                        latest_hw_id = EXCLUDED.latest_hw_id,
-                                        latest_quiz_id = EXCLUDED.latest_quiz_id,
-                                        wa_group_jid = EXCLUDED.wa_group_jid
-                                    """,
-                                    (
-                                        target_grp.strip(),
                                         int(new_hw_id) if new_hw_id else None,
                                         int(new_qz_id) if new_qz_id else None,
                                         new_jid or None,
