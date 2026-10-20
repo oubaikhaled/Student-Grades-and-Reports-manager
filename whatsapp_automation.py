@@ -1345,7 +1345,9 @@ class AutomatedMessagesView:
                     with st.container(border=True):
                         st.markdown("#### 🕒 Add / Remove Group Lecture Timings")
                         st.caption("You can add multiple meeting days and times to the same group.")
-                        sel_grp_time = st.selectbox("Select Group", groups, key="sched_grp_sel")
+                        sel_grp_time = str(
+                            st.selectbox("Select Group", groups, key="sched_grp_sel")
+                        ).strip()
 
                         c_d, c_t = st.columns(2)
                         with c_d:
@@ -1354,15 +1356,22 @@ class AutomatedMessagesView:
                                 DAYS_OF_WEEK,
                                 default=["Sat"],
                                 format_func=lambda d: f"{d} ({DAY_FULL_NAMES[d]})",
+                                key=f"sched_days_{sel_grp_time}",
                             )
                         with c_t:
                             sel_time = st.time_input(
                                 "Lecture Start Time",
                                 value=datetime.time(16, 0),
                                 step=datetime.timedelta(minutes=15),
+                                key=f"sched_time_{sel_grp_time}",
                             )
 
-                        if st.button("➕ Add Timing(s) to Group", type="primary", use_container_width=True):
+                        if st.button(
+                            f"➕ Add Timing(s) to Group {sel_grp_time}",
+                            type="primary",
+                            use_container_width=True,
+                            key=f"btn_add_time_{sel_grp_time}",
+                        ):
                             if not sel_days:
                                 st.error("Please select at least one day.")
                             else:
@@ -1373,17 +1382,23 @@ class AutomatedMessagesView:
                                         INSERT INTO group_meeting_times (group_number, day_of_week, meeting_time)
                                         VALUES (%s, %s, %s) ON CONFLICT DO NOTHING
                                         """,
-                                        (sel_grp_time.strip(), d, t_str),
+                                        (sel_grp_time, d, t_str),
                                     )
                                 st.success(f"Added {', '.join(sel_days)} at {t_str} to Group {sel_grp_time}!")
                                 st.rerun()
 
-                        grp_m = meetings_df[meetings_df["group_number"].astype(str).str.strip() == sel_grp_time]
-                        if not grp_m.empty:
-                            st.markdown(f"**Current Timings for Group {sel_grp_time}:**")
+                        grp_m = meetings_df[
+                            meetings_df["group_number"].astype(str).str.strip() == sel_grp_time
+                        ]
+                        st.markdown(f"**Current Timings for Group {sel_grp_time}:**")
+                        if grp_m.empty:
+                            st.caption(f"No lecture timings added for Group {sel_grp_time} yet.")
+                        else:
                             for _, mr in grp_m.iterrows():
                                 mc1, mc2 = st.columns([3, 1])
-                                mc1.write(f"• **{DAY_FULL_NAMES.get(mr['day_of_week'], mr['day_of_week'])}** at `{mr['meeting_time']}`")
+                                mc1.write(
+                                    f"• **{DAY_FULL_NAMES.get(mr['day_of_week'], mr['day_of_week'])}** at `{mr['meeting_time']}`"
+                                )
                                 if mc2.button("🗑️", key=f"del_m_{mr['meeting_id']}"):
                                     self.db.execute_query(
                                         "DELETE FROM group_meeting_times WHERE meeting_id = %s",
@@ -1391,6 +1406,80 @@ class AutomatedMessagesView:
                                     )
                                     st.rerun()
 
+                with col_right:
+                    with st.container(border=True):
+                        st.markdown("#### 📌 Set Latest Homework & Latest Quiz per Group")
+                        st.caption(
+                            "Defaults to **🔄 Auto (Latest Created)** automatically unless you manually select a specific Homework or Quiz for a group."
+                        )
+                        # MUST BE OUTSIDE st.form so changing the group immediately reloads the form below!
+                        target_grp = str(
+                            st.selectbox("Select Group to Configure", groups, key="cfg_grp_sel")
+                        ).strip()
+                        cur_cfg = configs_map.get(target_grp, {})
+                        init_hw = (
+                            int(cur_cfg["latest_hw_id"])
+                            if pd.notna(cur_cfg.get("latest_hw_id"))
+                            and int(cur_cfg["latest_hw_id"]) in hw_options
+                            else 0
+                        )
+                        init_qz = (
+                            int(cur_cfg["latest_quiz_id"])
+                            if pd.notna(cur_cfg.get("latest_quiz_id"))
+                            and int(cur_cfg["latest_quiz_id"]) in qz_options
+                            else 0
+                        )
+                        init_jid = (
+                            str(cur_cfg.get("wa_group_jid") or "")
+                            if pd.notna(cur_cfg.get("wa_group_jid"))
+                            else ""
+                        )
+
+                        with st.form(f"update_group_pace_form_{target_grp}"):
+                            new_hw_id = st.selectbox(
+                                f"3rd Column: Homework for Group {target_grp}",
+                                options=list(hw_options.keys()),
+                                index=list(hw_options.keys()).index(init_hw),
+                                format_func=lambda k: hw_options[k],
+                                key=f"cfg_hw_{target_grp}",
+                            )
+                            new_qz_id = st.selectbox(
+                                f"4th Column: Quiz for Group {target_grp}",
+                                options=list(qz_options.keys()),
+                                index=list(qz_options.keys()).index(init_qz),
+                                format_func=lambda k: qz_options[k],
+                                key=f"cfg_qz_{target_grp}",
+                            )
+                            new_jid = st.text_input(
+                                "Optional: WhatsApp Group JID (for Group Chat Broadcasts)",
+                                value=init_jid,
+                                placeholder="e.g. 12036304...@g.us",
+                                key=f"cfg_jid_{target_grp}",
+                            ).strip()
+
+                            if st.form_submit_button(
+                                f"💾 Save Group {target_grp} Assignment Pace",
+                                type="primary",
+                                use_container_width=True,
+                            ):
+                                self.db.execute_query(
+                                    """
+                                    INSERT INTO group_automation_config (group_number, latest_hw_id, latest_quiz_id, wa_group_jid)
+                                    VALUES (%s, %s, %s, %s)
+                                    ON CONFLICT (group_number) DO UPDATE SET
+                                        latest_hw_id = EXCLUDED.latest_hw_id,
+                                        latest_quiz_id = EXCLUDED.latest_quiz_id,
+                                        wa_group_jid = EXCLUDED.wa_group_jid
+                                    """,
+                                    (
+                                        target_grp,
+                                        int(new_hw_id) if new_hw_id else None,
+                                        int(new_qz_id) if new_qz_id else None,
+                                        new_jid or None,
+                                    ),
+                                )
+                                st.success(f"Saved assignment pace for Group {target_grp}!")
+                                st.rerun()
                 with col_right:
                     with st.container(border=True):
                         st.markdown("#### 📌 Set Latest Homework & Latest Quiz per Group")
