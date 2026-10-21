@@ -1195,6 +1195,62 @@ def run_scheduled_checks_once(db):
             )[0],
         )
 
+    # ---------------------------------------------------------
+    # Auto-Advance Group Pace on the NEXT DAY after a meeting
+    # Triggers on the very first scheduler tick of the day
+    # ---------------------------------------------------------
+    yesterday_dt = now - datetime.timedelta(days=1)
+    yesterday_str = yesterday_dt.strftime("%Y-%m-%d")
+    yesterday_day = yesterday_dt.strftime("%a")
+    
+    try:
+        y_meetings = db.fetch_dataframe(
+            "SELECT DISTINCT TRIM(group_number) AS grp FROM group_meeting_times WHERE day_of_week = %s",
+            (yesterday_day,)
+        )
+        for _, ym_row in y_meetings.iterrows():
+            y_grp = str(ym_row["grp"]).strip()
+            if not y_grp:
+                continue
+                
+            advance_key = f"pace_advance_{yesterday_str}_{y_grp}"
+            if not has_dispatched(db, advance_key):
+                if claim_dispatch(db, advance_key):
+                    cfg_df = db.fetch_dataframe(
+                        "SELECT latest_hw_id, latest_quiz_id FROM group_automation_config WHERE group_number = %s", 
+                        (y_grp,)
+                    )
+                    if not cfg_df.empty:
+                        cur_hw = cfg_df.iloc[0]["latest_hw_id"]
+                        cur_qz = cfg_df.iloc[0]["latest_quiz_id"]
+                        
+                        new_hw, new_qz = cur_hw, cur_qz
+                        updated = False
+                        
+                        # Find next sequential Homework ID
+                        if pd.notna(cur_hw):
+                            next_hw = db.execute_scalar("SELECT MIN(homework_id) FROM homeworks WHERE homework_id > %s", (int(cur_hw),))
+                            if next_hw:
+                                new_hw = int(next_hw)
+                                updated = True
+                        
+                        # Find next sequential Quiz ID
+                        if pd.notna(cur_qz):
+                            next_qz = db.execute_scalar("SELECT MIN(quiz_id) FROM quizzes WHERE quiz_id > %s", (int(cur_qz),))
+                            if next_qz:
+                                new_qz = int(next_qz)
+                                updated = True
+                                
+                        if updated:
+                            db.execute_query(
+                                "UPDATE group_automation_config SET latest_hw_id = %s, latest_quiz_id = %s WHERE group_number = %s",
+                                (new_hw, new_qz, y_grp)
+                            )
+                            _record_scheduler_action(db, rt, f"Auto-advanced pace for Group {y_grp} (HW: {new_hw}, QZ: {new_qz})")
+    except Exception as e:
+        _record_scheduler_error(db, rt, f"Next-day pace advance error: {e}")
+    # ---------------------------------------------------------
+
     meetings_df = db.fetch_dataframe(
         """
         SELECT m.meeting_id, TRIM(m.group_number) AS group_number, m.day_of_week, m.meeting_time,
