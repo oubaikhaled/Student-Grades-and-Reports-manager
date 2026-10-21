@@ -24,6 +24,7 @@ from pdf_utils import PDFGenerator
 from student_profile import StudentProfileView
 from whatsapp_automation import (
     AutomatedMessagesView,
+    clean_wa_phone as clean_number,
     start_background_automation_daemon,
     trigger_hw_submission_assistant_whatsapp,
     trigger_post_grade_whatsapp,
@@ -110,21 +111,6 @@ def set_flag(key):
 
 def to_bytes(buf):
     return buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
-
-
-def clean_number(p_str):
-    if pd.isna(p_str) or str(p_str).strip() in ["", "None", "nan"]:
-        return None
-    c_phone = re.sub(r"\D", "", str(p_str))
-    if not c_phone:
-        return None
-    if len(c_phone) == 10 and c_phone.startswith("1"):
-        return "20" + c_phone
-    elif c_phone.startswith("0"):
-        return "2" + c_phone
-    elif not c_phone.startswith("20"):
-        return "20" + c_phone
-    return c_phone
 
 
 def stitch_images(uploaded_files):
