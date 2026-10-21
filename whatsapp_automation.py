@@ -671,25 +671,27 @@ def trigger_hw_submission_assistant_whatsapp(
     group_number: str | None = None,
 ):
     """
-    Runs immediately when a student submits a homework.
-    Uses atomic `claim_dispatch` BEFORE starting the thread so neither the background daemon
-    nor a double-click can ever send a duplicate message to the assistants.
+    Runs immediately when a student clicks Submit Homework.
+    Uses a 30-second memory cooldown (instead of a permanent DB lock) so re-submissions
+    and testing always send a WhatsApp alert without double-sending on accidental double-taps.
     """
     _sync_secrets_to_cache_and_db(db)
     rt = get_daemon_runtime()
+
+    # 30-second anti-double-click cooldown per (homework_id, student_id)
+    dedup_id = f"hw_{homework_id}_stu_{str(student_id).strip()}"
+    now_ts = time.time()
+    with rt["lock"]:
+        recent_subs = rt.setdefault("recent_hw_subs", {})
+        if now_ts - recent_subs.get(dedup_id, 0.0) < 30.0:
+            return
+        recent_subs[dedup_id] = now_ts
 
     recipients = get_eligible_assistants(db, "notify_hw_submit")
     if not recipients:
         with rt["lock"]:
             rt["last_hw_sub_status"] = "Skipped (No assistants have 'HW Submits' enabled in Settings)"
         return
-
-    sub_key = None
-    if homework_id is not None:
-        sub_key = f"asst_hw_sub_hw_{int(homework_id)}_stu_{str(student_id).strip()}"
-        if not claim_dispatch(db, sub_key):
-            # Already claimed by either an earlier click or the background daemon!
-            return
 
     if not student_name or not group_number:
         try:
@@ -719,8 +721,50 @@ def trigger_hw_submission_assistant_whatsapp(
 
     homework_title = homework_title or (f"Homework #{homework_id}" if homework_id else "Homework")
 
+    # Also mark in DB so if the background daemon still has the old check, it won't double-send
+    if homework_id is not None:
+        mark_dispatched(db, f"asst_hw_sub_hw_{int(homework_id)}_stu_{str(student_id).strip()}")
+
     client = GowaClient.from_secrets(db)
     submitted_at_str = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M")
+
+    def _worker():
+        try:
+            sent_to = []
+            errors = []
+            for asst_name, asst_phone in recipients:
+                msg = emoji.emojize(
+                    f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
+                    f"👩‍🏫 *تنبيه يا {asst_name}:*\n"
+                    f"قام الطالب *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*) بتسليم الواجب:\n"
+                    f"📘 *{homework_title}*\n"
+                    f"🕒 *وقت التسليم:* {submitted_at_str}\n\n"
+                    f"برجاء الدخول على المنصة لمراجعة الواجب وتصحيحه. :check_mark_button:\n\n"
+                    f"Mathematics Team – Eng. Mahmoud Adel"
+                )
+                ok, err = client.send_text(asst_phone, msg, retries=3)
+                if ok:
+                    sent_to.append(f"{asst_name}({asst_phone})")
+                else:
+                    errors.append(f"{asst_name}: {err}")
+                    try:
+                        enqueue_failed_whatsapp(db, asst_phone, "text", message_text=msg, last_error=err)
+                    except Exception:
+                        pass
+
+            with rt["lock"]:
+                if sent_to:
+                    rt["last_hw_sub_status"] = f"Sent to {', '.join(sent_to)} for {student_name} ({homework_title})"
+                    rt["last_action"] = f"HW Sub Alert -> {len(sent_to)} Assistant(s)"
+                else:
+                    rt["last_hw_sub_status"] = f"Failed (Queued Retry) for {student_name}: {'; '.join(errors)}"
+                    rt["last_error"] = f"Assistant HW Sub Alert Error: {'; '.join(errors)}"
+        except Exception as e:
+            with rt["lock"]:
+                rt["last_error"] = f"Assistant HW Sub Exception ({student_name}): {e}"
+                rt["last_hw_sub_status"] = f"Exception for {student_name}: {e}"
+
+    threading.Thread(target=_worker, daemon=True).start()
 
     def _worker():
         try:
