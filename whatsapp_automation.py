@@ -400,6 +400,7 @@ def init_automation_tables(db):
                 """
             )
             c.execute("ALTER TABLE whatsapp_retry_queue ADD COLUMN IF NOT EXISTS dedup_key TEXT")
+            c.execute("UPDATE whatsapp_retry_queue SET dedup_key = NULL WHERE dedup_key = ''")
             c.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_wa_queue_dedup "
                 "ON whatsapp_retry_queue (dedup_key) WHERE dedup_key IS NOT NULL"
@@ -609,7 +610,7 @@ def _safe_generate_student_pdf(
 
 
 # ---------------------------------------------------------------------------
-# Instant Homework Submission Alert to Assistant (Atomic Single-Send)
+# Outbound Queue & Retry Engine
 # ---------------------------------------------------------------------------
 def enqueue_failed_whatsapp(
     db,
@@ -630,8 +631,17 @@ def enqueue_failed_whatsapp(
     attempts: int = 1,
     dedup_key: str | None = None,
 ):
-    """Saves a failed text or PDF report into the DB so the 60s daemon retries it until delivered."""
+    """Saves a text or PDF report into the DB so the daemon sends/retries it until delivered."""
+    clean_dedup = str(dedup_key).strip() if dedup_key else None
     try:
+        if clean_dedup:
+            existing = db.execute_scalar(
+                "SELECT COUNT(*) FROM whatsapp_retry_queue WHERE dedup_key = %s",
+                (clean_dedup,),
+            )
+            if existing and int(existing) > 0:
+                return
+
         db.execute_query(
             """
             INSERT INTO whatsapp_retry_queue (
@@ -645,11 +655,11 @@ def enqueue_failed_whatsapp(
             (
                 recipient, message_type, message_text, kind, int(item_id or 0), str(student_id or ""),
                 student_name, item_title, float(score or 0), float(max_score or 0), float(perc or 0),
-                report_text or "", video_link or "", int(attempts), str(last_error or ""), dedup_key,
+                report_text or "", video_link or "", int(attempts), str(last_error or ""), clean_dedup,
             ),
         )
     except Exception as e:
-        print(f"[RetryQueue] Could not enqueue failed message for {recipient}: {e}")
+        print(f"[RetryQueue] Could not enqueue message for {recipient}: {e}")
 
 
 def enqueue_outbound(db, recipient, message_type, **kw):
@@ -659,8 +669,8 @@ def enqueue_outbound(db, recipient, message_type, **kw):
 
 def process_whatsapp_retry_queue(db, client: GowaClient, rt):
     """
-    Called every 60 seconds by `run_scheduled_checks_once`.
-    Retries any failed WhatsApp texts or PDF grade reports up to 15 times before expiring.
+    Called every 60 seconds by `run_scheduled_checks_once` (and immediately via `trigger_queue_drain_async`).
+    Drains `whatsapp_retry_queue` safely one row at a time up to 15 attempts.
     """
     with rt["lock"]:
         qlock = rt.setdefault("queue_lock", threading.Lock())
@@ -671,88 +681,109 @@ def process_whatsapp_retry_queue(db, client: GowaClient, rt):
             q_df = db.fetch_dataframe(
                 "SELECT * FROM whatsapp_retry_queue WHERE attempts < 15 ORDER BY queue_id ASC LIMIT 25"
             )
-        except Exception:
+        except Exception as e:
+            _record_scheduler_error(db, rt, f"Queue fetch error: {e}")
             return
 
         if q_df.empty:
             return
 
-        ok_awake, _ = client.ensure_awake(max_wait_seconds=30)
+        ok_awake, awake_msg = client.ensure_awake(max_wait_seconds=55)
         if not ok_awake:
+            _record_scheduler_error(db, rt, f"Queue paused (GOWA not awake): {awake_msg}")
             return
 
         t0 = time.time()
-        for _, row in q_df.iterrows():
+        for idx, (_, row) in enumerate(q_df.iterrows()):
             if time.time() - t0 > 45:
                 break
 
-            qid = int(row["queue_id"])
-            recipient = str(row["recipient"])
-            mtype = str(row["message_type"])
-            attempts = int(row.get("attempts") or 0)
+            try:
+                qid = int(row["queue_id"])
+                recipient = str(row["recipient"])
+                mtype = str(row["message_type"])
+                attempts = int(row.get("attempts") or 0)
 
-            db.execute_query(
-                "UPDATE whatsapp_retry_queue SET attempts = attempts + 1 WHERE queue_id = %s",
-                (qid,),
-            )
-
-            if mtype == "text":
-                ok, err = client.send_text(recipient, str(row.get("message_text") or ""), retries=1)
-            elif mtype == "pdf_grade":
-                kind = str(row.get("kind") or "homework")
-                item_id = int(row.get("item_id") or 0)
-                student_id = str(row.get("student_id") or "")
-                student_name = str(row.get("student_name") or "")
-                item_title = str(row.get("item_title") or "")
-                score = float(row.get("score") or 0.0)
-                max_score = float(row.get("max_score") or 1.0)
-                perc = float(row.get("perc") or 0.0)
-                report_text = str(row.get("report_text") or "")
-                video_link = str(row.get("video_link") or "") or None
-                msg_txt = str(row.get("message_text") or "")
-                caption_str = msg_txt if msg_txt else f"📄 {student_name} — {item_title}"
-
-                # Fetch stored report_image from DB if available
-                img_bytes = None
-                try:
-                    table = "homework_grades" if kind == "homework" else "quiz_grades"
-                    icol = "homework_id" if kind == "homework" else "quiz_id"
-                    img_df = db.fetch_dataframe(
-                        f"SELECT report_image FROM {table} WHERE {icol} = %s AND student_id = %s",
-                        (item_id, student_id),
-                    )
-                    if not img_df.empty and img_df.iloc[0, 0] is not None and not isinstance(img_df.iloc[0, 0], float):
-                        img_bytes = bytes(img_df.iloc[0, 0])
-                except Exception:
-                    pass
-
-                pdf_bytes = _safe_generate_student_pdf(
-                    student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link
-                )
-                if pdf_bytes:
-                    pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
-                    ok, err = client.send_pdf(
-                        recipient, pdf_bytes, pdf_filename, caption=caption_str, retries=1
-                    )
-                else:
-                    ok, err = client.send_text(recipient, caption_str, retries=1)
-            else:
-                ok, err = True, "Unknown type"
-
-            if ok:
-                db.execute_query("DELETE FROM whatsapp_retry_queue WHERE queue_id = %s", (qid,))
-                _record_scheduler_action(db, rt, f"Queue Sent -> {recipient} ({mtype})")
-            else:
                 db.execute_query(
-                    "UPDATE whatsapp_retry_queue SET last_error = %s WHERE queue_id = %s",
-                    (str(err)[:200], qid),
+                    "UPDATE whatsapp_retry_queue SET attempts = attempts + 1 WHERE queue_id = %s",
+                    (qid,),
                 )
-                _record_scheduler_error(db, rt, f"Attempt #{attempts + 1} failed for {recipient}: {err}")
-            time.sleep(2)
+
+                if mtype == "text":
+                    ok, err = client.send_text(recipient, str(row.get("message_text") or ""), retries=1)
+                elif mtype == "pdf_grade":
+                    kind = str(row.get("kind") or "homework")
+                    item_id = int(row.get("item_id") or 0)
+                    student_id = str(row.get("student_id") or "")
+                    student_name = str(row.get("student_name") or "")
+                    item_title = str(row.get("item_title") or "")
+                    score = float(row.get("score") or 0.0)
+                    max_score = float(row.get("max_score") or 1.0)
+                    perc = float(row.get("perc") or 0.0)
+                    report_text = str(row.get("report_text") or "")
+                    video_link = str(row.get("video_link") or "") or None
+                    msg_txt = str(row.get("message_text") or "")
+                    caption_str = msg_txt if msg_txt else f"📄 {student_name} — {item_title}"
+
+                    # Fetch stored report_image from DB if available
+                    img_bytes = None
+                    try:
+                        table = "homework_grades" if kind == "homework" else "quiz_grades"
+                        icol = "homework_id" if kind == "homework" else "quiz_id"
+                        img_df = db.fetch_dataframe(
+                            f"SELECT report_image FROM {table} WHERE {icol} = %s AND student_id = %s",
+                            (item_id, student_id),
+                        )
+                        if not img_df.empty and img_df.iloc[0, 0] is not None and not isinstance(img_df.iloc[0, 0], float):
+                            img_bytes = bytes(img_df.iloc[0, 0])
+                    except Exception:
+                        pass
+
+                    pdf_bytes = _safe_generate_student_pdf(
+                        student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link
+                    )
+                    if pdf_bytes:
+                        pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
+                        ok, err = client.send_pdf(
+                            recipient, pdf_bytes, pdf_filename, caption=caption_str, retries=1
+                        )
+                    else:
+                        ok, err = client.send_text(recipient, caption_str, retries=1)
+                else:
+                    ok, err = True, "Unknown type"
+
+                if ok:
+                    db.execute_query("DELETE FROM whatsapp_retry_queue WHERE queue_id = %s", (qid,))
+                    _record_scheduler_action(db, rt, f"Queue Sent -> {recipient} ({mtype})")
+                else:
+                    db.execute_query(
+                        "UPDATE whatsapp_retry_queue SET last_error = %s WHERE queue_id = %s",
+                        (str(err)[:200], qid),
+                    )
+                    _record_scheduler_error(db, rt, f"Attempt #{attempts + 1} failed for {recipient}: {err}")
+            except Exception as row_err:
+                _record_scheduler_error(db, rt, f"Row drain exception: {row_err}")
+
+            if idx < len(q_df) - 1:
+                time.sleep(3)
     finally:
         qlock.release()
 
 
+def trigger_queue_drain_async(db):
+    """Immediately starts a background drain of whatsapp_retry_queue if one isn't already running."""
+    rt = get_daemon_runtime()
+    client = GowaClient.from_secrets(db)
+    threading.Thread(
+        target=process_whatsapp_retry_queue,
+        args=(db, client, rt),
+        daemon=True,
+    ).start()
+
+
+# ---------------------------------------------------------------------------
+# Instant Homework Submission Alert to Assistant (Atomic Single-Send)
+# ---------------------------------------------------------------------------
 def trigger_hw_submission_assistant_whatsapp(
     db,
     student_id: str,
@@ -865,7 +896,7 @@ def trigger_post_grade_whatsapp(
     """
     Runs immediately after an admin clicks Save Grade.
     Enqueues deduplicated grade reports into `whatsapp_retry_queue` synchronously
-    so the background daemon dispatches them steadily.
+    and triggers an immediate background queue drain.
     """
     _sync_secrets_to_cache_and_db(db)
     rt = get_daemon_runtime()
@@ -930,1083 +961,4 @@ def trigger_post_grade_whatsapp(
         parent_msg = corr_prefix + emoji.emojize(
             f":bar_chart: درجة الـ {item_title}\n\n"
             f"ولي الأمر الكريم،\n"
-            f"نحيط حضرتكم علمًا بأن الطالب *{student_name}* حصل على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n\n"
-            f"مرفق لحضرتكم تقرير الأداء التفصيلي (PDF).\n"
-            f"نتمنى له مزيدًا من التقدم والنجاح! :glowing_star:\n\n"
-            f"Mathematics Team – Eng. Mahmoud Adel"
-        )
-
-        stu_msg = corr_prefix + emoji.emojize(
-            f":bar_chart: درجة الـ {item_title}\n\n"
-            f"أهلاً بك يا *{student_name}*،\n"
-            f"لقد حصلت على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n"
-            f"مرفق تقرير الملاحظات الخاص بك. استمر في الاجتهاد! :glowing_star:\n\n"
-            f"Mathematics Team – Eng. Mahmoud Adel"
-        )
-
-        if parent_phone:
-            key = f"{prefix_key}{score_str}_{parent_phone}"
-            if claim_dispatch(db, key):
-                enqueue_outbound(
-                    db, parent_phone, "pdf_grade", message_text=parent_msg, kind=kind, item_id=int(item_id),
-                    student_id=str(student_id), student_name=student_name, item_title=item_title,
-                    score=float(score), max_score=float(max_score), perc=float(perc),
-                    report_text=report_text or "", video_link=video_link or "",
-                )
-                queued += 1
-
-        if student_phone and (also_student or not parent_phone):
-            key = f"{prefix_key}{score_str}_{student_phone}"
-            if claim_dispatch(db, key):
-                enqueue_outbound(
-                    db, student_phone, "pdf_grade", message_text=stu_msg, kind=kind, item_id=int(item_id),
-                    student_id=str(student_id), student_name=student_name, item_title=item_title,
-                    score=float(score), max_score=float(max_score), perc=float(perc),
-                    report_text=report_text or "", video_link=video_link or "",
-                )
-                queued += 1
-
-    if grade_assistants:
-        for asst_name, asst_phone in grade_assistants:
-            asst_msg = corr_prefix + emoji.emojize(
-                f":check_mark_button: *تم رصد درجة جديدة*\n\n"
-                f"👩‍🏫 *إشعار يا {asst_name}:*\n"
-                f"تم تصحيح {type_label}: *{item_title}*\n"
-                f"الطالب: *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*)\n"
-                f"الدرجة: *{score_str} / {max_str}* ({perc:.1f}%)"
-            )
-            asst_key = f"{prefix_key}{score_str}_asst_{asst_phone}"
-            if claim_dispatch(db, asst_key):
-                enqueue_outbound(db, asst_phone, "text", message_text=asst_msg)
-                queued += 1
-
-    with rt["lock"]:
-        rt["last_grade_status"] = f"{student_name}: queued {queued} message(s)"
-        rt["last_action"] = f"Post-Grade -> {student_name}"
-
-
-# ---------------------------------------------------------------------------
-# Reusable Morning Schedule Builder & Sender
-# ---------------------------------------------------------------------------
-def send_morning_schedule_to_teacher(
-    db, client: GowaClient, teacher_phone_clean: str, now: datetime.datetime, dedupe_assistants: bool = False
-) -> tuple[bool, str]:
-    """Builds and sends today's morning schedule + exciting sentence to the teacher and eligible assistants."""
-    today_str = now.strftime("%Y-%m-%d")
-    today_day = now.strftime("%a")
-
-    meetings_df = db.fetch_dataframe(
-        """
-        SELECT m.meeting_id, TRIM(m.group_number) AS group_number, m.day_of_week, m.meeting_time,
-               COALESCE(c.latest_hw_id, (SELECT MAX(homework_id) FROM homeworks)) AS latest_hw_id,
-               COALESCE(c.latest_quiz_id, (SELECT MAX(quiz_id) FROM quizzes)) AS latest_quiz_id
-        FROM group_meeting_times m
-        LEFT JOIN group_automation_config c ON TRIM(m.group_number) = TRIM(c.group_number)
-        WHERE m.day_of_week = %s
-        ORDER BY m.meeting_time ASC
-        """,
-        (today_day,),
-    )
-
-    hw_map = {}
-    hw_df = db.fetch_dataframe("SELECT homework_id, title FROM homeworks")
-    for _, r in hw_df.iterrows():
-        hw_map[int(r["homework_id"])] = str(r["title"])
-
-    qz_map = {}
-    qz_df = db.fetch_dataframe("SELECT quiz_id, title FROM quizzes")
-    for _, r in qz_df.iterrows():
-        qz_map[int(r["quiz_id"])] = str(r["title"])
-
-    exciting_line = random.choice(EXCITING_MORNING_SENTENCES)
-
-    if meetings_df.empty:
-        msg = (
-            f"☀️ *Good Morning, Eng. Mahmoud Adel!*\n"
-            f"📅 *Date:* {today_str} ({DAY_FULL_NAMES.get(today_day, today_day)})\n\n"
-            f"You have *no scheduled group sessions* registered for today.\n\n"
-            f"{exciting_line}"
-        )
-    else:
-        lines = [
-            f"☀️ *Good Morning, Eng. Mahmoud Adel!*",
-            f"📅 *Today's Schedule — {DAY_FULL_NAMES.get(today_day, today_day)} ({today_str}):*\n",
-        ]
-        for _, m_row in meetings_df.iterrows():
-            grp = m_row["group_number"]
-            mtime = m_row["meeting_time"]
-            hw_id = m_row.get("latest_hw_id")
-            qz_id = m_row.get("latest_quiz_id")
-            hw_label = hw_map.get(int(hw_id), "Not Set") if pd.notna(hw_id) else "Not Set"
-            qz_label = qz_map.get(int(qz_id), "Not Set") if pd.notna(qz_id) else "Not Set"
-            lines.append(
-                f"🕒 *{mtime}* — *Group {grp}*\n"
-                f"   • 📝 HW: {hw_label}\n"
-                f"   • 📊 Quiz: {qz_label}"
-            )
-        lines.append(f"\n{exciting_line}")
-        msg = "\n".join(lines)
-
-    # 1. Send to the Teacher
-    ok, err = client.send_text(teacher_phone_clean, msg)
-    if not ok:
-        return False, err
-
-    # 2. Send to eligible Assistants
-    try:
-        asst_recipients = get_eligible_assistants(db, "notify_daily_schedule")
-        for asst_name, asst_phone in asst_recipients:
-            if teacher_phone_clean and asst_phone == teacher_phone_clean:
-                continue
-            key = f"morning_asst_{today_str}_{asst_phone}"
-            if dedupe_assistants and not claim_dispatch(db, key):
-                continue
-            asst_msg = msg.replace("Eng. Mahmoud Adel", asst_name)
-            ok_a, err_a = client.send_text(asst_phone, asst_msg)
-            if not ok_a:
-                enqueue_outbound(db, asst_phone, "text", message_text=asst_msg, last_error=err_a)
-    except Exception as e:
-        print(f"Failed to send schedule to assistants: {e}")
-
-    return ok, err
-
-
-# ---------------------------------------------------------------------------
-# Background Scheduler Tick
-# ---------------------------------------------------------------------------
-def _parse_hhmm_tolerant(time_str: str, default_hr: int = 8, default_min: int = 0) -> tuple[int, int]:
-    try:
-        m = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{1,2})", str(time_str or ""))
-        if m:
-            hr, mn = int(m.group(1)), int(m.group(2))
-            if 0 <= hr <= 23 and 0 <= mn <= 59:
-                return hr, mn
-    except Exception:
-        pass
-    return default_hr, default_min
-
-
-def _record_scheduler_action(db, rt, action_msg: str):
-    with rt["lock"]:
-        rt["last_action"] = action_msg
-    try:
-        set_bot_setting(db, "last_scheduler_action", action_msg)
-    except Exception:
-        pass
-
-
-def _record_scheduler_error(db, rt, err_msg: str):
-    with rt["lock"]:
-        rt["last_error"] = err_msg
-    try:
-        set_bot_setting(db, "last_scheduler_error", err_msg)
-    except Exception:
-        pass
-
-
-def _run_claimed_job(db, rt, key, label, fn):
-    """Claim key, run fn(); release the key on failure OR exception so the next tick retries."""
-    if not claim_dispatch(db, key):
-        return
-    ok = False
-    try:
-        ok = bool(fn())
-    except Exception as e:
-        _record_scheduler_error(db, rt, f"{label} exception: {e}")
-    if ok:
-        _record_scheduler_action(db, rt, f"Sent {label}")
-    else:
-        release_dispatch(db, key)
-        _record_scheduler_error(db, rt, f"{label} failed (will retry next tick)")
-
-
-def run_scheduled_checks_once(db):
-    rt = get_daemon_runtime()
-    now = datetime.datetime.now(CAIRO_TZ)
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    today_str = now.strftime("%Y-%m-%d")
-    today_day = now.strftime("%a")
-
-    with rt["lock"]:
-        rt["last_tick"] = now_str
-        rt["last_tick_ts"] = time.time()
-
-    try:
-        set_bot_setting(db, "last_scheduler_tick", now_str)
-    except Exception as e:
-        print(f"[Scheduler] Warning: could not persist last_scheduler_tick: {e}")
-
-    teacher_phone_clean = get_resolved_teacher_phone(db)
-    assistant_phone_clean = get_resolved_assistant_phone(db)
-    client = GowaClient.from_secrets(db)
-
-    try:
-        process_whatsapp_retry_queue(db, client, rt)
-    except Exception as e:
-        _record_scheduler_error(db, rt, f"Queue drain error: {e}")
-
-    morning_time_str = get_bot_setting(db, "morning_schedule_time", "08:00")
-    m_hr, m_min = _parse_hhmm_tolerant(morning_time_str, default_hr=8, default_min=0)
-    morning_dt = now.replace(hour=m_hr, minute=m_min, second=0, microsecond=0)
-
-    morning_key = f"morning_sched_{today_str}"
-    if not teacher_phone_clean:
-        print("[Scheduler] Morning schedule skipped: teacher phone not configured.")
-    elif now >= morning_dt and (now - morning_dt).total_seconds() <= 28800:
-        _run_claimed_job(
-            db,
-            rt,
-            morning_key,
-            f"Morning Schedule ({today_str})",
-            lambda: send_morning_schedule_to_teacher(
-                db, client, teacher_phone_clean, now, dedupe_assistants=True
-            )[0],
-        )
-
-    meetings_df = db.fetch_dataframe(
-        """
-        SELECT m.meeting_id, TRIM(m.group_number) AS group_number, m.day_of_week, m.meeting_time,
-               COALESCE(c.latest_hw_id, (SELECT MAX(homework_id) FROM homeworks)) AS latest_hw_id,
-               COALESCE(c.latest_quiz_id, (SELECT MAX(quiz_id) FROM quizzes)) AS latest_quiz_id,
-               c.wa_group_jid
-        FROM group_meeting_times m
-        LEFT JOIN group_automation_config c ON TRIM(m.group_number) = TRIM(c.group_number)
-        WHERE m.day_of_week = %s
-        ORDER BY m.meeting_time ASC
-        """,
-        (today_day,),
-    )
-    if meetings_df.empty:
-        return
-
-    hw_map = {}
-    hw_df = db.fetch_dataframe("SELECT homework_id, title, total_questions FROM homeworks")
-    for _, r in hw_df.iterrows():
-        hw_map[int(r["homework_id"])] = (str(r["title"]), int(r["total_questions"]))
-
-    qz_map = {}
-    qz_df = db.fetch_dataframe("SELECT quiz_id, title, max_score FROM quizzes")
-    for _, r in qz_df.iterrows():
-        qz_map[int(r["quiz_id"])] = (str(r["title"]), float(r["max_score"]))
-
-    for _, m_row in meetings_df.iterrows():
-        grp = str(m_row.get("group_number", "")).strip()
-        mtime = str(m_row.get("meeting_time", "")).strip()
-        try:
-            try:
-                hr, mn = [int(x) for x in mtime.split(":")[:2]]
-                lecture_dt = now.replace(hour=hr, minute=mn, second=0, microsecond=0)
-            except Exception:
-                continue
-
-            minutes_until_lecture = (lecture_dt - now).total_seconds() / 60.0
-            hw_id = int(m_row["latest_hw_id"]) if pd.notna(m_row.get("latest_hw_id")) else None
-            qz_id = int(m_row["latest_quiz_id"]) if pd.notna(m_row.get("latest_quiz_id")) else None
-
-            done10 = f"teacher10_done_{today_str}_{grp}_{mtime}"
-            if teacher_phone_clean and -5 <= minutes_until_lecture <= 15 and not has_dispatched(db, done10):
-                if send_group_master_reports_to_teacher(
-                    db, client, teacher_phone_clean, grp, mtime, hw_id, qz_id, hw_map, qz_map, today_str=today_str
-                ):
-                    mark_dispatched(db, done10)
-                    _record_scheduler_action(db, rt, f"Sent 10-min Report for Group {grp}")
-
-            done_key = f"6hr_done_{today_str}_{grp}_hw{hw_id}"
-            if hw_id and 300 <= minutes_until_lecture <= 380 and not has_dispatched(db, done_key):
-                if send_6hr_unsubmitted_reminders(
-                    db, client, grp, mtime, hw_id, qz_id, hw_map, qz_map, use_keys=True
-                ):
-                    mark_dispatched(db, done_key)
-                    _record_scheduler_action(db, rt, f"Sent 6-hr Reminders for Group {grp}")
-        except Exception as e:
-            _record_scheduler_error(db, rt, f"Group {grp} {mtime}: {e}")
-            continue
-
-
-def send_group_master_reports_to_teacher(
-    db, client: GowaClient, teacher_phone: str, grp: str, mtime: str,
-    hw_id: int | None, qz_id: int | None, hw_map: dict, qz_map: dict,
-    today_str: str | None = None,
-) -> bool:
-    students_df = db.fetch_dataframe(
-        "SELECT id, name FROM students WHERE TRIM(group_number) = %s ORDER BY name ASC",
-        (grp,),
-    )
-    if students_df.empty:
-        return True
-
-    use_keys = today_str is not None
-
-    def _claim(suffix):
-        return (not use_keys) or claim_dispatch(db, f"teacher10_{today_str}_{grp}_{mtime}_{suffix}")
-
-    def _release(suffix):
-        if use_keys:
-            release_dispatch(db, f"teacher10_{today_str}_{grp}_{mtime}_{suffix}")
-
-    all_ok = True
-
-    if _claim("intro"):
-        intro_msg = (
-            f"⏰ *Upcoming Session in 10 Minutes!*\n"
-            f"👥 *Group:* {grp} (at {mtime})\n"
-            f"👨‍🎓 *Enrolled Students:* {len(students_df)}\n"
-            f"Here are the latest Homework & Quiz reports for this group:"
-        )
-        ok_intro, _ = client.send_text(teacher_phone, intro_msg)
-        if not ok_intro:
-            _release("intro")
-            all_ok = False
-
-    if hw_id and hw_id in hw_map and _claim("hw"):
-        hw_title, hw_total = hw_map[hw_id]
-        g_df = db.fetch_dataframe(
-            "SELECT student_id, correct_answers, percentage, COALESCE(submitted, FALSE) as submitted "
-            "FROM homework_grades WHERE homework_id = %s",
-            (hw_id,),
-        )
-        merged = students_df.merge(g_df, left_on="id", right_on="student_id", how="left")
-        records = [
-            (
-                r["id"],
-                r["name"],
-                r["correct_answers"] if pd.notna(r["correct_answers"]) else ("Submitted" if r.get("submitted") else None),
-                r["percentage"] if pd.notna(r["percentage"]) else None,
-            )
-            for _, r in merged.iterrows()
-        ]
-        submitted_cnt = int(
-            (merged["correct_answers"].notna() | merged["submitted"].fillna(False)).sum()
-        )
-        pdf_buf = PDFGenerator.generate_master_report(
-            f"{hw_title} (Group {grp})", hw_total, records
-        )
-        caption = (
-            f"📚 *Homework Report — Group {grp}*\n"
-            f"📌 *Assignment:* {hw_title}\n"
-            f"✅ *Submitted/Graded:* {submitted_cnt} / {len(students_df)}"
-        )
-        ok_hw_pdf, _ = client.send_pdf(
-            teacher_phone,
-            pdf_buf.getvalue(),
-            f"Group_{grp}_HW_{hw_id}_Report.pdf",
-            caption=caption,
-        )
-        if not ok_hw_pdf:
-            _release("hw")
-            all_ok = False
-
-    if qz_id and qz_id in qz_map and _claim("qz"):
-        qz_title, qz_max = qz_map[qz_id]
-        qg_df = db.fetch_dataframe(
-            "SELECT student_id, score, percentage FROM quiz_grades WHERE quiz_id = %s",
-            (qz_id,),
-        )
-        merged_q = students_df.merge(qg_df, left_on="id", right_on="student_id", how="left")
-        records_q = [
-            (
-                r["id"],
-                r["name"],
-                r["score"] if pd.notna(r["score"]) else None,
-                r["percentage"] if pd.notna(r["percentage"]) else None,
-            )
-            for _, r in merged_q.iterrows()
-        ]
-        attended_cnt = int(merged_q["score"].notna().sum())
-        pdf_buf_q = PDFGenerator.generate_master_report(
-            f"{qz_title} (Group {grp})", qz_max, records_q
-        )
-        caption_q = (
-            f"📝 *Quiz Report — Group {grp}*\n"
-            f"📌 *Quiz:* {qz_title}\n"
-            f"✅ *Graded:* {attended_cnt} / {len(students_df)}"
-        )
-        ok_qz_pdf, _ = client.send_pdf(
-            teacher_phone,
-            pdf_buf_q.getvalue(),
-            f"Group_{grp}_Quiz_{qz_id}_Report.pdf",
-            caption=caption_q,
-        )
-        if not ok_qz_pdf:
-            _release("qz")
-            all_ok = False
-
-    return all_ok
-
-
-def send_6hr_unsubmitted_reminders(
-    db, client: GowaClient, grp: str, mtime: str,
-    hw_id: int | None, qz_id: int | None, hw_map: dict, qz_map: dict,
-    use_keys: bool = True,
-) -> bool:
-    """True when every unsubmitted student has been handled (sent earlier, sent now, or has no phone)."""
-    if not hw_id or hw_id not in hw_map:
-        return True            # nothing to remind about; do NOT return False (it caused retries every minute)
-
-    students_df = db.fetch_dataframe(
-        "SELECT id, name, phone, phone_parent FROM students WHERE TRIM(group_number) = %s",
-        (grp,),
-    )
-    if students_df.empty:
-        return True
-
-    hw_title, _ = hw_map[hw_id]
-    qz_title = qz_map[qz_id][0] if (qz_id and qz_id in qz_map) else None
-
-    g_df = db.fetch_dataframe(
-        "SELECT student_id, correct_answers, COALESCE(submitted, FALSE) AS submitted "
-        "FROM homework_grades WHERE homework_id = %s",
-        (hw_id,),
-    )
-    submitted_ids = set()
-    for _, r in g_df.iterrows():
-        if pd.notna(r["correct_answers"]) or bool(r["submitted"]):
-            submitted_ids.add(str(r["student_id"]))
-
-    unsubmitted_rows = [
-        stu for _, stu in students_df.iterrows()
-        if str(stu["id"]) not in submitted_ids
-    ]
-    if not unsubmitted_rows:
-        return True
-
-    today = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
-    all_handled = True
-    consecutive_fail = 0
-    for stu in unsubmitted_rows:
-        sid = str(stu["id"])
-        stu_name = str(stu["name"])
-        stu_phone = clean_wa_phone(stu.get("phone"))
-        if not stu_phone:
-            continue
-        key = f"6hr_{today}_{grp}_hw{hw_id}_stu{sid}"
-        if use_keys and not claim_dispatch(db, key):
-            continue           # already sent earlier today
-
-        quiz_line = f"\n📌 تذكير أيضًا بمراجعة اختبار: *{qz_title}*" if qz_title else ""
-
-        reminder_msg = emoji.emojize(
-            f":hourglass_not_done: *تذكير بموعد الحصة والواجب (باقي 6 ساعات)*\n\n"
-            f"أهلاً بك يا *{stu_name}*،\n"
-            f"نذكرك بموعد حصتك اليوم الساعة *{mtime}* (مجموعة {grp})، ولم يتم حتى الآن تسجيل تسليمك في واجب:\n"
-            f"📘 *{hw_title}*{quiz_line}\n\n"
-            f"برجاء سرعة رفع الواجب على المنصة قبل موعد الحصة.\n\n"
-            f"Mathematics Team – Eng. Mahmoud Adel"
-        )
-        ok, err = client.send_text(stu_phone, reminder_msg)
-        if ok:
-            consecutive_fail = 0
-            time.sleep(4)
-        else:
-            if use_keys:
-                release_dispatch(db, key)   # only this student is retried next tick
-            all_handled = False
-            consecutive_fail += 1
-            if consecutive_fail >= 3:
-                break          # GOWA is probably down; stop hammering, next tick resumes
-
-    return all_handled
-
-
-def start_background_automation_daemon(db):
-    """Starts a single background daemon thread across the Streamlit server process."""
-    init_automation_tables(db)
-    _sync_secrets_to_cache_and_db(db)
-    rt = get_daemon_runtime()
-
-    with rt["lock"]:
-        if rt.get("daemon_started"):
-            return
-        rt["daemon_started"] = True
-
-    def _daemon_loop():
-        while True:
-            try:
-                run_scheduled_checks_once(db)
-            except Exception as e:
-                with rt["lock"]:
-                    rt["last_error"] = f"Daemon loop error: {e}"
-            time.sleep(60)
-
-    threading.Thread(target=_daemon_loop, daemon=True, name="WhatsAppAutomationDaemon").start()
-
-
-# ---------------------------------------------------------------------------
-# UI Renderer for the "🤖 Automated Messages" Tab
-# ---------------------------------------------------------------------------
-class AutomatedMessagesView:
-    def __init__(self, db):
-        self.db = db
-        init_automation_tables(self.db)
-        _sync_secrets_to_cache_and_db(self.db)
-
-    def render(self):
-        st.subheader("🤖 Automated WhatsApp Bot & Group Schedules")
-        st.caption(
-            "Configure group lecture timings, assign each group's latest Homework & Quiz, "
-            "and manage automated teacher/assistant/student/parent WhatsApp notifications."
-        )
-
-        rt = get_daemon_runtime()
-        now_dt = datetime.datetime.now(CAIRO_TZ)
-        now_cairo = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-        db_last_tick = get_bot_setting(self.db, "last_scheduler_tick", "")
-        db_last_action = get_bot_setting(self.db, "last_scheduler_action", "")
-        db_last_error = get_bot_setting(self.db, "last_scheduler_error", "")
-
-        with rt["lock"]:
-            d_tick = db_last_tick or rt.get("last_tick") or "No tick recorded yet"
-            d_action = db_last_action or rt.get("last_action", "Initialized — waiting for first check...")
-            d_grade = rt.get("last_grade_status", "No grade saved in this session yet.")
-            d_hw_sub = rt.get("last_hw_sub_status", "No homework submission alert sent in this session yet.")
-            d_err = db_last_error or rt.get("last_error")
-
-        scheduler_active = False
-        if db_last_tick:
-            try:
-                tick_dt = datetime.datetime.strptime(db_last_tick, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CAIRO_TZ)
-                if (now_dt - tick_dt).total_seconds() < 15 * 60:
-                    scheduler_active = True
-            except Exception:
-                scheduler_active = False
-
-        try:
-            q_pending = int(
-                self.db.execute_scalar("SELECT COUNT(*) FROM whatsapp_retry_queue WHERE attempts < 15") or 0
-            )
-        except Exception:
-            q_pending = 0
-        try:
-            q_expired = int(
-                self.db.execute_scalar("SELECT COUNT(*) FROM whatsapp_retry_queue WHERE attempts >= 15") or 0
-            )
-        except Exception:
-            q_expired = 0
-
-        status_col1, status_col2, status_col3 = st.columns(3)
-        status_label = (
-            "🟢 **Scheduler: Active**"
-            if scheduler_active
-            else "🔴 **Scheduler: Idle/Inactive**"
-        )
-        status_col1.caption(f"{status_label} | 🕒 `{now_cairo}`")
-        status_col2.caption(f"🔄 **Last Check:** `{d_tick}`")
-        status_col3.caption(f"📌 **Last Event:** `{d_action}`")
-        st.caption(
-            f"📨 **Last Post-Grade Auto-Send:** `{d_grade}` | "
-            f"📥 **Last Assistant HW Sub Alert:** `{d_hw_sub}` | "
-            f"📤 **Pending outbound:** `{q_pending}` | ⚠️ **Failed (expired):** `{q_expired}`"
-        )
-        if d_err:
-            st.warning(f"⚠️ Last Background Warning/Error: `{d_err}`")
-
-        tab_sched, tab_broadcast, tab_settings = st.tabs([
-            "📅 Group Schedules & Auto-Bot",
-            "📢 Manual Broadcast (Private or Group)",
-            "⚙️ Bot & Teacher Settings",
-        ])
-
-        students_df = self.db.fetch_dataframe(
-            "SELECT id, name, phone, phone_parent, group_number FROM students ORDER BY name ASC"
-        )
-        groups = sorted({
-            str(g).strip()
-            for g in students_df["group_number"].dropna().unique()
-            if str(g).strip()
-        }) if not students_df.empty else []
-
-        hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions FROM homeworks ORDER BY homework_id DESC")
-        qz_df = self.db.fetch_dataframe("SELECT quiz_id, title, max_score FROM quizzes ORDER BY quiz_id DESC")
-
-        # Determine the global latest Homework and Quiz IDs (for automatic fallback)
-        default_latest_hw_id = int(hw_df.iloc[0]["homework_id"]) if not hw_df.empty else None
-        default_latest_qz_id = int(qz_df.iloc[0]["quiz_id"]) if not qz_df.empty else None
-        default_hw_title = str(hw_df.iloc[0]["title"]) if not hw_df.empty else "None"
-        default_qz_title = str(qz_df.iloc[0]["title"]) if not qz_df.empty else "None"
-
-        hw_options = {0: f"🔄 Auto (Latest: {default_hw_title})"}
-        for _, r in hw_df.iterrows():
-            hw_options[int(r["homework_id"])] = str(r["title"])
-
-        qz_options = {0: f"🔄 Auto (Latest: {default_qz_title})"}
-        for _, r in qz_df.iterrows():
-            qz_options[int(r["quiz_id"])] = str(r["title"])
-
-        # ===================================================================
-        # TAB 1: GROUP SCHEDULE TABLE
-        # ===================================================================
-        with tab_sched:
-            if not groups:
-                st.warning("No student groups exist yet. Add students with group numbers first.")
-            else:
-                configs_df = self.db.fetch_dataframe("SELECT * FROM group_automation_config")
-                configs_map = {
-                    str(r["group_number"]).strip(): r
-                    for _, r in configs_df.iterrows()
-                }
-                meetings_df = self.db.fetch_dataframe(
-                    "SELECT meeting_id, group_number, day_of_week, meeting_time "
-                    "FROM group_meeting_times ORDER BY meeting_time ASC"
-                )
-
-                st.markdown("#### 📋 Master Group Schedule & Pace Overview")
-                overview_rows = []
-                for g in groups:
-                    g_meetings = meetings_df[meetings_df["group_number"].astype(str).str.strip() == g]
-                    if g_meetings.empty:
-                        timings_str = "No timings added yet"
-                    else:
-                        timings_str = " | ".join(
-                            f"{r['day_of_week']} {r['meeting_time']}"
-                            for _, r in g_meetings.iterrows()
-                        )
-                    cfg_row = configs_map.get(g, {})
-                    eff_hw, eff_qz, is_hw_man, is_qz_man = get_effective_group_pace(
-                        cfg_row, default_latest_hw_id, default_latest_qz_id
-                    )
-                    hw_disp = hw_options.get(eff_hw, "— None —") if eff_hw else "— None —"
-                    qz_disp = qz_options.get(eff_qz, "— None —") if eff_qz else "— None —"
-                    if eff_hw and not is_hw_man:
-                        hw_disp = f"🔄 {hw_disp} (Auto)"
-                    if eff_qz and not is_qz_man:
-                        qz_disp = f"🔄 {qz_disp} (Auto)"
-
-                    overview_rows.append({
-                        "Group": f"Group {g}",
-                        "Scheduled Timings": timings_str,
-                        "Active Homework": hw_disp,
-                        "Active Quiz": qz_disp,
-                    })
-                st.dataframe(pd.DataFrame(overview_rows), hide_index=True, use_container_width=True)
-
-                st.divider()
-
-                col_left, col_right = st.columns([1.2, 1.3])
-
-                with col_left:
-                    with st.container(border=True):
-                        st.markdown("#### 🕒 Add / Remove Group Lecture Timings")
-                        st.caption("You can add multiple meeting days and times to the same group.")
-                        sel_grp_time = str(
-                            st.selectbox("Select Group", groups, key="sched_grp_sel")
-                        ).strip()
-
-                        c_d, c_t = st.columns(2)
-                        with c_d:
-                            sel_days = st.multiselect(
-                                "Day(s) of Week",
-                                DAYS_OF_WEEK,
-                                default=["Sat"],
-                                format_func=lambda d: f"{d} ({DAY_FULL_NAMES[d]})",
-                                key=f"sched_days_{sel_grp_time}",
-                            )
-                        with c_t:
-                            sel_time = st.time_input(
-                                "Lecture Start Time",
-                                value=datetime.time(16, 0),
-                                step=datetime.timedelta(minutes=15),
-                                key=f"sched_time_{sel_grp_time}",
-                            )
-
-                        if st.button(
-                            f"➕ Add Timing(s) to Group {sel_grp_time}",
-                            type="primary",
-                            use_container_width=True,
-                            key=f"btn_add_time_{sel_grp_time}",
-                        ):
-                            if not sel_days:
-                                st.error("Please select at least one day.")
-                            else:
-                                t_str = sel_time.strftime("%H:%M")
-                                for d in sel_days:
-                                    self.db.execute_query(
-                                        """
-                                        INSERT INTO group_meeting_times (group_number, day_of_week, meeting_time)
-                                        VALUES (%s, %s, %s) ON CONFLICT DO NOTHING
-                                        """,
-                                        (sel_grp_time, d, t_str),
-                                    )
-                                st.success(f"Added {', '.join(sel_days)} at {t_str} to Group {sel_grp_time}!")
-                                st.rerun()
-
-                        grp_m = meetings_df[
-                            meetings_df["group_number"].astype(str).str.strip() == sel_grp_time
-                        ]
-                        st.markdown(f"**Current Timings for Group {sel_grp_time}:**")
-                        if grp_m.empty:
-                            st.caption(f"No lecture timings added for Group {sel_grp_time} yet.")
-                        else:
-                            for _, mr in grp_m.iterrows():
-                                mc1, mc2 = st.columns([3, 1])
-                                mc1.write(
-                                    f"• **{DAY_FULL_NAMES.get(mr['day_of_week'], mr['day_of_week'])}** at `{mr['meeting_time']}`"
-                                )
-                                if mc2.button("🗑️", key=f"del_m_{mr['meeting_id']}"):
-                                    self.db.execute_query(
-                                        "DELETE FROM group_meeting_times WHERE meeting_id = %s",
-                                        (int(mr["meeting_id"]),),
-                                    )
-                                    st.rerun()
-
-                with col_right:
-                    with st.container(border=True):
-                        st.markdown("#### 📌 Set Latest Homework & Latest Quiz per Group")
-                        st.caption(
-                            "Defaults to **🔄 Auto (Latest Created)** automatically unless you manually select a specific Homework or Quiz for a group."
-                        )
-                        target_grp = str(
-                            st.selectbox("Select Group to Configure", groups, key="cfg_grp_sel")
-                        ).strip()
-                        cur_cfg = configs_map.get(target_grp, {})
-                        init_hw = (
-                            int(cur_cfg["latest_hw_id"])
-                            if pd.notna(cur_cfg.get("latest_hw_id"))
-                            and int(cur_cfg["latest_hw_id"]) in hw_options
-                            else 0
-                        )
-                        init_qz = (
-                            int(cur_cfg["latest_quiz_id"])
-                            if pd.notna(cur_cfg.get("latest_quiz_id"))
-                            and int(cur_cfg["latest_quiz_id"]) in qz_options
-                            else 0
-                        )
-                        init_jid = (
-                            str(cur_cfg.get("wa_group_jid") or "")
-                            if pd.notna(cur_cfg.get("wa_group_jid"))
-                            else ""
-                        )
-
-                        with st.form(f"update_group_pace_form_{target_grp}"):
-                            new_hw_id = st.selectbox(
-                                f"3rd Column: Homework for Group {target_grp}",
-                                options=list(hw_options.keys()),
-                                index=list(hw_options.keys()).index(init_hw),
-                                format_func=lambda k: hw_options[k],
-                                key=f"cfg_hw_{target_grp}",
-                            )
-                            new_qz_id = st.selectbox(
-                                f"4th Column: Quiz for Group {target_grp}",
-                                options=list(qz_options.keys()),
-                                index=list(qz_options.keys()).index(init_qz),
-                                format_func=lambda k: qz_options[k],
-                                key=f"cfg_qz_{target_grp}",
-                            )
-                            new_jid = st.text_input(
-                                "Optional: WhatsApp Group JID (for Group Chat Broadcasts)",
-                                value=init_jid,
-                                placeholder="e.g. 12036304...@g.us",
-                                key=f"cfg_jid_{target_grp}",
-                            ).strip()
-
-                            if st.form_submit_button(
-                                f"💾 Save Group {target_grp} Assignment Pace",
-                                type="primary",
-                                use_container_width=True,
-                            ):
-                                self.db.execute_query(
-                                    """
-                                    INSERT INTO group_automation_config (group_number, latest_hw_id, latest_quiz_id, wa_group_jid)
-                                    VALUES (%s, %s, %s, %s)
-                                    ON CONFLICT (group_number) DO UPDATE SET
-                                        latest_hw_id = EXCLUDED.latest_hw_id,
-                                        latest_quiz_id = EXCLUDED.latest_quiz_id,
-                                        wa_group_jid = EXCLUDED.wa_group_jid
-                                    """,
-                                    (
-                                        target_grp,
-                                        int(new_hw_id) if new_hw_id else None,
-                                        int(new_qz_id) if new_qz_id else None,
-                                        new_jid or None,
-                                    ),
-                                )
-                                st.success(f"Saved assignment pace for Group {target_grp}!")
-                                st.rerun()
-
-                st.divider()
-                st.markdown("#### ⚡ Instant Test / Manual Trigger Buttons")
-                col_t1, col_t2, col_t3 = st.columns(3)
-                with col_t1:
-                    if st.button("☀️ Send Morning Schedule to Teacher Now", use_container_width=True):
-                        t_phone = get_resolved_teacher_phone(self.db)
-                        if not t_phone:
-                            st.error("Please save the Teacher's WhatsApp Phone in the '⚙️ Bot & Teacher Settings' tab first!")
-                        else:
-                            with st.spinner("Sending Morning Schedule to Teacher..."):
-                                now_c = datetime.datetime.now(CAIRO_TZ)
-                                ok, err = send_morning_schedule_to_teacher(
-                                    self.db, GowaClient.from_secrets(self.db), t_phone, now_c
-                                )
-                                if ok:
-                                    st.success("Morning schedule + exciting quote sent to Teacher!")
-                                else:
-                                    st.error(f"Failed to send Morning Schedule: {err}")
-                with col_t2:
-                    test_grp = st.selectbox("Group for Instant Action", groups, key="instant_grp_sel", label_visibility="collapsed")
-                    if st.button(f"📊 Send Group {test_grp} Reports to Teacher Now", use_container_width=True):
-                        t_phone = get_resolved_teacher_phone(self.db)
-                        if not t_phone:
-                            st.error("Please set Teacher Phone in Settings first!")
-                        else:
-                            with st.spinner(f"Generating & sending Group {test_grp} Master PDFs..."):
-                                cfg_r = configs_map.get(test_grp, {})
-                                hid, qid, _, _ = get_effective_group_pace(
-                                    cfg_r, default_latest_hw_id, default_latest_qz_id
-                                )
-                                hw_m = {int(r["homework_id"]): (str(r["title"]), int(r["total_questions"])) for _, r in hw_df.iterrows()}
-                                qz_m = {int(r["quiz_id"]): (str(r["title"]), float(r["max_score"])) for _, r in qz_df.iterrows()}
-                                ok = send_group_master_reports_to_teacher(
-                                    self.db, GowaClient.from_secrets(self.db), t_phone, test_grp, "Now", hid, qid, hw_m, qz_m
-                                )
-                                if ok:
-                                    st.success(f"Sent Group {test_grp} HW & Quiz Master PDFs to Teacher!")
-                                else:
-                                    st.error("Failed to send reports. Check GOWA connection in Settings.")
-                with col_t3:
-                    if st.button(f"🔔 Send Unsubmitted HW Reminders to Group {test_grp} Now", use_container_width=True):
-                        cfg_r = configs_map.get(test_grp, {})
-                        hid, qid, _, _ = get_effective_group_pace(
-                            cfg_r, default_latest_hw_id, default_latest_qz_id
-                        )
-                        if not hid:
-                            st.error(f"No homeworks exist yet for Group {test_grp}!")
-                        else:
-                            hw_m = {int(r["homework_id"]): (str(r["title"]), int(r["total_questions"])) for _, r in hw_df.iterrows()}
-                            qz_m = {int(r["quiz_id"]): (str(r["title"]), float(r["max_score"])) for _, r in qz_df.iterrows()}
-                            client_inst = GowaClient.from_secrets(self.db)
-                            threading.Thread(
-                                target=send_6hr_unsubmitted_reminders,
-                                args=(self.db, client_inst, test_grp, "Upcoming", hid, qid, hw_m, qz_m),
-                                daemon=True,
-                            ).start()
-                            st.success(f"Started sending reminders in the background to unsubmitted students in Group {test_grp}!")
-                    st.caption("Students already reminded today are skipped.")
-
-        # ===================================================================
-        # TAB 2: MANUAL BROADCAST TAB
-        # ===================================================================
-        with tab_broadcast:
-            st.markdown("#### 📢 Custom Automated Broadcast")
-            st.caption(
-                "Write any announcement or message and send it automatically via the bot to all students, "
-                "a specific group privately, or directly into their WhatsApp Group chat."
-            )
-
-            col_b1, col_b2 = st.columns(2)
-            with col_b1:
-                target_audience = st.selectbox(
-                    "1️⃣ Select Target Audience",
-                    ["All Students", "Specific Group"],
-                    key="bc_audience",
-                )
-                selected_bc_group = None
-                if target_audience == "Specific Group" and groups:
-                    selected_bc_group = st.selectbox("Select Group", groups, key="bc_grp_sel")
-
-            with col_b2:
-                delivery_mode = st.radio(
-                    "2️⃣ Delivery Mode",
-                    [
-                        "💬 Privately to Students",
-                        "👨‍👩‍👦 Privately to Parents",
-                        "👨‍👩‍👦🎓 Privately to Both Students & Parents",
-                        "👥 On Their WhatsApp Group Chat",
-                    ],
-                    key="bc_mode",
-                )
-
-            custom_msg = st.text_area(
-                "3️⃣ Write Your Message (Use `{name}` to automatically insert the student's name in private messages)",
-                placeholder="أهلاً بك يا {name}، تنبيه هام بخصوص حصة الغد...",
-                height=140,
-            )
-
-            if st.button("🚀 Send Automated Broadcast Now", type="primary", use_container_width=True):
-                if not custom_msg.strip():
-                    st.error("Please write a message first.")
-                else:
-                    bc_id = uuid.uuid4().hex[:8]
-                    seen, queued = set(), 0
-
-                    def _enq(phone, text):
-                        pair = (phone, text)
-                        if not phone or pair in seen:
-                            return 0
-                        seen.add(pair)
-                        h = hashlib.md5(text.encode("utf-8")).hexdigest()[:10]
-                        enqueue_outbound(
-                            self.db, phone, "text", message_text=text, dedup_key=f"bc_{bc_id}_{phone}_{h}"
-                        )
-                        return 1
-
-                    if delivery_mode == "👥 On Their WhatsApp Group Chat":
-                        cfg_df = self.db.fetch_dataframe("SELECT group_number, wa_group_jid FROM group_automation_config")
-                        if target_audience == "Specific Group" and selected_bc_group:
-                            cfg_df = cfg_df[cfg_df["group_number"].astype(str).str.strip() == selected_bc_group]
-                        jids = [
-                            str(r["wa_group_jid"]).strip()
-                            for _, r in cfg_df.iterrows()
-                            if pd.notna(r.get("wa_group_jid")) and str(r.get("wa_group_jid")).strip()
-                        ]
-                        if not jids:
-                            st.error("No WhatsApp Group JIDs (`...@g.us`) are configured for the selected group(s). Add them in the Schedule tab!")
-                        else:
-                            for jid in jids:
-                                queued += _enq(jid, custom_msg.strip())
-                            st.success(
-                                f"Queued {queued} message(s). The bot sends them in the background, about 25 per minute. You can close this page."
-                            )
-                    else:
-                        target_df = students_df.copy()
-                        if target_audience == "Specific Group" and selected_bc_group:
-                            target_df = target_df[target_df["group_number"].astype(str).str.strip() == selected_bc_group]
-
-                        if target_df.empty:
-                            st.warning("No students found in the selected audience.")
-                        else:
-                            for _, s_row in target_df.iterrows():
-                                s_name = str(s_row["name"])
-                                personalized = custom_msg.strip().replace("{name}", s_name)
-                                s_phone = clean_wa_phone(s_row.get("phone"))
-                                p_phone = clean_wa_phone(s_row.get("phone_parent"))
-
-                                if "Students" in delivery_mode and s_phone:
-                                    queued += _enq(s_phone, personalized)
-                                if "Parents" in delivery_mode and p_phone:
-                                    queued += _enq(p_phone, personalized)
-
-                            st.success(
-                                f"Queued {queued} message(s). The bot sends them in the background, about 25 per minute. You can close this page."
-                            )
-
-        # ===================================================================
-        # TAB 3: BOT & TEACHER SETTINGS
-        # ===================================================================
-        with tab_settings:
-            st.markdown("#### ⚙️ Bot Connection & Teacher Settings")
-            cur_url = get_bot_setting(self.db, "gowa_url", rt.get("cached_url", DEFAULT_GOWA_URL))
-            cur_auth = get_bot_setting(self.db, "gowa_auth", rt.get("cached_auth", ""))
-            cur_t_phone = get_bot_setting(self.db, "teacher_phone", rt.get("cached_teacher_phone", ""))
-            cur_m_time = get_bot_setting(self.db, "morning_schedule_time", "08:00")
-            cur_auto_grade = get_bot_setting(self.db, "auto_send_on_grade", "true").lower() == "true"
-            cur_also_stu = get_bot_setting(self.db, "also_send_grade_to_student", "false").lower() == "true"
-
-            try:
-                parsed_morning_time = datetime.datetime.strptime(cur_m_time.strip(), "%H:%M").time()
-            except Exception:
-                parsed_morning_time = datetime.time(8, 0)
-
-            col_st1, col_st2 = st.columns([1, 1])
-            with col_st1:
-                if st.button("🔌 Test GOWA Connection", use_container_width=True):
-                    with st.spinner("Pinging GOWA server..."):
-                        ok, status_msg = GowaClient.from_secrets(self.db).ensure_awake(max_wait_seconds=60)
-                        if ok:
-                            st.success(f"✅ {status_msg}")
-                        else:
-                            st.warning(f"⚠️ {status_msg}")
-            with col_st2:
-                if st.button("🔄 Force Run Scheduler Check Now", use_container_width=True):
-                    with st.spinner("Running scheduled checks..."):
-                        run_scheduled_checks_once(self.db)
-                        st.success("Scheduler check executed!")
-                        st.rerun()
-
-            with st.form("bot_settings_form"):
-                in_url = st.text_input("GOWA Render Deployment URL", value=cur_url)
-                in_auth = st.text_input(
-                    "GOWA Basic Auth (`username:password` if set in Render, else leave blank)",
-                    value=cur_auth,
-                    type="password",
-                )
-                in_t_phone = st.text_input(
-                    "👨‍🏫 Teacher's WhatsApp Phone Number (Receives Morning Schedule & 10-Min Pre-Group Reports)",
-                    value=cur_t_phone,
-                    placeholder="e.g. 010...",
-                )
-                in_m_time = st.time_input(
-                    "☀️ Daily Morning Schedule Send Time (Cairo time)",
-                    value=parsed_morning_time,
-                )
-                in_auto_grade = st.checkbox(
-                    "✅ Automatically send Grade + PDF Report to Parent on WhatsApp right after saving a grade",
-                    value=cur_auto_grade,
-                )
-                in_also_stu = st.checkbox(
-                    "🎓 Also send Grade + PDF Report to Student's phone right after saving a grade",
-                    value=cur_also_stu,
-                )
-
-                if st.form_submit_button("💾 Save Teacher & Bot Settings", type="primary", use_container_width=True):
-                    m_time_formatted = (
-                        in_m_time.strftime("%H:%M")
-                        if isinstance(in_m_time, datetime.time)
-                        else "08:00"
-                    )
-                    set_bot_setting(self.db, "gowa_url", in_url.strip() or DEFAULT_GOWA_URL)
-                    set_bot_setting(self.db, "gowa_auth", in_auth.strip())
-                    set_bot_setting(self.db, "teacher_phone", in_t_phone.strip())
-                    set_bot_setting(self.db, "morning_schedule_time", m_time_formatted)
-                    set_bot_setting(self.db, "auto_send_on_grade", "true" if in_auto_grade else "false")
-                    set_bot_setting(self.db, "also_send_grade_to_student", "true" if in_also_stu else "false")
-                    _sync_secrets_to_cache_and_db(self.db)
-                    st.success("✅ Teacher & Bot settings saved!")
-                    st.rerun()
-
-            st.divider()
-            st.markdown("#### 👩‍🏫 Manage Assistants & Notification Permissions")
-
-            asst_df = self.db.fetch_dataframe(
-                "SELECT id, name, phone, notify_hw_submit, notify_daily_schedule, notify_grade_submitted FROM assistants ORDER BY id ASC"
-            )
-
-            if not asst_df.empty:
-                st.dataframe(
-                    asst_df,
-                    hide_index=True,
-                    use_container_width=True,
-                    column_config={
-                        "id": None,
-                        "name": "Assistant Name",
-                        "phone": "WhatsApp Phone",
-                        "notify_hw_submit": "HW Submits",
-                        "notify_daily_schedule": "Daily Schedule",
-                        "notify_grade_submitted": "Grade Saved"
-                    }
-                )
-
-                del_asst_dict = {str(row["id"]): f"{row['name']} ({row['phone']})" for _, row in asst_df.iterrows()}
-                c_del1, c_del2 = st.columns([3, 1])
-                del_sel = c_del1.selectbox("Select Assistant to Remove", list(del_asst_dict.keys()), format_func=lambda x: del_asst_dict[x])
-                if c_del2.button("🗑️ Remove Assistant", use_container_width=True):
-                    self.db.execute_query("DELETE FROM assistants WHERE id = %s", (int(del_sel),))
-                    st.rerun()
-            else:
-                st.info("No assistants registered yet.")
-
-            with st.expander("➕ Add New Assistant", expanded=True):
-                with st.form("add_assistant_form"):
-                    a_name = st.text_input("Assistant Name")
-                    a_phone = st.text_input("WhatsApp Phone Number", placeholder="010...")
-
-                    st.markdown("**Notification Permissions:**")
-                    a_hw = st.checkbox("📥 Receive New Homework Submission Alerts", value=True)
-                    a_sched = st.checkbox("☀️ Receive Morning Schedule", value=True)
-                    a_grade = st.checkbox("✅ Receive Grade Saved Alerts", value=False)
-
-                    if st.form_submit_button("💾 Add Assistant", type="primary"):
-                        if not a_name.strip() or not a_phone.strip():
-                            st.error("Name and Phone are required.")
-                        else:
-                            try:
-                                self.db.execute_query(
-                                    """
-                                    INSERT INTO assistants (name, phone, notify_hw_submit, notify_daily_schedule, notify_grade_submitted) 
-                                    VALUES (%s, %s, %s, %s, %s)
-                                    """,
-                                    (a_name.strip(), a_phone.strip(), a_hw, a_sched, a_grade)
-                                )
-                                st.success(f"Assistant {a_name} added successfully!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Failed to add assistant (Phone might already exist): {e}")
+            f"نحيط حضرتكم علمًا بأن الطالب *{student_name}* حصل على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {
