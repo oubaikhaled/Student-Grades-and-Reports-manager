@@ -192,8 +192,8 @@ class GowaClient:
             time.sleep(4)
         return False, f"Wake-up timeout: {last_err}"
 
-    def send_text(self, recipient: str, message: str, retries: int = 2) -> tuple[bool, str]:
-        """Sends a WhatsApp text message to a phone number or group JID (@g.us)."""
+    def send_text(self, recipient: str, message: str, retries: int = 4) -> tuple[bool, str]:
+        """Sends a WhatsApp text message with automatic wake-up and progressive retry on failure."""
         target = clean_wa_phone(recipient)
         if not target:
             return False, f"Invalid phone/recipient: {recipient}"
@@ -212,16 +212,32 @@ class GowaClient:
                     timeout=50,
                 )
                 if resp.status_code in (200, 201):
-                    return True, "Sent"
-                last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
+                    # Verify GOWA didn't return an internal error inside a 200 JSON payload
+                    try:
+                        body = resp.json()
+                        code = str(body.get("code", "")).upper()
+                        if code and code not in ("SUCCESS", "200", "OK", ""):
+                            last_err = f"GOWA API error: {body.get('message') or body}"
+                        else:
+                            return True, "Sent"
+                    except Exception:
+                        return True, "Sent"
+                else:
+                    last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
             except Exception as e:
                 last_err = str(e)
+
             if attempt < retries:
-                time.sleep(3)
+                # Wait progressively longer (4s, 8s, 12s, 16s) and ensure server is awake
+                time.sleep(4 * (attempt + 1))
+                self.ensure_awake(max_wait_seconds=25)
+
         return False, last_err
 
-    def send_pdf(self, recipient: str, pdf_bytes: bytes, filename: str, caption: str = "", retries: int = 1) -> tuple[bool, str]:
-        """Sends a PDF file via GOWA /send/file using an ASCII-safe filename."""
+    def send_pdf(
+        self, recipient: str, pdf_bytes: bytes, filename: str, caption: str = "", retries: int = 3
+    ) -> tuple[bool, str]:
+        """Sends a PDF file via GOWA /send/file with automatic wake-up and progressive retry on failure."""
         target = clean_wa_phone(recipient)
         if not target:
             return False, f"Invalid phone/recipient: {recipient}"
@@ -248,15 +264,25 @@ class GowaClient:
                     timeout=65,
                 )
                 if resp.status_code in (200, 201):
-                    return True, "PDF Sent"
-                last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
+                    try:
+                        body = resp.json()
+                        code = str(body.get("code", "")).upper()
+                        if code and code not in ("SUCCESS", "200", "OK", ""):
+                            last_err = f"GOWA PDF error: {body.get('message') or body}"
+                        else:
+                            return True, "PDF Sent"
+                    except Exception:
+                        return True, "PDF Sent"
+                else:
+                    last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
             except Exception as e:
                 last_err = str(e)
+
             if attempt < retries:
-                time.sleep(3)
+                time.sleep(5 * (attempt + 1))
+                self.ensure_awake(max_wait_seconds=25)
+
         return False, last_err
-
-
 # ---------------------------------------------------------------------------
 # Database Schema & Helpers for Automation
 # ---------------------------------------------------------------------------
@@ -297,6 +323,29 @@ def init_automation_tables(db):
                 CREATE TABLE IF NOT EXISTS automated_dispatch_log (
                     dispatch_key TEXT PRIMARY KEY,
                     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS whatsapp_retry_queue (
+                    queue_id SERIAL PRIMARY KEY,
+                    recipient TEXT NOT NULL,
+                    message_type TEXT NOT NULL, -- 'text' or 'pdf_grade'
+                    message_text TEXT,
+                    kind TEXT,
+                    item_id INTEGER,
+                    student_id TEXT,
+                    student_name TEXT,
+                    item_title TEXT,
+                    score REAL,
+                    max_score REAL,
+                    perc REAL,
+                    report_text TEXT,
+                    video_link TEXT,
+                    attempts INTEGER DEFAULT 0,
+                    last_error TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -501,6 +550,118 @@ def _safe_generate_student_pdf(
 # ---------------------------------------------------------------------------
 # Instant Homework Submission Alert to Assistant (Atomic Single-Send)
 # ---------------------------------------------------------------------------
+def enqueue_failed_whatsapp(
+    db,
+    recipient: str,
+    message_type: str,
+    message_text: str = "",
+    kind: str = "",
+    item_id: int = 0,
+    student_id: str = "",
+    student_name: str = "",
+    item_title: str = "",
+    score: float = 0.0,
+    max_score: float = 0.0,
+    perc: float = 0.0,
+    report_text: str = "",
+    video_link: str = "",
+    last_error: str = "",
+):
+    """Saves a failed text or PDF report into the DB so the 60s daemon retries it until delivered."""
+    try:
+        db.execute_query(
+            """
+            INSERT INTO whatsapp_retry_queue (
+                recipient, message_type, message_text, kind, item_id, student_id,
+                student_name, item_title, score, max_score, perc, report_text, video_link,
+                attempts, last_error
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s)
+            """,
+            (
+                recipient, message_type, message_text, kind, int(item_id or 0), str(student_id or ""),
+                student_name, item_title, float(score or 0), float(max_score or 0), float(perc or 0),
+                report_text or "", video_link or "", str(last_error or ""),
+            ),
+        )
+    except Exception as e:
+        print(f"[RetryQueue] Could not enqueue failed message for {recipient}: {e}")
+
+
+def process_whatsapp_retry_queue(db, client: GowaClient, rt):
+    """
+    Called every 60 seconds by `run_scheduled_checks_once`.
+    Retries any failed WhatsApp texts or PDF grade reports up to 15 times before expiring.
+    """
+    try:
+        q_df = db.fetch_dataframe(
+            "SELECT * FROM whatsapp_retry_queue WHERE attempts < 15 ORDER BY queue_id ASC LIMIT 10"
+        )
+    except Exception:
+        return
+
+    if q_df.empty:
+        return
+
+    client.ensure_awake(max_wait_seconds=30)
+
+    for _, row in q_df.iterrows():
+        qid = int(row["queue_id"])
+        recipient = str(row["recipient"])
+        mtype = str(row["message_type"])
+        attempts = int(row.get("attempts") or 1)
+
+        if mtype == "text":
+            ok, err = client.send_text(recipient, str(row.get("message_text") or ""), retries=1)
+        elif mtype == "pdf_grade":
+            kind = str(row.get("kind") or "homework")
+            item_id = int(row.get("item_id") or 0)
+            student_id = str(row.get("student_id") or "")
+            student_name = str(row.get("student_name") or "")
+            item_title = str(row.get("item_title") or "")
+            score = float(row.get("score") or 0.0)
+            max_score = float(row.get("max_score") or 1.0)
+            perc = float(row.get("perc") or 0.0)
+            report_text = str(row.get("report_text") or "")
+            video_link = str(row.get("video_link") or "") or None
+
+            # Fetch stored report_image from DB if available
+            img_bytes = None
+            try:
+                table = "homework_grades" if kind == "homework" else "quiz_grades"
+                icol = "homework_id" if kind == "homework" else "quiz_id"
+                img_df = db.fetch_dataframe(
+                    f"SELECT report_image FROM {table} WHERE {icol} = %s AND student_id = %s",
+                    (item_id, student_id),
+                )
+                if not img_df.empty and img_df.iloc[0, 0] is not None and not isinstance(img_df.iloc[0, 0], float):
+                    img_bytes = bytes(img_df.iloc[0, 0])
+            except Exception:
+                pass
+
+            pdf_bytes = _safe_generate_student_pdf(
+                student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link
+            )
+            if pdf_bytes:
+                pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
+                ok, err = client.send_pdf(
+                    recipient, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}", retries=1
+                )
+            else:
+                ok, err = False, "PDF generation returned None"
+        else:
+            ok, err = True, "Unknown type"
+
+        if ok:
+            db.execute_query("DELETE FROM whatsapp_retry_queue WHERE queue_id = %s", (qid,))
+            _record_scheduler_action(db, rt, f"Retry Succeeded -> {recipient} ({mtype})")
+        else:
+            db.execute_query(
+                "UPDATE whatsapp_retry_queue SET attempts = %s, last_error = %s WHERE queue_id = %s",
+                (attempts + 1, str(err)[:200], qid),
+            )
+            _record_scheduler_error(db, rt, f"Retry #{attempts + 1} failed for {recipient}: {err}")
+        time.sleep(2)
 def trigger_hw_submission_assistant_whatsapp(
     db,
     student_id: str,
@@ -699,30 +860,66 @@ def trigger_post_grade_whatsapp(
                 )
                 pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
 
+                # 1. Send to Parent
                 if parent_phone:
                     ok_txt, err_txt = client.send_text(parent_phone, parent_msg)
+                    if not ok_txt:
+                        enqueue_failed_whatsapp(
+                            db, parent_phone, "text", message_text=parent_msg, last_error=err_txt
+                        )
+
                     if pdf_bytes:
                         ok_pdf, err_pdf = client.send_pdf(
                             parent_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
                         )
-                        status_parts.append(f"Parent({parent_phone}): Txt={'OK' if ok_txt else err_txt}, PDF={'OK' if ok_pdf else err_pdf}")
+                        if not ok_pdf:
+                            enqueue_failed_whatsapp(
+                                db, parent_phone, "pdf_grade", kind=kind, item_id=item_id,
+                                student_id=student_id, student_name=student_name, item_title=item_title,
+                                score=score, max_score=max_score, perc=perc, report_text=report_text,
+                                video_link=video_link or "", last_error=err_pdf,
+                            )
+                        status_parts.append(
+                            f"Parent({parent_phone}): Txt={'OK' if ok_txt else 'QueuedRetry'}, PDF={'OK' if ok_pdf else 'QueuedRetry'}"
+                        )
                     else:
-                        status_parts.append(f"Parent({parent_phone}): Txt={'OK' if ok_txt else err_txt}")
+                        status_parts.append(
+                            f"Parent({parent_phone}): Txt={'OK' if ok_txt else 'QueuedRetry'}"
+                        )
                 else:
                     status_parts.append("Parent: No valid phone")
 
+                # 2. Send to Student
                 if student_phone and (also_student or not parent_phone):
                     ok_stxt, err_stxt = client.send_text(student_phone, stu_msg)
+                    if not ok_stxt:
+                        enqueue_failed_whatsapp(
+                            db, student_phone, "text", message_text=stu_msg, last_error=err_stxt
+                        )
+
                     if pdf_bytes:
                         ok_spdf, err_spdf = client.send_pdf(
                             student_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
                         )
-                        status_parts.append(f"Student({student_phone}): Txt={'OK' if ok_stxt else err_stxt}, PDF={'OK' if ok_spdf else err_spdf}")
+                        if not ok_spdf:
+                            enqueue_failed_whatsapp(
+                                db, student_phone, "pdf_grade", kind=kind, item_id=item_id,
+                                student_id=student_id, student_name=student_name, item_title=item_title,
+                                score=score, max_score=max_score, perc=perc, report_text=report_text,
+                                video_link=video_link or "", last_error=err_spdf,
+                            )
+                        status_parts.append(
+                            f"Student({student_phone}): Txt={'OK' if ok_stxt else 'QueuedRetry'}, PDF={'OK' if ok_spdf else 'QueuedRetry'}"
+                        )
                     else:
-                        status_parts.append(f"Student({student_phone}): Txt={'OK' if ok_stxt else err_stxt}")
+                        status_parts.append(
+                            f"Student({student_phone}): Txt={'OK' if ok_stxt else 'QueuedRetry'}"
+                        )
 
+            # 3. Send to Eligible Assistants
             if grade_assistants:
                 asst_sent = 0
+                asst_queued = 0
                 for asst_name, asst_phone in grade_assistants:
                     asst_msg = emoji.emojize(
                         f":check_mark_button: *تم رصد درجة جديدة*\n\n"
@@ -731,10 +928,18 @@ def trigger_post_grade_whatsapp(
                         f"الطالب: *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*)\n"
                         f"الدرجة: *{score_str} / {max_str}* ({perc:.1f}%)"
                     )
-                    ok_a, _ = client.send_text(asst_phone, asst_msg)
+                    ok_a, err_a = client.send_text(asst_phone, asst_msg)
                     if ok_a:
                         asst_sent += 1
-                status_parts.append(f"Assistants: {asst_sent}/{len(grade_assistants)} sent")
+                    else:
+                        asst_queued += 1
+                        enqueue_failed_whatsapp(
+                            db, asst_phone, "text", message_text=asst_msg, last_error=err_a
+                        )
+                if asst_queued > 0:
+                    status_parts.append(f"Assistants: {asst_sent}/{len(grade_assistants)} sent ({asst_queued} queued for retry)")
+                else:
+                    status_parts.append(f"Assistants: {asst_sent}/{len(grade_assistants)} sent")
 
             summary = " | ".join(status_parts) if status_parts else "No recipients configured"
             with rt["lock"]:
