@@ -953,8 +953,12 @@ def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label, 
                   on_click=set_flag, args=(master_key,))
     else:
         pdf_data = [
-            (r.id, r.name, clean(r.score),
-             (float(r.score) / float(max_score)) * 100 if pd.notna(r.score) else None)
+            (
+                r.id, 
+                r.name, 
+                clean(r.score) if pd.notna(r.score) else ("Submitted" if getattr(r, "submitted", False) else None),
+                (float(r.score) / float(max_score)) * 100 if pd.notna(r.score) else None
+            )
             for r in df.itertuples(index=False)
         ]
         pdf = get_cached_master_report(item_title, group_label, max_score, pdf_data)
@@ -963,7 +967,6 @@ def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label, 
             file_name=f"{item_title}_{group_label}_Master.pdf".replace(" ", "_"),
             mime="application/pdf",
         )
-
 
 @st.fragment
 def whatsapp_fragment(db, kind, item_id, title, total, vid_link, df):
