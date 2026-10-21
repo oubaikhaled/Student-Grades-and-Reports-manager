@@ -1192,7 +1192,7 @@ def run_scheduled_checks_once(db):
     assistant_phone_clean = get_resolved_assistant_phone(db)
     client = GowaClient.from_secrets(db)
 
-    check_and_notify_assistant_pending_submissions(db, client, assistant_phone_clean, now, rt)
+    
 
     morning_time_str = get_bot_setting(db, "morning_schedule_time", "08:00")
     m_hr, m_min = _parse_hhmm_tolerant(morning_time_str, default_hr=8, default_min=0)
