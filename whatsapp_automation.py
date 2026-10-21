@@ -1298,17 +1298,21 @@ def send_group_master_reports_to_teacher(
             (hw_id,),
         )
         merged = students_df.merge(g_df, left_on="id", right_on="student_id", how="left")
+        
+        # FIX: Explicitly convert NaNs to False so empty submissions don't show as "Submitted"
+        merged["submitted"] = merged["submitted"].fillna(False).astype(bool)
+        
         records = [
             (
                 r["id"],
                 r["name"],
-                r["correct_answers"] if pd.notna(r["correct_answers"]) else ("Submitted" if r.get("submitted") else None),
+                r["correct_answers"] if pd.notna(r["correct_answers"]) else ("Submitted" if r["submitted"] else None),
                 r["percentage"] if pd.notna(r["percentage"]) else None,
             )
             for _, r in merged.iterrows()
         ]
         submitted_cnt = int(
-            (merged["correct_answers"].notna() | merged["submitted"].fillna(False)).sum()
+            (merged["correct_answers"].notna() | merged["submitted"]).sum()
         )
         pdf_buf = PDFGenerator.generate_master_report(
             f"{hw_title} (Group {grp})", hw_total, records
