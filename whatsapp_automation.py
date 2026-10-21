@@ -670,21 +670,28 @@ def trigger_hw_submission_assistant_whatsapp(
     student_name: str | None = None,
     group_number: str | None = None,
 ):
-    """
-    Runs immediately when a student clicks Submit Homework.
-    Uses a 30-second memory cooldown (instead of a permanent DB lock) so re-submissions
-    and testing always send a WhatsApp alert without double-sending on accidental double-taps.
-    """
     _sync_secrets_to_cache_and_db(db)
     rt = get_daemon_runtime()
 
-    # 30-second anti-double-click cooldown per (homework_id, student_id)
-    dedup_id = f"hw_{homework_id}_stu_{str(student_id).strip()}"
+    # Strict deduplication key
+    clean_hw_id = int(homework_id) if homework_id is not None else 0
+    clean_stu_id = str(student_id or "").strip()
+    dedup_id = f"hw_{clean_hw_id}_stu_{clean_stu_id}"
+    
     now_ts = time.time()
     with rt["lock"]:
         recent_subs = rt.setdefault("recent_hw_subs", {})
-        if now_ts - recent_subs.get(dedup_id, 0.0) < 30.0:
+        # Increased cooldown window to 60 seconds to completely block double-clicks
+        if now_ts - recent_subs.get(dedup_id, 0.0) < 60.0:
+            print(f"[Deduplication] Blocked duplicate assistant alert for {dedup_id}")
             return
+        recent_subs[dedup_id] = now_ts
+
+    recipients = get_eligible_assistants(db, "notify_hw_submit")
+    if not recipients:
+        with rt["lock"]:
+            rt["last_hw_sub_status"] = "Skipped (No assistants have 'HW Submits' enabled in Settings)"
+        return
         recent_subs[dedup_id] = now_ts
 
     recipients = get_eligible_assistants(db, "notify_hw_submit")
