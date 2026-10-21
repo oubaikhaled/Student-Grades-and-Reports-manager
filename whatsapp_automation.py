@@ -1,10 +1,12 @@
 import datetime
+import hashlib
 import io
 import os
 import random
 import re
 import threading
 import time
+import uuid
 from zoneinfo import ZoneInfo
 
 import emoji
@@ -117,17 +119,17 @@ def clean_wa_phone(p_str: str) -> str | None:
     if s.endswith(".0"):
         s = s[:-2]
     digits = re.sub(r"\D", "", s)
-    if not digits or len(digits) < 10:
-        return None
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if len(digits) == 11 and digits.startswith("01"):
+        return "2" + digits                 # 010... -> 2010...
     if len(digits) == 10 and digits.startswith("1"):
-        return "20" + digits
-    if digits.startswith("0020"):
-        return digits[2:]
-    if digits.startswith("0"):
-        return "2" + digits
-    if not digits.startswith("20"):
-        return "20" + digits
-    return digits
+        return "20" + digits                # 10... -> 2010...
+    if digits.startswith("20") and len(digits) == 12:
+        return digits
+    if len(digits) >= 11 and not digits.startswith("0"):
+        return digits                       # already international; do not mangle
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +187,9 @@ class GowaClient:
         while time.time() < deadline:
             ok, msg = self.check_status(timeout=20)
             if ok:
+                rt = get_daemon_runtime()
+                with rt["lock"]:
+                    rt["gowa_last_ok"] = time.time()
                 return True, msg
             last_err = msg
             if "no WhatsApp device is linked" in msg:
@@ -193,10 +198,20 @@ class GowaClient:
         return False, f"Wake-up timeout: {last_err}"
 
     def send_text(self, recipient: str, message: str, retries: int = 4) -> tuple[bool, str]:
-        """Sends a WhatsApp text message with automatic wake-up and progressive retry on failure."""
+        """
+        Sends a WhatsApp text message with automatic wake-up and progressive retry on failure.
+        Note: ReadTimeouts are treated as sent (unconfirmed) to avoid duplicate messages when
+        GOWA delivers the message on a slow/cold instance before the HTTP response times out.
+        """
         target = clean_wa_phone(recipient)
         if not target:
             return False, f"Invalid phone/recipient: {recipient}"
+
+        rt = get_daemon_runtime()
+        with rt["lock"]:
+            last_ok = rt.get("gowa_last_ok", 0.0)
+        if time.time() - last_ok > 300:
+            self.ensure_awake(max_wait_seconds=45)
 
         payload = {
             "phone": target,
@@ -219,11 +234,23 @@ class GowaClient:
                         if code and code not in ("SUCCESS", "200", "OK", ""):
                             last_err = f"GOWA API error: {body.get('message') or body}"
                         else:
+                            with rt["lock"]:
+                                rt["gowa_last_ok"] = time.time()
                             return True, "Sent"
                     except Exception:
+                        with rt["lock"]:
+                            rt["gowa_last_ok"] = time.time()
                         return True, "Sent"
-                else:
+                elif resp.status_code == 429 or resp.status_code >= 500:
                     last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
+                else:
+                    return False, f"HTTP {resp.status_code}: {resp.text[:150]}"
+            except requests.exceptions.ReadTimeout:
+                # request reached the server; retrying would likely duplicate it
+                print("[GOWA] read timeout, treating as sent (unconfirmed)")
+                return True, "Sent (unconfirmed: read timeout)"
+            except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as e:
+                last_err = str(e)          # never reached the server: safe to retry
             except Exception as e:
                 last_err = str(e)
 
@@ -237,10 +264,19 @@ class GowaClient:
     def send_pdf(
         self, recipient: str, pdf_bytes: bytes, filename: str, caption: str = "", retries: int = 3
     ) -> tuple[bool, str]:
-        """Sends a PDF file via GOWA /send/file with automatic wake-up and progressive retry on failure."""
+        """
+        Sends a PDF file via GOWA /send/file with automatic wake-up and progressive retry on failure.
+        Note: ReadTimeouts are treated as sent (unconfirmed) to avoid duplicate PDFs.
+        """
         target = clean_wa_phone(recipient)
         if not target:
             return False, f"Invalid phone/recipient: {recipient}"
+
+        rt = get_daemon_runtime()
+        with rt["lock"]:
+            last_ok = rt.get("gowa_last_ok", 0.0)
+        if time.time() - last_ok > 300:
+            self.ensure_awake(max_wait_seconds=45)
 
         safe_ascii_name = re.sub(r"[^A-Za-z0-9_\-.]", "_", str(filename or "Report.pdf"))
         if not safe_ascii_name.lower().endswith(".pdf"):
@@ -270,11 +306,23 @@ class GowaClient:
                         if code and code not in ("SUCCESS", "200", "OK", ""):
                             last_err = f"GOWA PDF error: {body.get('message') or body}"
                         else:
+                            with rt["lock"]:
+                                rt["gowa_last_ok"] = time.time()
                             return True, "PDF Sent"
                     except Exception:
+                        with rt["lock"]:
+                            rt["gowa_last_ok"] = time.time()
                         return True, "PDF Sent"
-                else:
+                elif resp.status_code == 429 or resp.status_code >= 500:
                     last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
+                else:
+                    return False, f"HTTP {resp.status_code}: {resp.text[:150]}"
+            except requests.exceptions.ReadTimeout:
+                # request reached the server; retrying would likely duplicate it
+                print("[GOWA] read timeout, treating as sent (unconfirmed)")
+                return True, "Sent (unconfirmed: read timeout)"
+            except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as e:
+                last_err = str(e)          # never reached the server: safe to retry
             except Exception as e:
                 last_err = str(e)
 
@@ -283,6 +331,8 @@ class GowaClient:
                 self.ensure_awake(max_wait_seconds=25)
 
         return False, last_err
+
+
 # ---------------------------------------------------------------------------
 # Database Schema & Helpers for Automation
 # ---------------------------------------------------------------------------
@@ -349,6 +399,11 @@ def init_automation_tables(db):
                 )
                 """
             )
+            c.execute("ALTER TABLE whatsapp_retry_queue ADD COLUMN IF NOT EXISTS dedup_key TEXT")
+            c.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_wa_queue_dedup "
+                "ON whatsapp_retry_queue (dedup_key) WHERE dedup_key IS NOT NULL"
+            )
             c.execute(
                 """
                 CREATE TABLE IF NOT EXISTS assistants (
@@ -370,7 +425,8 @@ def get_bot_setting(db, key: str, default: str = "") -> str:
             "SELECT setting_value FROM bot_settings WHERE setting_key = %s", (key,)
         )
         return str(val).strip() if val is not None and str(val).strip() != "" else default
-    except Exception:
+    except Exception as e:
+        print(f"[BotSettings] Error reading key '{key}': {e}")
         return default
 
 
@@ -503,13 +559,18 @@ def claim_dispatch(db, key: str) -> bool:
 
 def release_dispatch(db, key: str):
     """Releases a claimed dispatch key if sending failed so the next tick can retry."""
-    try:
-        db.execute_query(
-            "DELETE FROM automated_dispatch_log WHERE dispatch_key = %s",
-            (key,),
-        )
-    except Exception as e:
-        print(f"[Dispatch] Failed to release key '{key}': {e}")
+    for attempt in range(2):
+        try:
+            db.execute_query(
+                "DELETE FROM automated_dispatch_log WHERE dispatch_key = %s",
+                (key,),
+            )
+            return
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(1)
+            else:
+                print(f"[Dispatch] Failed to release key '{key}' after retry: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +627,8 @@ def enqueue_failed_whatsapp(
     report_text: str = "",
     video_link: str = "",
     last_error: str = "",
+    attempts: int = 1,
+    dedup_key: str | None = None,
 ):
     """Saves a failed text or PDF report into the DB so the 60s daemon retries it until delivered."""
     try:
@@ -574,18 +637,24 @@ def enqueue_failed_whatsapp(
             INSERT INTO whatsapp_retry_queue (
                 recipient, message_type, message_text, kind, item_id, student_id,
                 student_name, item_title, score, max_score, perc, report_text, video_link,
-                attempts, last_error
+                attempts, last_error, dedup_key
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
             """,
             (
                 recipient, message_type, message_text, kind, int(item_id or 0), str(student_id or ""),
                 student_name, item_title, float(score or 0), float(max_score or 0), float(perc or 0),
-                report_text or "", video_link or "", str(last_error or ""),
+                report_text or "", video_link or "", int(attempts), str(last_error or ""), dedup_key,
             ),
         )
     except Exception as e:
         print(f"[RetryQueue] Could not enqueue failed message for {recipient}: {e}")
+
+
+def enqueue_outbound(db, recipient, message_type, **kw):
+    """Put a fresh outbound message in the queue. The daemon sends it (attempts starts at 0)."""
+    enqueue_failed_whatsapp(db, recipient, message_type, attempts=0, **kw)
 
 
 def process_whatsapp_retry_queue(db, client: GowaClient, rt):
@@ -593,75 +662,97 @@ def process_whatsapp_retry_queue(db, client: GowaClient, rt):
     Called every 60 seconds by `run_scheduled_checks_once`.
     Retries any failed WhatsApp texts or PDF grade reports up to 15 times before expiring.
     """
+    with rt["lock"]:
+        qlock = rt.setdefault("queue_lock", threading.Lock())
+    if not qlock.acquire(blocking=False):
+        return
     try:
-        q_df = db.fetch_dataframe(
-            "SELECT * FROM whatsapp_retry_queue WHERE attempts < 15 ORDER BY queue_id ASC LIMIT 10"
-        )
-    except Exception:
-        return
-
-    if q_df.empty:
-        return
-
-    client.ensure_awake(max_wait_seconds=30)
-
-    for _, row in q_df.iterrows():
-        qid = int(row["queue_id"])
-        recipient = str(row["recipient"])
-        mtype = str(row["message_type"])
-        attempts = int(row.get("attempts") or 1)
-
-        if mtype == "text":
-            ok, err = client.send_text(recipient, str(row.get("message_text") or ""), retries=1)
-        elif mtype == "pdf_grade":
-            kind = str(row.get("kind") or "homework")
-            item_id = int(row.get("item_id") or 0)
-            student_id = str(row.get("student_id") or "")
-            student_name = str(row.get("student_name") or "")
-            item_title = str(row.get("item_title") or "")
-            score = float(row.get("score") or 0.0)
-            max_score = float(row.get("max_score") or 1.0)
-            perc = float(row.get("perc") or 0.0)
-            report_text = str(row.get("report_text") or "")
-            video_link = str(row.get("video_link") or "") or None
-
-            # Fetch stored report_image from DB if available
-            img_bytes = None
-            try:
-                table = "homework_grades" if kind == "homework" else "quiz_grades"
-                icol = "homework_id" if kind == "homework" else "quiz_id"
-                img_df = db.fetch_dataframe(
-                    f"SELECT report_image FROM {table} WHERE {icol} = %s AND student_id = %s",
-                    (item_id, student_id),
-                )
-                if not img_df.empty and img_df.iloc[0, 0] is not None and not isinstance(img_df.iloc[0, 0], float):
-                    img_bytes = bytes(img_df.iloc[0, 0])
-            except Exception:
-                pass
-
-            pdf_bytes = _safe_generate_student_pdf(
-                student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link
+        try:
+            q_df = db.fetch_dataframe(
+                "SELECT * FROM whatsapp_retry_queue WHERE attempts < 15 ORDER BY queue_id ASC LIMIT 25"
             )
-            if pdf_bytes:
-                pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
-                ok, err = client.send_pdf(
-                    recipient, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}", retries=1
-                )
-            else:
-                ok, err = False, "PDF generation returned None"
-        else:
-            ok, err = True, "Unknown type"
+        except Exception:
+            return
 
-        if ok:
-            db.execute_query("DELETE FROM whatsapp_retry_queue WHERE queue_id = %s", (qid,))
-            _record_scheduler_action(db, rt, f"Retry Succeeded -> {recipient} ({mtype})")
-        else:
+        if q_df.empty:
+            return
+
+        ok_awake, _ = client.ensure_awake(max_wait_seconds=30)
+        if not ok_awake:
+            return
+
+        t0 = time.time()
+        for _, row in q_df.iterrows():
+            if time.time() - t0 > 45:
+                break
+
+            qid = int(row["queue_id"])
+            recipient = str(row["recipient"])
+            mtype = str(row["message_type"])
+            attempts = int(row.get("attempts") or 0)
+
             db.execute_query(
-                "UPDATE whatsapp_retry_queue SET attempts = %s, last_error = %s WHERE queue_id = %s",
-                (attempts + 1, str(err)[:200], qid),
+                "UPDATE whatsapp_retry_queue SET attempts = attempts + 1 WHERE queue_id = %s",
+                (qid,),
             )
-            _record_scheduler_error(db, rt, f"Retry #{attempts + 1} failed for {recipient}: {err}")
-        time.sleep(2)
+
+            if mtype == "text":
+                ok, err = client.send_text(recipient, str(row.get("message_text") or ""), retries=1)
+            elif mtype == "pdf_grade":
+                kind = str(row.get("kind") or "homework")
+                item_id = int(row.get("item_id") or 0)
+                student_id = str(row.get("student_id") or "")
+                student_name = str(row.get("student_name") or "")
+                item_title = str(row.get("item_title") or "")
+                score = float(row.get("score") or 0.0)
+                max_score = float(row.get("max_score") or 1.0)
+                perc = float(row.get("perc") or 0.0)
+                report_text = str(row.get("report_text") or "")
+                video_link = str(row.get("video_link") or "") or None
+                msg_txt = str(row.get("message_text") or "")
+                caption_str = msg_txt if msg_txt else f"📄 {student_name} — {item_title}"
+
+                # Fetch stored report_image from DB if available
+                img_bytes = None
+                try:
+                    table = "homework_grades" if kind == "homework" else "quiz_grades"
+                    icol = "homework_id" if kind == "homework" else "quiz_id"
+                    img_df = db.fetch_dataframe(
+                        f"SELECT report_image FROM {table} WHERE {icol} = %s AND student_id = %s",
+                        (item_id, student_id),
+                    )
+                    if not img_df.empty and img_df.iloc[0, 0] is not None and not isinstance(img_df.iloc[0, 0], float):
+                        img_bytes = bytes(img_df.iloc[0, 0])
+                except Exception:
+                    pass
+
+                pdf_bytes = _safe_generate_student_pdf(
+                    student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link
+                )
+                if pdf_bytes:
+                    pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
+                    ok, err = client.send_pdf(
+                        recipient, pdf_bytes, pdf_filename, caption=caption_str, retries=1
+                    )
+                else:
+                    ok, err = client.send_text(recipient, caption_str, retries=1)
+            else:
+                ok, err = True, "Unknown type"
+
+            if ok:
+                db.execute_query("DELETE FROM whatsapp_retry_queue WHERE queue_id = %s", (qid,))
+                _record_scheduler_action(db, rt, f"Queue Sent -> {recipient} ({mtype})")
+            else:
+                db.execute_query(
+                    "UPDATE whatsapp_retry_queue SET last_error = %s WHERE queue_id = %s",
+                    (str(err)[:200], qid),
+                )
+                _record_scheduler_error(db, rt, f"Attempt #{attempts + 1} failed for {recipient}: {err}")
+            time.sleep(2)
+    finally:
+        qlock.release()
+
+
 def trigger_hw_submission_assistant_whatsapp(
     db,
     student_id: str,
@@ -672,26 +763,14 @@ def trigger_hw_submission_assistant_whatsapp(
 ):
     _sync_secrets_to_cache_and_db(db)
     rt = get_daemon_runtime()
-
-    # Strict deduplication key
     clean_hw_id = int(homework_id) if homework_id is not None else 0
     clean_stu_id = str(student_id or "").strip()
     dedup_id = f"hw_{clean_hw_id}_stu_{clean_stu_id}"
-    
     now_ts = time.time()
     with rt["lock"]:
         recent_subs = rt.setdefault("recent_hw_subs", {})
-        # Increased cooldown window to 60 seconds to completely block double-clicks
         if now_ts - recent_subs.get(dedup_id, 0.0) < 60.0:
-            print(f"[Deduplication] Blocked duplicate assistant alert for {dedup_id}")
             return
-        recent_subs[dedup_id] = now_ts
-
-    recipients = get_eligible_assistants(db, "notify_hw_submit")
-    if not recipients:
-        with rt["lock"]:
-            rt["last_hw_sub_status"] = "Skipped (No assistants have 'HW Submits' enabled in Settings)"
-        return
         recent_subs[dedup_id] = now_ts
 
     recipients = get_eligible_assistants(db, "notify_hw_submit")
@@ -737,8 +816,8 @@ def trigger_hw_submission_assistant_whatsapp(
 
     def _worker():
         try:
-            sent_to = []
-            errors = []
+            client.ensure_awake(max_wait_seconds=45)
+            sent_to, errors = [], []
             for asst_name, asst_phone in recipients:
                 msg = emoji.emojize(
                     f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
@@ -754,62 +833,16 @@ def trigger_hw_submission_assistant_whatsapp(
                     sent_to.append(f"{asst_name}({asst_phone})")
                 else:
                     errors.append(f"{asst_name}: {err}")
-                    try:
-                        enqueue_failed_whatsapp(db, asst_phone, "text", message_text=msg, last_error=err)
-                    except Exception:
-                        pass
-
+                    enqueue_outbound(db, asst_phone, "text", message_text=msg, last_error=err)
             with rt["lock"]:
                 if sent_to:
-                    rt["last_hw_sub_status"] = f"Sent to {', '.join(sent_to)} for {student_name} ({homework_title})"
+                    rt["last_hw_sub_status"] = f"Sent to {chr(44).join(sent_to)} for {student_name} ({homework_title})"
                     rt["last_action"] = f"HW Sub Alert -> {len(sent_to)} Assistant(s)"
-                else:
-                    rt["last_hw_sub_status"] = f"Failed (Queued Retry) for {student_name}: {'; '.join(errors)}"
-                    rt["last_error"] = f"Assistant HW Sub Alert Error: {'; '.join(errors)}"
+                if errors:
+                    rt["last_hw_sub_status"] = f"Partly queued for retry for {student_name}: {chr(59).join(errors)}"
         except Exception as e:
             with rt["lock"]:
                 rt["last_error"] = f"Assistant HW Sub Exception ({student_name}): {e}"
-                rt["last_hw_sub_status"] = f"Exception for {student_name}: {e}"
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-    def _worker():
-        try:
-            client.ensure_awake(max_wait_seconds=45)
-
-            sent_to = []
-            errors = []
-            for asst_name, asst_phone in recipients:
-                msg = emoji.emojize(
-                    f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
-                    f"👩‍🏫 *تنبيه يا {asst_name}:*\n"
-                    f"قام الطالب *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*) بتسليم الواجب:\n"
-                    f"📘 *{homework_title}*\n"
-                    f"🕒 *وقت التسليم:* {submitted_at_str}\n\n"
-                    f"برجاء الدخول على المنصة لمراجعة الواجب وتصحيحه. :check_mark_button:\n\n"
-                    f"Mathematics Team – Eng. Mahmoud Adel"
-                )
-                ok, err = client.send_text(asst_phone, msg)
-                if ok:
-                    sent_to.append(f"{asst_name}({asst_phone})")
-                else:
-                    errors.append(f"{asst_name}: {err}")
-
-            with rt["lock"]:
-                if sent_to:
-                    rt["last_hw_sub_status"] = f"Sent to {', '.join(sent_to)} for {student_name} ({homework_title})"
-                    rt["last_action"] = f"HW Sub Alert -> {len(sent_to)} Assistant(s)"
-                else:
-                    if sub_key:
-                        release_dispatch(db, sub_key)
-                    rt["last_hw_sub_status"] = f"Failed for {student_name}: {'; '.join(errors)}"
-                    rt["last_error"] = f"Assistant HW Sub Alert Error: {'; '.join(errors)}"
-        except Exception as e:
-            if sub_key:
-                release_dispatch(db, sub_key)
-            with rt["lock"]:
-                rt["last_error"] = f"Assistant HW Sub Exception ({student_name}): {e}"
-                rt["last_hw_sub_status"] = f"Exception for {student_name}: {e}"
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -831,8 +864,8 @@ def trigger_post_grade_whatsapp(
 ):
     """
     Runs immediately after an admin clicks Save Grade.
-    Fetches all DB records on the main thread BEFORE Streamlit reruns,
-    then wakes GOWA and dispatches messages + PDF in the background.
+    Enqueues deduplicated grade reports into `whatsapp_retry_queue` synchronously
+    so the background daemon dispatches them steadily.
     """
     _sync_secrets_to_cache_and_db(db)
     rt = get_daemon_runtime()
@@ -876,138 +909,88 @@ def trigger_post_grade_whatsapp(
         except Exception:
             pass
 
-    client = GowaClient.from_secrets(db)
+    score_str = str(int(score)) if float(score).is_integer() else f"{score:.1f}"
+    max_str = str(int(max_score)) if float(max_score).is_integer() else f"{max_score:.1f}"
+    type_label = "Quiz" if kind == "quiz" else "Homework"
 
-    def _worker():
-        try:
-            client.ensure_awake(max_wait_seconds=45)
+    prefix_key = f"grade_{kind}_{item_id}_{student_id}_"
+    try:
+        prev = db.execute_scalar(
+            "SELECT COUNT(*) FROM automated_dispatch_log WHERE dispatch_key LIKE %s",
+            (prefix_key + "%",),
+        )
+        is_correction = bool(prev and int(prev) > 0)
+    except Exception:
+        is_correction = False
+    corr_prefix = "🔁 *تصحيح للدرجة السابقة*\n\n" if is_correction else ""
 
-            score_str = str(int(score)) if float(score).is_integer() else f"{score:.1f}"
-            max_str = str(int(max_score)) if float(max_score).is_integer() else f"{max_score:.1f}"
-            type_label = "Quiz" if kind == "quiz" else "Homework"
+    queued = 0
 
-            status_parts = []
+    if auto_enabled:
+        parent_msg = corr_prefix + emoji.emojize(
+            f":bar_chart: درجة الـ {item_title}\n\n"
+            f"ولي الأمر الكريم،\n"
+            f"نحيط حضرتكم علمًا بأن الطالب *{student_name}* حصل على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n\n"
+            f"مرفق لحضرتكم تقرير الأداء التفصيلي (PDF).\n"
+            f"نتمنى له مزيدًا من التقدم والنجاح! :glowing_star:\n\n"
+            f"Mathematics Team – Eng. Mahmoud Adel"
+        )
 
-            if auto_enabled:
-                parent_msg = emoji.emojize(
-                    f":bar_chart: درجة الـ {item_title}\n\n"
-                    f"ولي الأمر الكريم،\n"
-                    f"نحيط حضرتكم علمًا بأن الطالب *{student_name}* حصل على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n\n"
-                    f"مرفق لحضرتكم تقرير الأداء التفصيلي (PDF).\n"
-                    f"نتمنى له مزيدًا من التقدم والنجاح! :glowing_star:\n\n"
-                    f"Mathematics Team – Eng. Mahmoud Adel"
+        stu_msg = corr_prefix + emoji.emojize(
+            f":bar_chart: درجة الـ {item_title}\n\n"
+            f"أهلاً بك يا *{student_name}*،\n"
+            f"لقد حصلت على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n"
+            f"مرفق تقرير الملاحظات الخاص بك. استمر في الاجتهاد! :glowing_star:\n\n"
+            f"Mathematics Team – Eng. Mahmoud Adel"
+        )
+
+        if parent_phone:
+            key = f"{prefix_key}{score_str}_{parent_phone}"
+            if claim_dispatch(db, key):
+                enqueue_outbound(
+                    db, parent_phone, "pdf_grade", message_text=parent_msg, kind=kind, item_id=int(item_id),
+                    student_id=str(student_id), student_name=student_name, item_title=item_title,
+                    score=float(score), max_score=float(max_score), perc=float(perc),
+                    report_text=report_text or "", video_link=video_link or "",
                 )
+                queued += 1
 
-                stu_msg = emoji.emojize(
-                    f":bar_chart: درجة الـ {item_title}\n\n"
-                    f"أهلاً بك يا *{student_name}*،\n"
-                    f"لقد حصلت على *{score_str} / {max_str}* ({perc:.1f}%) في الـ {type_label} الأخير.\n"
-                    f"مرفق تقرير الملاحظات الخاص بك. استمر في الاجتهاد! :glowing_star:\n\n"
-                    f"Mathematics Team – Eng. Mahmoud Adel"
+        if student_phone and (also_student or not parent_phone):
+            key = f"{prefix_key}{score_str}_{student_phone}"
+            if claim_dispatch(db, key):
+                enqueue_outbound(
+                    db, student_phone, "pdf_grade", message_text=stu_msg, kind=kind, item_id=int(item_id),
+                    student_id=str(student_id), student_name=student_name, item_title=item_title,
+                    score=float(score), max_score=float(max_score), perc=float(perc),
+                    report_text=report_text or "", video_link=video_link or "",
                 )
+                queued += 1
 
-                pdf_bytes = _safe_generate_student_pdf(
-                    student_name, item_title, score, max_score, perc, report_text, img_bytes, video_link
-                )
-                pdf_filename = f"Student_{student_id}_{kind}_{item_id}_Report.pdf"
+    if grade_assistants:
+        for asst_name, asst_phone in grade_assistants:
+            asst_msg = corr_prefix + emoji.emojize(
+                f":check_mark_button: *تم رصد درجة جديدة*\n\n"
+                f"👩‍🏫 *إشعار يا {asst_name}:*\n"
+                f"تم تصحيح {type_label}: *{item_title}*\n"
+                f"الطالب: *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*)\n"
+                f"الدرجة: *{score_str} / {max_str}* ({perc:.1f}%)"
+            )
+            asst_key = f"{prefix_key}{score_str}_asst_{asst_phone}"
+            if claim_dispatch(db, asst_key):
+                enqueue_outbound(db, asst_phone, "text", message_text=asst_msg)
+                queued += 1
 
-                # 1. Send to Parent
-                if parent_phone:
-                    ok_txt, err_txt = client.send_text(parent_phone, parent_msg)
-                    if not ok_txt:
-                        enqueue_failed_whatsapp(
-                            db, parent_phone, "text", message_text=parent_msg, last_error=err_txt
-                        )
-
-                    if pdf_bytes:
-                        ok_pdf, err_pdf = client.send_pdf(
-                            parent_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
-                        )
-                        if not ok_pdf:
-                            enqueue_failed_whatsapp(
-                                db, parent_phone, "pdf_grade", kind=kind, item_id=item_id,
-                                student_id=student_id, student_name=student_name, item_title=item_title,
-                                score=score, max_score=max_score, perc=perc, report_text=report_text,
-                                video_link=video_link or "", last_error=err_pdf,
-                            )
-                        status_parts.append(
-                            f"Parent({parent_phone}): Txt={'OK' if ok_txt else 'QueuedRetry'}, PDF={'OK' if ok_pdf else 'QueuedRetry'}"
-                        )
-                    else:
-                        status_parts.append(
-                            f"Parent({parent_phone}): Txt={'OK' if ok_txt else 'QueuedRetry'}"
-                        )
-                else:
-                    status_parts.append("Parent: No valid phone")
-
-                # 2. Send to Student
-                if student_phone and (also_student or not parent_phone):
-                    ok_stxt, err_stxt = client.send_text(student_phone, stu_msg)
-                    if not ok_stxt:
-                        enqueue_failed_whatsapp(
-                            db, student_phone, "text", message_text=stu_msg, last_error=err_stxt
-                        )
-
-                    if pdf_bytes:
-                        ok_spdf, err_spdf = client.send_pdf(
-                            student_phone, pdf_bytes, pdf_filename, caption=f"📄 {student_name} — {item_title}"
-                        )
-                        if not ok_spdf:
-                            enqueue_failed_whatsapp(
-                                db, student_phone, "pdf_grade", kind=kind, item_id=item_id,
-                                student_id=student_id, student_name=student_name, item_title=item_title,
-                                score=score, max_score=max_score, perc=perc, report_text=report_text,
-                                video_link=video_link or "", last_error=err_spdf,
-                            )
-                        status_parts.append(
-                            f"Student({student_phone}): Txt={'OK' if ok_stxt else 'QueuedRetry'}, PDF={'OK' if ok_spdf else 'QueuedRetry'}"
-                        )
-                    else:
-                        status_parts.append(
-                            f"Student({student_phone}): Txt={'OK' if ok_stxt else 'QueuedRetry'}"
-                        )
-
-            # 3. Send to Eligible Assistants
-            if grade_assistants:
-                asst_sent = 0
-                asst_queued = 0
-                for asst_name, asst_phone in grade_assistants:
-                    asst_msg = emoji.emojize(
-                        f":check_mark_button: *تم رصد درجة جديدة*\n\n"
-                        f"👩‍🏫 *إشعار يا {asst_name}:*\n"
-                        f"تم تصحيح {type_label}: *{item_title}*\n"
-                        f"الطالب: *{student_name}* (كود: `{student_id}` — مجموعة *{group_number}*)\n"
-                        f"الدرجة: *{score_str} / {max_str}* ({perc:.1f}%)"
-                    )
-                    ok_a, err_a = client.send_text(asst_phone, asst_msg)
-                    if ok_a:
-                        asst_sent += 1
-                    else:
-                        asst_queued += 1
-                        enqueue_failed_whatsapp(
-                            db, asst_phone, "text", message_text=asst_msg, last_error=err_a
-                        )
-                if asst_queued > 0:
-                    status_parts.append(f"Assistants: {asst_sent}/{len(grade_assistants)} sent ({asst_queued} queued for retry)")
-                else:
-                    status_parts.append(f"Assistants: {asst_sent}/{len(grade_assistants)} sent")
-
-            summary = " | ".join(status_parts) if status_parts else "No recipients configured"
-            with rt["lock"]:
-                rt["last_grade_status"] = f"{student_name}: {summary}"
-                rt["last_action"] = f"Post-Grade -> {student_name}"
-        except Exception as e:
-            with rt["lock"]:
-                rt["last_error"] = f"Post-Grade Exception ({student_name}): {e}"
-                rt["last_grade_status"] = f"Error for {student_name}: {e}"
-
-    threading.Thread(target=_worker, daemon=True).start()
+    with rt["lock"]:
+        rt["last_grade_status"] = f"{student_name}: queued {queued} message(s)"
+        rt["last_action"] = f"Post-Grade -> {student_name}"
 
 
 # ---------------------------------------------------------------------------
 # Reusable Morning Schedule Builder & Sender
 # ---------------------------------------------------------------------------
-def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean: str, now: datetime.datetime) -> tuple[bool, str]:
+def send_morning_schedule_to_teacher(
+    db, client: GowaClient, teacher_phone_clean: str, now: datetime.datetime, dedupe_assistants: bool = False
+) -> tuple[bool, str]:
     """Builds and sends today's morning schedule + exciting sentence to the teacher and eligible assistants."""
     today_str = now.strftime("%Y-%m-%d")
     today_day = now.strftime("%a")
@@ -1066,6 +1049,8 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
 
     # 1. Send to the Teacher
     ok, err = client.send_text(teacher_phone_clean, msg)
+    if not ok:
+        return False, err
 
     # 2. Send to eligible Assistants
     try:
@@ -1073,77 +1058,17 @@ def send_morning_schedule_to_teacher(db, client: GowaClient, teacher_phone_clean
         for asst_name, asst_phone in asst_recipients:
             if teacher_phone_clean and asst_phone == teacher_phone_clean:
                 continue
+            key = f"morning_asst_{today_str}_{asst_phone}"
+            if dedupe_assistants and not claim_dispatch(db, key):
+                continue
             asst_msg = msg.replace("Eng. Mahmoud Adel", asst_name)
-            client.send_text(asst_phone, asst_msg)
+            ok_a, err_a = client.send_text(asst_phone, asst_msg)
+            if not ok_a:
+                enqueue_outbound(db, asst_phone, "text", message_text=asst_msg, last_error=err_a)
     except Exception as e:
         print(f"Failed to send schedule to assistants: {e}")
 
     return ok, err
-
-
-# ---------------------------------------------------------------------------
-# Background Check: Pending Uncorrected Homework Submissions for Assistant
-# ---------------------------------------------------------------------------
-def check_and_notify_assistant_pending_submissions(
-    db, client: GowaClient, assistant_phone_clean: str, now: datetime.datetime, rt
-):
-    recipients = get_eligible_assistants(db, "notify_hw_submit")
-    if not recipients:
-        return
-
-    try:
-        pending_df = db.fetch_dataframe(
-            """
-            SELECT hg.homework_id, hg.student_id, s.name AS student_name, s.group_number, h.title AS hw_title
-            FROM homework_grades hg
-            JOIN students s ON s.id = hg.student_id
-            JOIN homeworks h ON h.homework_id = hg.homework_id
-            WHERE COALESCE(hg.submitted, FALSE) = TRUE
-              AND hg.correct_answers IS NULL
-            """
-        )
-    except Exception as e:
-        print(f"[Scheduler] Failed to query pending homework submissions: {e}")
-        return
-
-    if pending_df.empty:
-        return
-
-    now_fmt = now.strftime("%Y-%m-%d %H:%M")
-    for _, row in pending_df.iterrows():
-        hw_id = int(row["homework_id"])
-        stu_id = str(row["student_id"]).strip()
-        stu_name = str(row.get("student_name") or f"Student #{stu_id}")
-        grp = str(row.get("group_number") or "N/A").strip()
-        hw_title = str(row.get("hw_title") or f"Homework #{hw_id}")
-
-        sub_key = f"asst_hw_sub_hw_{hw_id}_stu_{stu_id}"
-        if claim_dispatch(db, sub_key):
-            any_sent = False
-            for asst_name, asst_phone in recipients:
-                msg = emoji.emojize(
-                    f":inbox_tray: *تسليم واجب جديد للمراجعة والتصحيح*\n\n"
-                    f"👩‍🏫 *تنبيه يا {asst_name}:*\n"
-                    f"قام الطالب *{stu_name}* (كود: `{stu_id}` — مجموعة *{grp}*) بتسليم الواجب:\n"
-                    f"📘 *{hw_title}*\n"
-                    f"🕒 *وقت الإشعار:* {now_fmt}\n\n"
-                    f"برجاء الدخول على المنصة لمراجعة الواجب وتصحيحه. :check_mark_button:\n\n"
-                    f"Mathematics Team – Eng. Mahmoud Adel"
-                )
-                ok, err = client.send_text(asst_phone, msg)
-                if ok:
-                    any_sent = True
-
-            if any_sent:
-                action_msg = f"Notified Assistants: HW submitted by {stu_name} ({hw_title})"
-                _record_scheduler_action(db, rt, action_msg)
-                with rt["lock"]:
-                    rt["last_hw_sub_status"] = f"Sent to assistants for {stu_name}"
-            else:
-                release_dispatch(db, sub_key)
-                err_msg = f"Assistant HW Sub Alert Failed ({stu_name})"
-                _record_scheduler_error(db, rt, err_msg)
-            time.sleep(3)
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1104,22 @@ def _record_scheduler_error(db, rt, err_msg: str):
         pass
 
 
+def _run_claimed_job(db, rt, key, label, fn):
+    """Claim key, run fn(); release the key on failure OR exception so the next tick retries."""
+    if not claim_dispatch(db, key):
+        return
+    ok = False
+    try:
+        ok = bool(fn())
+    except Exception as e:
+        _record_scheduler_error(db, rt, f"{label} exception: {e}")
+    if ok:
+        _record_scheduler_action(db, rt, f"Sent {label}")
+    else:
+        release_dispatch(db, key)
+        _record_scheduler_error(db, rt, f"{label} failed (will retry next tick)")
+
+
 def run_scheduled_checks_once(db):
     rt = get_daemon_runtime()
     now = datetime.datetime.now(CAIRO_TZ)
@@ -1199,7 +1140,10 @@ def run_scheduled_checks_once(db):
     assistant_phone_clean = get_resolved_assistant_phone(db)
     client = GowaClient.from_secrets(db)
 
-    
+    try:
+        process_whatsapp_retry_queue(db, client, rt)
+    except Exception as e:
+        _record_scheduler_error(db, rt, f"Queue drain error: {e}")
 
     morning_time_str = get_bot_setting(db, "morning_schedule_time", "08:00")
     m_hr, m_min = _parse_hhmm_tolerant(morning_time_str, default_hr=8, default_min=0)
@@ -1209,15 +1153,15 @@ def run_scheduled_checks_once(db):
     if not teacher_phone_clean:
         print("[Scheduler] Morning schedule skipped: teacher phone not configured.")
     elif now >= morning_dt and (now - morning_dt).total_seconds() <= 28800:
-        if claim_dispatch(db, morning_key):
-            ok, err = send_morning_schedule_to_teacher(db, client, teacher_phone_clean, now)
-            if ok:
-                action_msg = f"Sent Morning Schedule ({today_str})"
-                _record_scheduler_action(db, rt, action_msg)
-            else:
-                release_dispatch(db, morning_key)
-                err_msg = f"Morning Schedule Failed: {err}"
-                _record_scheduler_error(db, rt, err_msg)
+        _run_claimed_job(
+            db,
+            rt,
+            morning_key,
+            f"Morning Schedule ({today_str})",
+            lambda: send_morning_schedule_to_teacher(
+                db, client, teacher_phone_clean, now, dedupe_assistants=True
+            )[0],
+        )
 
     meetings_df = db.fetch_dataframe(
         """
@@ -1246,68 +1190,75 @@ def run_scheduled_checks_once(db):
         qz_map[int(r["quiz_id"])] = (str(r["title"]), float(r["max_score"]))
 
     for _, m_row in meetings_df.iterrows():
-        grp = str(m_row["group_number"]).strip()
-        mtime = str(m_row["meeting_time"]).strip()
+        grp = str(m_row.get("group_number", "")).strip()
+        mtime = str(m_row.get("meeting_time", "")).strip()
         try:
-            hr, mn = [int(x) for x in mtime.split(":")[:2]]
-            lecture_dt = now.replace(hour=hr, minute=mn, second=0, microsecond=0)
-        except Exception:
+            try:
+                hr, mn = [int(x) for x in mtime.split(":")[:2]]
+                lecture_dt = now.replace(hour=hr, minute=mn, second=0, microsecond=0)
+            except Exception:
+                continue
+
+            minutes_until_lecture = (lecture_dt - now).total_seconds() / 60.0
+            hw_id = int(m_row["latest_hw_id"]) if pd.notna(m_row.get("latest_hw_id")) else None
+            qz_id = int(m_row["latest_quiz_id"]) if pd.notna(m_row.get("latest_quiz_id")) else None
+
+            done10 = f"teacher10_done_{today_str}_{grp}_{mtime}"
+            if teacher_phone_clean and -5 <= minutes_until_lecture <= 15 and not has_dispatched(db, done10):
+                if send_group_master_reports_to_teacher(
+                    db, client, teacher_phone_clean, grp, mtime, hw_id, qz_id, hw_map, qz_map, today_str=today_str
+                ):
+                    mark_dispatched(db, done10)
+                    _record_scheduler_action(db, rt, f"Sent 10-min Report for Group {grp}")
+
+            done_key = f"6hr_done_{today_str}_{grp}_hw{hw_id}"
+            if hw_id and 300 <= minutes_until_lecture <= 380 and not has_dispatched(db, done_key):
+                if send_6hr_unsubmitted_reminders(
+                    db, client, grp, mtime, hw_id, qz_id, hw_map, qz_map, use_keys=True
+                ):
+                    mark_dispatched(db, done_key)
+                    _record_scheduler_action(db, rt, f"Sent 6-hr Reminders for Group {grp}")
+        except Exception as e:
+            _record_scheduler_error(db, rt, f"Group {grp} {mtime}: {e}")
             continue
-
-        minutes_until_lecture = (lecture_dt - now).total_seconds() / 60.0
-        hw_id = int(m_row["latest_hw_id"]) if pd.notna(m_row.get("latest_hw_id")) else None
-        qz_id = int(m_row["latest_quiz_id"]) if pd.notna(m_row.get("latest_quiz_id")) else None
-
-        pre10_key = f"teacher_10min_{today_str}_grp_{grp}_{mtime}"
-        if teacher_phone_clean and -5 <= minutes_until_lecture <= 15:
-            if claim_dispatch(db, pre10_key):
-                ok = send_group_master_reports_to_teacher(
-                    db, client, teacher_phone_clean, grp, mtime, hw_id, qz_id, hw_map, qz_map
-                )
-                if ok:
-                    action_msg = f"Sent 10-min Report for Group {grp}"
-                    _record_scheduler_action(db, rt, action_msg)
-                else:
-                    release_dispatch(db, pre10_key)
-                    err_msg = f"10-min Report failed for Group {grp}"
-                    _record_scheduler_error(db, rt, err_msg)
-
-        rem6h_key = f"student_6hr_{today_str}_grp_{grp}_{mtime}"
-        if (hw_id or qz_id) and 300 <= minutes_until_lecture <= 380:
-            if claim_dispatch(db, rem6h_key):
-                ok = send_6hr_unsubmitted_reminders(
-                    db, client, grp, mtime, hw_id, qz_id, hw_map, qz_map
-                )
-                if ok:
-                    action_msg = f"Sent 6-hr Reminders for Group {grp}"
-                    _record_scheduler_action(db, rt, action_msg)
-                else:
-                    release_dispatch(db, rem6h_key)
-                    err_msg = f"6-hr Reminders failed for Group {grp}"
-                    _record_scheduler_error(db, rt, err_msg)
 
 
 def send_group_master_reports_to_teacher(
     db, client: GowaClient, teacher_phone: str, grp: str, mtime: str,
-    hw_id: int | None, qz_id: int | None, hw_map: dict, qz_map: dict
+    hw_id: int | None, qz_id: int | None, hw_map: dict, qz_map: dict,
+    today_str: str | None = None,
 ) -> bool:
     students_df = db.fetch_dataframe(
         "SELECT id, name FROM students WHERE TRIM(group_number) = %s ORDER BY name ASC",
         (grp,),
     )
     if students_df.empty:
-        return False
+        return True
 
-    intro_msg = (
-        f"⏰ *Upcoming Session in 10 Minutes!*\n"
-        f"👥 *Group:* {grp} (at {mtime})\n"
-        f"👨‍🎓 *Enrolled Students:* {len(students_df)}\n"
-        f"Here are the latest Homework & Quiz reports for this group:"
-    )
-    ok_intro, _ = client.send_text(teacher_phone, intro_msg)
-    any_sent = ok_intro
+    use_keys = today_str is not None
 
-    if hw_id and hw_id in hw_map:
+    def _claim(suffix):
+        return (not use_keys) or claim_dispatch(db, f"teacher10_{today_str}_{grp}_{mtime}_{suffix}")
+
+    def _release(suffix):
+        if use_keys:
+            release_dispatch(db, f"teacher10_{today_str}_{grp}_{mtime}_{suffix}")
+
+    all_ok = True
+
+    if _claim("intro"):
+        intro_msg = (
+            f"⏰ *Upcoming Session in 10 Minutes!*\n"
+            f"👥 *Group:* {grp} (at {mtime})\n"
+            f"👨‍🎓 *Enrolled Students:* {len(students_df)}\n"
+            f"Here are the latest Homework & Quiz reports for this group:"
+        )
+        ok_intro, _ = client.send_text(teacher_phone, intro_msg)
+        if not ok_intro:
+            _release("intro")
+            all_ok = False
+
+    if hw_id and hw_id in hw_map and _claim("hw"):
         hw_title, hw_total = hw_map[hw_id]
         g_df = db.fetch_dataframe(
             "SELECT student_id, correct_answers, percentage, COALESCE(submitted, FALSE) as submitted "
@@ -1335,16 +1286,17 @@ def send_group_master_reports_to_teacher(
             f"📌 *Assignment:* {hw_title}\n"
             f"✅ *Submitted/Graded:* {submitted_cnt} / {len(students_df)}"
         )
-        ok_hw_txt, _ = client.send_text(teacher_phone, caption)
         ok_hw_pdf, _ = client.send_pdf(
             teacher_phone,
             pdf_buf.getvalue(),
             f"Group_{grp}_HW_{hw_id}_Report.pdf",
             caption=caption,
         )
-        any_sent = any_sent or ok_hw_txt or ok_hw_pdf
+        if not ok_hw_pdf:
+            _release("hw")
+            all_ok = False
 
-    if qz_id and qz_id in qz_map:
+    if qz_id and qz_id in qz_map and _claim("qz"):
         qz_title, qz_max = qz_map[qz_id]
         qg_df = db.fetch_dataframe(
             "SELECT student_id, score, percentage FROM quiz_grades WHERE quiz_id = %s",
@@ -1369,28 +1321,34 @@ def send_group_master_reports_to_teacher(
             f"📌 *Quiz:* {qz_title}\n"
             f"✅ *Graded:* {attended_cnt} / {len(students_df)}"
         )
-        ok_qz_txt, _ = client.send_text(teacher_phone, caption_q)
         ok_qz_pdf, _ = client.send_pdf(
             teacher_phone,
             pdf_buf_q.getvalue(),
             f"Group_{grp}_Quiz_{qz_id}_Report.pdf",
             caption=caption_q,
         )
-        any_sent = any_sent or ok_qz_txt or ok_qz_pdf
+        if not ok_qz_pdf:
+            _release("qz")
+            all_ok = False
 
-    return any_sent
+    return all_ok
 
 
 def send_6hr_unsubmitted_reminders(
     db, client: GowaClient, grp: str, mtime: str,
-    hw_id: int | None, qz_id: int | None, hw_map: dict, qz_map: dict
+    hw_id: int | None, qz_id: int | None, hw_map: dict, qz_map: dict,
+    use_keys: bool = True,
 ) -> bool:
+    """True when every unsubmitted student has been handled (sent earlier, sent now, or has no phone)."""
+    if not hw_id or hw_id not in hw_map:
+        return True            # nothing to remind about; do NOT return False (it caused retries every minute)
+
     students_df = db.fetch_dataframe(
         "SELECT id, name, phone, phone_parent FROM students WHERE TRIM(group_number) = %s",
         (grp,),
     )
-    if students_df.empty or not hw_id or hw_id not in hw_map:
-        return False
+    if students_df.empty:
+        return True
 
     hw_title, _ = hw_map[hw_id]
     qz_title = qz_map[qz_id][0] if (qz_id and qz_id in qz_map) else None
@@ -1412,10 +1370,19 @@ def send_6hr_unsubmitted_reminders(
     if not unsubmitted_rows:
         return True
 
-    sent_any = False
+    today = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
+    all_handled = True
+    consecutive_fail = 0
     for stu in unsubmitted_rows:
+        sid = str(stu["id"])
         stu_name = str(stu["name"])
         stu_phone = clean_wa_phone(stu.get("phone"))
+        if not stu_phone:
+            continue
+        key = f"6hr_{today}_{grp}_hw{hw_id}_stu{sid}"
+        if use_keys and not claim_dispatch(db, key):
+            continue           # already sent earlier today
+
         quiz_line = f"\n📌 تذكير أيضًا بمراجعة اختبار: *{qz_title}*" if qz_title else ""
 
         reminder_msg = emoji.emojize(
@@ -1426,13 +1393,19 @@ def send_6hr_unsubmitted_reminders(
             f"برجاء سرعة رفع الواجب على المنصة قبل موعد الحصة.\n\n"
             f"Mathematics Team – Eng. Mahmoud Adel"
         )
-        if stu_phone:
-            ok, _ = client.send_text(stu_phone, reminder_msg)
-            if ok:
-                sent_any = True
+        ok, err = client.send_text(stu_phone, reminder_msg)
+        if ok:
+            consecutive_fail = 0
             time.sleep(4)
+        else:
+            if use_keys:
+                release_dispatch(db, key)   # only this student is retried next tick
+            all_handled = False
+            consecutive_fail += 1
+            if consecutive_fail >= 3:
+                break          # GOWA is probably down; stop hammering, next tick resumes
 
-    return sent_any
+    return all_handled
 
 
 def start_background_automation_daemon(db):
@@ -1498,6 +1471,19 @@ class AutomatedMessagesView:
             except Exception:
                 scheduler_active = False
 
+        try:
+            q_pending = int(
+                self.db.execute_scalar("SELECT COUNT(*) FROM whatsapp_retry_queue WHERE attempts < 15") or 0
+            )
+        except Exception:
+            q_pending = 0
+        try:
+            q_expired = int(
+                self.db.execute_scalar("SELECT COUNT(*) FROM whatsapp_retry_queue WHERE attempts >= 15") or 0
+            )
+        except Exception:
+            q_expired = 0
+
         status_col1, status_col2, status_col3 = st.columns(3)
         status_label = (
             "🟢 **Scheduler: Active**"
@@ -1509,7 +1495,8 @@ class AutomatedMessagesView:
         status_col3.caption(f"📌 **Last Event:** `{d_action}`")
         st.caption(
             f"📨 **Last Post-Grade Auto-Send:** `{d_grade}` | "
-            f"📥 **Last Assistant HW Sub Alert:** `{d_hw_sub}`"
+            f"📥 **Last Assistant HW Sub Alert:** `{d_hw_sub}` | "
+            f"📤 **Pending outbound:** `{q_pending}` | ⚠️ **Failed (expired):** `{q_expired}`"
         )
         if d_err:
             st.warning(f"⚠️ Last Background Warning/Error: `{d_err}`")
@@ -1793,6 +1780,7 @@ class AutomatedMessagesView:
                                 daemon=True,
                             ).start()
                             st.success(f"Started sending reminders in the background to unsubmitted students in Group {test_grp}!")
+                    st.caption("Students already reminded today are skipped.")
 
         # ===================================================================
         # TAB 2: MANUAL BROADCAST TAB
@@ -1837,7 +1825,20 @@ class AutomatedMessagesView:
                 if not custom_msg.strip():
                     st.error("Please write a message first.")
                 else:
-                    client = GowaClient.from_secrets(self.db)
+                    bc_id = uuid.uuid4().hex[:8]
+                    seen, queued = set(), 0
+
+                    def _enq(phone, text):
+                        pair = (phone, text)
+                        if not phone or pair in seen:
+                            return 0
+                        seen.add(pair)
+                        h = hashlib.md5(text.encode("utf-8")).hexdigest()[:10]
+                        enqueue_outbound(
+                            self.db, phone, "text", message_text=text, dedup_key=f"bc_{bc_id}_{phone}_{h}"
+                        )
+                        return 1
+
                     if delivery_mode == "👥 On Their WhatsApp Group Chat":
                         cfg_df = self.db.fetch_dataframe("SELECT group_number, wa_group_jid FROM group_automation_config")
                         if target_audience == "Specific Group" and selected_bc_group:
@@ -1850,14 +1851,11 @@ class AutomatedMessagesView:
                         if not jids:
                             st.error("No WhatsApp Group JIDs (`...@g.us`) are configured for the selected group(s). Add them in the Schedule tab!")
                         else:
-                            sent_c = 0
                             for jid in jids:
-                                ok, err = client.send_text(jid, custom_msg.strip())
-                                if ok:
-                                    sent_c += 1
-                                else:
-                                    st.warning(f"Failed for {jid}: {err}")
-                            st.success(f"✅ Broadcast sent to {sent_c} WhatsApp Group chat(s)!")
+                                queued += _enq(jid, custom_msg.strip())
+                            st.success(
+                                f"Queued {queued} message(s). The bot sends them in the background, about 25 per minute. You can close this page."
+                            )
                     else:
                         target_df = students_df.copy()
                         if target_audience == "Specific Group" and selected_bc_group:
@@ -1866,29 +1864,20 @@ class AutomatedMessagesView:
                         if target_df.empty:
                             st.warning("No students found in the selected audience.")
                         else:
-                            prog = st.progress(0, text="Starting automated broadcast...")
-                            sent_count = 0
-                            total_rows = len(target_df)
-                            for idx, (_, s_row) in enumerate(target_df.iterrows()):
+                            for _, s_row in target_df.iterrows():
                                 s_name = str(s_row["name"])
                                 personalized = custom_msg.strip().replace("{name}", s_name)
                                 s_phone = clean_wa_phone(s_row.get("phone"))
                                 p_phone = clean_wa_phone(s_row.get("phone_parent"))
 
                                 if "Students" in delivery_mode and s_phone:
-                                    ok, _ = client.send_text(s_phone, personalized)
-                                    if ok:
-                                        sent_count += 1
+                                    queued += _enq(s_phone, personalized)
                                 if "Parents" in delivery_mode and p_phone:
-                                    ok, _ = client.send_text(p_phone, personalized)
-                                    if ok:
-                                        sent_count += 1
+                                    queued += _enq(p_phone, personalized)
 
-                                prog.progress((idx + 1) / total_rows, text=f"Sent to {s_name} ({idx + 1}/{total_rows})...")
-                                if idx < total_rows - 1:
-                                    time.sleep(4)
-                            prog.empty()
-                            st.success(f"🎉 Broadcast complete! Successfully sent {sent_count} WhatsApp message(s).")
+                            st.success(
+                                f"Queued {queued} message(s). The bot sends them in the background, about 25 per minute. You can close this page."
+                            )
 
         # ===================================================================
         # TAB 3: BOT & TEACHER SETTINGS
