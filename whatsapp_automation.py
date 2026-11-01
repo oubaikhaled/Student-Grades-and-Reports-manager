@@ -67,7 +67,47 @@ def get_daemon_runtime():
         "cached_auth": "",
         "cached_teacher_phone": "",
         "cached_assistant_phone": "",
+        # Quiet-scheduler state: lets the 60s loop skip the database (so Neon can scale to zero)
+        # unless something is actually due. See _scheduler_has_work().
+        "plan": None,
+        "plan_day": "",
+        "plan_loaded_ts": 0.0,
+        "plan_stale": True,
+        "done_keys": set(),
+        "queue_dirty": True,
+        "queue_retry_at": 0.0,
+        "queue_backoff_level": 0,
     }
+
+
+# Re-read meeting times / settings at least this often, even if nothing marked them stale.
+PLAN_MAX_AGE_SECONDS = 6 * 3600
+# Waits before retrying a queue that still has failed messages (seconds, grows per failure).
+QUEUE_RETRY_BACKOFF_SECONDS = (120, 300, 600, 1200, 1800)
+
+
+def mark_schedule_stale():
+    """Makes the scheduler re-read meeting times and settings on its next tick."""
+    rt = get_daemon_runtime()
+    with rt["lock"]:
+        rt["plan_stale"] = True
+
+
+def _mark_queue_dirty():
+    rt = get_daemon_runtime()
+    with rt["lock"]:
+        rt["queue_dirty"] = True
+        rt["queue_retry_at"] = 0.0
+
+
+def _memo_has(rt, key: str) -> bool:
+    with rt["lock"]:
+        return key in rt["done_keys"]
+
+
+def _memo_add(rt, key: str):
+    with rt["lock"]:
+        rt["done_keys"].add(key)
 
 
 def _sync_secrets_to_cache_and_db(db=None):
@@ -658,6 +698,7 @@ def enqueue_failed_whatsapp(
                 report_text or "", video_link or "", int(attempts), str(last_error or ""), clean_dedup,
             ),
         )
+        _mark_queue_dirty()
     except Exception as e:
         print(f"[RetryQueue] Could not enqueue message for {recipient}: {e}")
 
@@ -676,27 +717,36 @@ def process_whatsapp_retry_queue(db, client: GowaClient, rt):
         qlock = rt.setdefault("queue_lock", threading.Lock())
     if not qlock.acquire(blocking=False):
         return
+    # Messages queued from now on set the flag again, so none are missed by this drain.
+    with rt["lock"]:
+        rt["queue_dirty"] = False
+    failed = False
+    unfinished = False
     try:
         try:
             q_df = db.fetch_dataframe(
                 "SELECT * FROM whatsapp_retry_queue WHERE attempts < 15 ORDER BY queue_id ASC LIMIT 25"
             )
         except Exception as e:
+            failed = True
             _record_scheduler_error(db, rt, f"Queue fetch error: {e}")
             return
 
         if q_df.empty:
             return
+        unfinished = len(q_df) >= 25
 
         # Give Render up to 55s to wake up from cold start
         ok_awake, awake_msg = client.ensure_awake(max_wait_seconds=55)
         if not ok_awake:
+            failed = True
             _record_scheduler_error(db, rt, f"Queue paused (GOWA not awake): {awake_msg}")
             return
 
         t0 = time.time()
         for idx, (_, row) in enumerate(q_df.iterrows()):
             if time.time() - t0 > 50:
+                unfinished = True
                 break
 
             try:
@@ -756,18 +806,32 @@ def process_whatsapp_retry_queue(db, client: GowaClient, rt):
                     db.execute_query("DELETE FROM whatsapp_retry_queue WHERE queue_id = %s", (qid,))
                     _record_scheduler_action(db, rt, f"Queue Sent -> {recipient} ({mtype})")
                 else:
+                    failed = True
                     db.execute_query(
                         "UPDATE whatsapp_retry_queue SET last_error = %s WHERE queue_id = %s",
                         (str(err)[:200], qid),
                     )
                     _record_scheduler_error(db, rt, f"Attempt #{attempts + 1} failed for {recipient}: {err}")
             except Exception as row_err:
+                failed = True
                 _record_scheduler_error(db, rt, f"Row drain exception: {row_err}")
 
             # Wait 3.5 seconds between messages so GOWA's WhatsApp socket never chokes on multi-message bursts
             if idx < len(q_df) - 1:
                 time.sleep(3.5)
     finally:
+        with rt["lock"]:
+            if failed:
+                # Retry later instead of every minute, so a down GOWA server doesn't keep Neon awake.
+                level = rt["queue_backoff_level"]
+                delay = QUEUE_RETRY_BACKOFF_SECONDS[min(level, len(QUEUE_RETRY_BACKOFF_SECONDS) - 1)]
+                rt["queue_backoff_level"] = level + 1
+                rt["queue_dirty"] = True
+                rt["queue_retry_at"] = max(rt["queue_retry_at"], time.time() + delay)
+            else:
+                rt["queue_backoff_level"] = 0
+                if unfinished:
+                    rt["queue_dirty"] = True
         qlock.release()
 
 
@@ -1138,7 +1202,11 @@ def _record_scheduler_error(db, rt, err_msg: str):
 
 def _run_claimed_job(db, rt, key, label, fn):
     """Claim key, run fn(); release the key on failure OR exception so the next tick retries."""
+    if _memo_has(rt, key):
+        return
     if not claim_dispatch(db, key):
+        if has_dispatched(db, key):
+            _memo_add(rt, key)
         return
     ok = False
     try:
@@ -1146,10 +1214,94 @@ def _run_claimed_job(db, rt, key, label, fn):
     except Exception as e:
         _record_scheduler_error(db, rt, f"{label} exception: {e}")
     if ok:
+        _memo_add(rt, key)
         _record_scheduler_action(db, rt, f"Sent {label}")
     else:
         release_dispatch(db, key)
         _record_scheduler_error(db, rt, f"{label} failed (will retry next tick)")
+
+
+def _load_schedule_plan(db, rt, today_str: str):
+    """Caches what the scheduler needs to know *when* it has work, so idle ticks skip the database."""
+    meetings_df = db.fetch_dataframe(
+        "SELECT TRIM(group_number) AS grp, day_of_week, meeting_time FROM group_meeting_times"
+    )
+    plan = {
+        "morning": _parse_hhmm_tolerant(get_bot_setting(db, "morning_schedule_time", "08:00"), 8, 0),
+        "has_teacher": bool(get_resolved_teacher_phone(db)),
+        "meetings": [
+            (str(r["grp"] or "").strip(), str(r["day_of_week"] or ""), str(r["meeting_time"] or "").strip())
+            for _, r in meetings_df.iterrows()
+        ],
+    }
+    with rt["lock"]:
+        if rt["plan_day"] != today_str:
+            rt["done_keys"] = set()
+        rt["plan"] = plan
+        rt["plan_day"] = today_str
+        rt["plan_loaded_ts"] = time.time()
+        rt["plan_stale"] = False
+
+
+def _plan_needs_refresh(rt, today_str: str) -> bool:
+    return (
+        rt["plan"] is None
+        or rt["plan_stale"]
+        or rt["plan_day"] != today_str
+        or time.time() - rt["plan_loaded_ts"] > PLAN_MAX_AGE_SECONDS
+    )
+
+
+def _scheduler_has_work(rt, now) -> bool:
+    """True when this tick must touch the database: the cached plan needs a refresh, queued
+    messages are waiting, or a morning / 10-minute / 6-hour job is inside its window and not done."""
+    today_str = now.strftime("%Y-%m-%d")
+    with rt["lock"]:
+        if _plan_needs_refresh(rt, today_str):
+            return True
+        if rt["queue_dirty"] and time.time() >= rt["queue_retry_at"]:
+            return True
+        plan = rt["plan"]
+
+    if plan["has_teacher"]:
+        m_hr, m_min = plan["morning"]
+        morning_dt = now.replace(hour=m_hr, minute=m_min, second=0, microsecond=0)
+        if 0 <= (now - morning_dt).total_seconds() <= 28800 and not _memo_has(rt, f"morning_sched_{today_str}"):
+            return True
+
+    today_day = now.strftime("%a")
+    for grp, day, mtime in plan["meetings"]:
+        if day != today_day:
+            continue
+        try:
+            hr, mn = [int(x) for x in mtime.split(":")[:2]]
+            lecture_dt = now.replace(hour=hr, minute=mn, second=0, microsecond=0)
+        except Exception:
+            continue
+        minutes_until_lecture = (lecture_dt - now).total_seconds() / 60.0
+        if (
+            plan["has_teacher"]
+            and -5 <= minutes_until_lecture <= 15
+            and not _memo_has(rt, f"10m|{today_str}|{grp}|{mtime}")
+        ):
+            return True
+        if 300 <= minutes_until_lecture <= 380 and not _memo_has(rt, f"6h|{today_str}|{grp}|{mtime}"):
+            return True
+    return False
+
+
+def run_scheduler_tick(db) -> bool:
+    """One daemon tick. Runs the database checks only when _scheduler_has_work() says so,
+    which lets the Neon compute scale to zero between jobs. Returns whether they ran."""
+    rt = get_daemon_runtime()
+    now = datetime.datetime.now(CAIRO_TZ)
+    with rt["lock"]:
+        rt["last_tick"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        rt["last_tick_ts"] = time.time()
+    if not _scheduler_has_work(rt, now):
+        return False
+    run_scheduled_checks_once(db)
+    return True
 
 
 def run_scheduled_checks_once(db):
@@ -1162,6 +1314,12 @@ def run_scheduled_checks_once(db):
     with rt["lock"]:
         rt["last_tick"] = now_str
         rt["last_tick_ts"] = time.time()
+        plan_needs_refresh = _plan_needs_refresh(rt, today_str)
+    if plan_needs_refresh:
+        try:
+            _load_schedule_plan(db, rt, today_str)
+        except Exception as e:
+            _record_scheduler_error(db, rt, f"Schedule plan load error: {e}")
 
     try:
         set_bot_setting(db, "last_scheduler_tick", now_str)
@@ -1202,12 +1360,16 @@ def run_scheduled_checks_once(db):
     yesterday_dt = now - datetime.timedelta(days=1)
     yesterday_str = yesterday_dt.strftime("%Y-%m-%d")
     yesterday_day = yesterday_dt.strftime("%a")
-    
+    pace_memo = f"pace_checked_{yesterday_str}"
+
     try:
-        y_meetings = db.fetch_dataframe(
-            "SELECT DISTINCT TRIM(group_number) AS grp FROM group_meeting_times WHERE day_of_week = %s",
-            (yesterday_day,)
-        )
+        if _memo_has(rt, pace_memo):
+            y_meetings = pd.DataFrame(columns=["grp"])
+        else:
+            y_meetings = db.fetch_dataframe(
+                "SELECT DISTINCT TRIM(group_number) AS grp FROM group_meeting_times WHERE day_of_week = %s",
+                (yesterday_day,)
+            )
         for _, ym_row in y_meetings.iterrows():
             y_grp = str(ym_row["grp"]).strip()
             if not y_grp:
@@ -1221,8 +1383,11 @@ def run_scheduled_checks_once(db):
                         (y_grp,)
                     )
                     if not cfg_df.empty:
+                        # Plain ints/None: psycopg2 can't adapt numpy.int64 in the UPDATE below.
                         cur_hw = cfg_df.iloc[0]["latest_hw_id"]
+                        cur_hw = int(cur_hw) if pd.notna(cur_hw) else None
                         cur_qz = cfg_df.iloc[0]["latest_quiz_id"]
+                        cur_qz = int(cur_qz) if pd.notna(cur_qz) else None
                         
                         new_hw, new_qz = cur_hw, cur_qz
                         updated = False
@@ -1247,6 +1412,7 @@ def run_scheduled_checks_once(db):
                                 (new_hw, new_qz, y_grp)
                             )
                             _record_scheduler_action(db, rt, f"Auto-advanced pace for Group {y_grp} (HW: {new_hw}, QZ: {new_qz})")
+        _memo_add(rt, pace_memo)
     except Exception as e:
         _record_scheduler_error(db, rt, f"Next-day pace advance error: {e}")
     # ---------------------------------------------------------
@@ -1292,19 +1458,27 @@ def run_scheduled_checks_once(db):
             qz_id = int(m_row["latest_quiz_id"]) if pd.notna(m_row.get("latest_quiz_id")) else None
 
             done10 = f"teacher10_done_{today_str}_{grp}_{mtime}"
-            if teacher_phone_clean and -5 <= minutes_until_lecture <= 15 and not has_dispatched(db, done10):
-                if send_group_master_reports_to_teacher(
+            memo10 = f"10m|{today_str}|{grp}|{mtime}"
+            if teacher_phone_clean and -5 <= minutes_until_lecture <= 15 and not _memo_has(rt, memo10):
+                if has_dispatched(db, done10):
+                    _memo_add(rt, memo10)
+                elif send_group_master_reports_to_teacher(
                     db, client, teacher_phone_clean, grp, mtime, hw_id, qz_id, hw_map, qz_map, today_str=today_str
                 ):
                     mark_dispatched(db, done10)
+                    _memo_add(rt, memo10)
                     _record_scheduler_action(db, rt, f"Sent 10-min Report for Group {grp}")
 
             done_key = f"6hr_done_{today_str}_{grp}_hw{hw_id}"
-            if hw_id and 300 <= minutes_until_lecture <= 380 and not has_dispatched(db, done_key):
-                if send_6hr_unsubmitted_reminders(
+            memo6 = f"6h|{today_str}|{grp}|{mtime}"
+            if 300 <= minutes_until_lecture <= 380 and not _memo_has(rt, memo6):
+                if not hw_id or has_dispatched(db, done_key):
+                    _memo_add(rt, memo6)
+                elif send_6hr_unsubmitted_reminders(
                     db, client, grp, mtime, hw_id, qz_id, hw_map, qz_map, use_keys=True
                 ):
                     mark_dispatched(db, done_key)
+                    _memo_add(rt, memo6)
                     _record_scheduler_action(db, rt, f"Sent 6-hr Reminders for Group {grp}")
         except Exception as e:
             _record_scheduler_error(db, rt, f"Group {grp} {mtime}: {e}")
@@ -1501,9 +1675,10 @@ def send_6hr_unsubmitted_reminders(
 
 
 def start_background_automation_daemon(db):
-    """Starts a single background daemon thread across the Streamlit server process."""
-    init_automation_tables(db)
-    _sync_secrets_to_cache_and_db(db)
+    """Starts a single background daemon thread across the Streamlit server process.
+
+    Called on every rerun, so the database setup runs only on the first call.
+    """
     rt = get_daemon_runtime()
 
     with rt["lock"]:
@@ -1511,10 +1686,18 @@ def start_background_automation_daemon(db):
             return
         rt["daemon_started"] = True
 
+    try:
+        init_automation_tables(db)
+        _sync_secrets_to_cache_and_db(db)
+    except Exception:
+        with rt["lock"]:
+            rt["daemon_started"] = False
+        raise
+
     def _daemon_loop():
         while True:
             try:
-                run_scheduled_checks_once(db)
+                run_scheduler_tick(db)
             except Exception as e:
                 with rt["lock"]:
                     rt["last_error"] = f"Daemon loop error: {e}"
@@ -1540,6 +1723,8 @@ class AutomatedMessagesView:
         )
 
         rt = get_daemon_runtime()
+        # Settings and meeting times are edited on this page; have the scheduler re-read them.
+        mark_schedule_stale()
         now_dt = datetime.datetime.now(CAIRO_TZ)
         now_cairo = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1548,14 +1733,16 @@ class AutomatedMessagesView:
         db_last_error = get_bot_setting(self.db, "last_scheduler_error", "")
 
         with rt["lock"]:
-            d_tick = db_last_tick or rt.get("last_tick") or "No tick recorded yet"
+            # The daemon writes its tick to the database only when it has work, so memory is newer.
+            d_tick = rt.get("last_tick") or db_last_tick or "No tick recorded yet"
+            mem_tick_ts = rt.get("last_tick_ts") or 0.0
             d_action = db_last_action or rt.get("last_action", "Initialized — waiting for first check...")
             d_grade = rt.get("last_grade_status", "No grade saved in this session yet.")
             d_hw_sub = rt.get("last_hw_sub_status", "No homework submission alert sent in this session yet.")
             d_err = db_last_error or rt.get("last_error")
 
-        scheduler_active = False
-        if db_last_tick:
+        scheduler_active = time.time() - mem_tick_ts < 15 * 60
+        if not scheduler_active and db_last_tick:
             try:
                 tick_dt = datetime.datetime.strptime(db_last_tick, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CAIRO_TZ)
                 if (now_dt - tick_dt).total_seconds() < 15 * 60:
