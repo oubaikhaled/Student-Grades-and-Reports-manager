@@ -1,4 +1,5 @@
 import os
+import time
 import warnings
 import pandas as pd
 import psycopg2
@@ -10,12 +11,14 @@ import streamlit as st
 warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
 
 EXCEL_FILE = "students-list.xlsx"
+PING_IF_IDLE_SECONDS = 30
 
 
 class DatabaseManager:
     def __init__(self, db_url):
         self.db_url = db_url
         self._pool = None
+        self._last_used = {}  # id(pooled connection) -> time it was last returned healthy
         self._init_pool()
 
     def _init_pool(self):
@@ -25,6 +28,7 @@ class DatabaseManager:
                     self._pool.closeall()
                 except Exception:
                     pass
+            self._last_used.clear()
             self._pool = pool.ThreadedConnectionPool(
                 minconn=1,
                 maxconn=10,
@@ -46,9 +50,12 @@ class DatabaseManager:
                     self._pool.putconn(conn, close=True)
                     return psycopg2.connect(self.db_url), False
 
-                # Ping the server to verify the SSL connection wasn't dropped by Neon/cloud proxy
-                with conn.cursor() as c:
-                    c.execute("SELECT 1")
+                # Ping the server to verify the SSL connection wasn't dropped by Neon/cloud proxy.
+                # Neon only drops connections after minutes of inactivity, so a connection used
+                # moments ago skips the extra round trip.
+                if time.time() - self._last_used.get(id(conn), 0.0) > PING_IF_IDLE_SECONDS:
+                    with conn.cursor() as c:
+                        c.execute("SELECT 1")
                 return conn, True
             except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.DatabaseError):
                 try:
@@ -83,7 +90,12 @@ class DatabaseManager:
             if conn is not None:
                 if from_pool and self._pool is not None:
                     try:
-                        self._pool.putconn(conn, close=(discard or conn.closed != 0))
+                        close = discard or conn.closed != 0
+                        if close:
+                            self._last_used.pop(id(conn), None)
+                        else:
+                            self._last_used[id(conn)] = time.time()
+                        self._pool.putconn(conn, close=close)
                     except Exception:
                         try:
                             conn.close()

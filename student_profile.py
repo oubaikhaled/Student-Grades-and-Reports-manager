@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 from pdf_utils import PDFGenerator
-
-CACHE_TTL = 120
+from portal.config import CACHE_TTL
+from portal.data import invalidate_data_caches
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -184,7 +184,7 @@ class StudentProfileView:
                                 "UPDATE students SET notes = %s WHERE id = %s",
                                 (new_notes.strip(), stu_id),
                             )
-                            st.cache_data.clear()
+                            invalidate_data_caches()
                             st.success("Notes saved successfully!")
                             st.rerun()
                         except Exception as e:
