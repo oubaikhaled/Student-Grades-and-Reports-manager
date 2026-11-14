@@ -1,6 +1,6 @@
 import psycopg2
 
-from portal.config import KINDS
+from portal.config import FULL_MARK_CONGRATS, KINDS
 from portal.data import invalidate_data_caches
 from whatsapp_automation import trigger_post_grade_whatsapp
 
@@ -19,7 +19,26 @@ def mark_homework_submitted(db, homework_id: int, student_id: str):
     invalidate_data_caches()
 
 
+def apply_full_mark_congrats(report, perc):
+    """Puts the congratulations line at the top of the report for a 100% score.
+
+    Safe to call on every save: the line is never duplicated, and it is removed again
+    if a grade that was 100% is later corrected to something lower.
+    """
+    text = str(report or "")
+    is_full_mark = perc is not None and float(perc) >= 99.999
+    if not is_full_mark and FULL_MARK_CONGRATS not in text:
+        return report
+    body = "\n".join(
+        line for line in text.split("\n") if line.strip() != FULL_MARK_CONGRATS
+    ).strip()
+    if not is_full_mark:
+        return body
+    return f"{FULL_MARK_CONGRATS}\n\n{body}" if body else FULL_MARK_CONGRATS
+
+
 def save_grade(db, kind, item_id, student_id, score, perc, report, img_bytes):
+    report = apply_full_mark_congrats(report, perc)
     cfg = KINDS[kind]
     t, ic, sc = cfg["table"], cfg["item_col"], cfg["score_col"]
     cols = [ic, "student_id", sc, "percentage", "report"]

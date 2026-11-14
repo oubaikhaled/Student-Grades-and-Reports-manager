@@ -8,7 +8,13 @@ from ai_grading import (
     parse_api_keys,
 )
 from portal.config import KINDS
-from portal.data import load_item_grades, load_students, merge_grades
+from portal.data import (
+    load_item_grades,
+    load_report_template,
+    load_students,
+    merge_grades,
+    save_report_template,
+)
 from portal.grades import mark_homework_submitted, save_grade
 from portal.images import stitch_images
 from portal.locks import release_my_student_locks, sync_and_claim_student_lock
@@ -47,7 +53,8 @@ def filter_students(df, key_prefix):
 
 
 @st.fragment
-def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label, saved_rubric=""):
+def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label, saved_rubric="",
+                     report_template=""):
     cfg = KINDS[kind]
     ver_key = f"roster_ver_{kind}"
     st.session_state.setdefault(ver_key, 0)
@@ -240,10 +247,12 @@ def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label, 
                     score_key,
                     int(cur) if (pd.notna(cur) and cfg["is_int"]) else (float(cur) if pd.notna(cur) else (0 if cfg["is_int"] else 0.0))
                 )
-                default_report = st.session_state.get(
-                    report_key,
-                    stu["report"] if pd.notna(stu["report"]) else ""
+                # A student with no report yet starts from the template; a saved report
+                # (or a fresh AI report) always takes priority over it.
+                existing_report = (
+                    str(stu["report"]) if pd.notna(stu["report"]) and str(stu["report"]).strip() else ""
                 )
+                default_report = st.session_state.get(report_key, existing_report or report_template)
 
                 ai_rev = "ai" if score_key in st.session_state else "man"
                 with col_manual:
@@ -291,6 +300,10 @@ def grading_fragment(db, kind, item_id, item_title, max_score, df, group_label, 
                         img_bytes = stitch_images(st.session_state[images_key])
                     else:
                         img_bytes = None
+
+                    # An untouched template is not feedback: don't send empty headings to parents.
+                    if report_template and report.strip() == report_template.strip():
+                        report = ""
 
                     perc = (float(score) / float(max_score)) * 100.0 if max_score > 0 else 0
                     save_grade(db, kind, item_id, stu_id, score, perc, report, img_bytes)
@@ -344,6 +357,21 @@ def grading_section(db, kind, item_id, item_title, max_score, saved_rubric=""):
     st.divider()
     st.subheader("🔍 Search & Grade Students")
 
+    cfg = KINDS[kind]
+    report_template = load_report_template(db, kind)
+    with st.expander(f"🧾 Feedback Report Template ({cfg['noun']})", expanded=False):
+        st.caption(
+            "This text is pre-filled in the Feedback Report box for every student who has no "
+            f"report yet. It applies to all {kind} grading. Leave it empty and save to restore "
+            "the built-in template."
+        )
+        with st.form(f"report_template_form_{kind}"):
+            new_template = st.text_area("Template", value=report_template, height=200)
+            if st.form_submit_button("💾 Save Template", type="primary"):
+                save_report_template(db, kind, new_template)
+                st.session_state["flash"] = "Feedback report template updated!"
+                st.rerun()
+
     students_df = load_students(db)
     df = merge_grades(students_df, load_item_grades(db, kind, item_id))
     filtered, filter_group = filter_students(df, kind)
@@ -351,4 +379,7 @@ def grading_section(db, kind, item_id, item_title, max_score, saved_rubric=""):
     if filtered.empty:
         st.warning("No students found matching your filters.")
         return
-    grading_fragment(db, kind, item_id, item_title, max_score, filtered, filter_group, saved_rubric=saved_rubric)
+    grading_fragment(
+        db, kind, item_id, item_title, max_score, filtered, filter_group,
+        saved_rubric=saved_rubric, report_template=report_template,
+    )
