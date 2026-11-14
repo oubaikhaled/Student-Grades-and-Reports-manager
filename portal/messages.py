@@ -3,6 +3,24 @@ import emoji
 from portal.utils import fmt
 
 
+def build_missing_work_parent_message(name, hw_title=None, qz_title=None):
+    """One notice to the parent listing the homework and/or quiz the student has not done."""
+    lines = []
+    if hw_title:
+        lines.append(f"لم يقم بأداء واجب : {hw_title}")
+    if qz_title:
+        lines.append(f"لم يقم بأداء امتحان : {qz_title}")
+    return emoji.emojize(
+        ":bar_chart: متابعة الواجبات والاختبارات\n\n"
+        "نحيط حضرتكم علمًا بأن\n"
+        f"الطالب: {name}\n"
+        + "\n".join(lines)
+        + "\n\n"
+        "برجاء الالتزام بحضور وأداء الواجبات والاختبارات في المواعيد المحددة، ومتابعة جميع التقييمات أولًا بأول.\n\n"
+        "Mathematics Team – Mahmoud Adel"
+    )
+
+
 def build_wa_messages(kind, name, title, score, total):
     """Returns (parent_message, student_message)."""
     if score is not None:

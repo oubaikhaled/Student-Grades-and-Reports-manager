@@ -43,8 +43,15 @@ def render_manage_students(db):
         st.info("No students registered yet.")
         return
 
-    st.caption(f"Current Enrolled Students ({len(students_df)})")
-    st.dataframe(students_df, hide_index=True, use_container_width=True)
+    suspended_ids = set(students_df.loc[students_df["suspended"].astype(bool), "id"].astype(str))
+    st.caption(
+        f"Current Enrolled Students ({len(students_df)}) — "
+        f"{len(students_df) - len(suspended_ids)} active, {len(suspended_ids)} suspended"
+    )
+    display_df = students_df.drop(columns="suspended").assign(
+        status=["⏸️ Suspended" if str(i) in suspended_ids else "✅ Active" for i in students_df["id"]]
+    )
+    st.dataframe(display_df, hide_index=True, use_container_width=True)
 
     st.divider()
 
@@ -65,8 +72,42 @@ def render_manage_students(db):
         st.warning("No students match your search criteria.")
         return
 
-    labels = {str(r.id): f"{r.name} (ID: {r.id})" for r in filtered_df.itertuples(index=False)}
+    labels = {
+        str(r.id): f"{r.name} (ID: {r.id})" + (" — ⏸️ Suspended" if str(r.id) in suspended_ids else "")
+        for r in filtered_df.itertuples(index=False)
+    }
     all_ids = set(students_df["id"].astype(str))
+
+    with st.expander("⏸️ Suspend / Reactivate Student"):
+        st.caption(
+            "A suspended student keeps all grades, reports and notes, but is left out of grading rosters, "
+            "group and master reports, WhatsApp broadcasts, reminders and missing-work notices, and no "
+            "grade messages are sent to the student or the parent. Reactivate at any time to bring "
+            "everything back."
+        )
+        toggle_id = st.selectbox("Select Student", list(labels.keys()),
+                                 format_func=lambda i: labels[i], key="suspend_student_sel")
+        if toggle_id:
+            is_suspended = toggle_id in suspended_ids
+            if st.button(
+                "▶️ Reactivate Student" if is_suspended else "⏸️ Suspend Student",
+                type="primary" if is_suspended else "secondary",
+                key=f"btn_toggle_suspend_{toggle_id}",
+            ):
+                try:
+                    ops = [("UPDATE students SET suspended = %s WHERE id = %s", (not is_suspended, toggle_id))]
+                    if not is_suspended:
+                        # Drop messages for this student that are still waiting in the outbound queue.
+                        ops.append(("DELETE FROM whatsapp_retry_queue WHERE student_id = %s", (toggle_id,)))
+                    run_write(db, ops)
+                    st.session_state["flash"] = (
+                        f"{labels[toggle_id].split(' — ')[0]} reactivated."
+                        if is_suspended
+                        else f"{labels[toggle_id]} suspended. No messages will be sent and the student is hidden from reports."
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to update student. Error: {e}")
 
     with st.expander("✏️ Edit Student Data"):
         edit_id = st.selectbox("Select Student to Edit", list(labels.keys()),
@@ -90,12 +131,13 @@ def render_manage_students(db):
                     else:
                         try:
                             if new_id != edit_id:
+                                # Update in place (not insert + delete) so notes and the
+                                # suspended flag move with the student to the new ID.
                                 ops = [
-                                    ("INSERT INTO students (id, name, phone, phone_parent, group_number) VALUES (%s, %s, %s, %s, %s)",
-                                     (new_id, new_name, new_phone, new_parent_phone, new_group)),
+                                    ("UPDATE students SET id = %s, name = %s, phone = %s, phone_parent = %s, group_number = %s WHERE id = %s",
+                                     (new_id, new_name, new_phone, new_parent_phone, new_group, edit_id)),
                                     ("UPDATE homework_grades SET student_id = %s WHERE student_id = %s", (new_id, edit_id)),
                                     ("UPDATE quiz_grades SET student_id = %s WHERE student_id = %s", (new_id, edit_id)),
-                                    ("DELETE FROM students WHERE id = %s", (edit_id,)),
                                 ]
                             else:
                                 ops = [(

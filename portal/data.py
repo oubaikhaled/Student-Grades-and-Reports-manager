@@ -34,8 +34,15 @@ def load_quizzes(_db):
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_students(_db):
     return _db.fetch_dataframe(
-        "SELECT id, name, phone, phone_parent, group_number FROM students ORDER BY name ASC"
+        "SELECT id, name, phone, phone_parent, group_number, "
+        "COALESCE(suspended, FALSE) AS suspended FROM students ORDER BY name ASC"
     )
+
+
+def load_active_students(db):
+    """Students who are not suspended: the list for grading rosters, reports and messaging."""
+    df = load_students(db)
+    return df[~df["suspended"].astype(bool)].drop(columns="suspended").reset_index(drop=True)
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)

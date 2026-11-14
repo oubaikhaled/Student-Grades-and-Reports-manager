@@ -84,6 +84,8 @@ def get_daemon_runtime():
 PLAN_MAX_AGE_SECONDS = 6 * 3600
 # Waits before retrying a queue that still has failed messages (seconds, grows per failure).
 QUEUE_RETRY_BACKOFF_SECONDS = (120, 300, 600, 1200, 1800)
+# Minimum gap between two queued messages, so the account never sends a burst (WhatsApp ban risk).
+QUEUE_SEND_INTERVAL_SECONDS = 60
 
 
 def mark_schedule_stale():
@@ -680,7 +682,7 @@ def enqueue_failed_whatsapp(
                 (clean_dedup,),
             )
             if existing and int(existing) > 0:
-                return
+                return True
 
         db.execute_query(
             """
@@ -699,19 +701,26 @@ def enqueue_failed_whatsapp(
             ),
         )
         _mark_queue_dirty()
+        return True
     except Exception as e:
         print(f"[RetryQueue] Could not enqueue message for {recipient}: {e}")
+        return False
 
 
 def enqueue_outbound(db, recipient, message_type, **kw):
-    """Put a fresh outbound message in the queue. The daemon sends it (attempts starts at 0)."""
-    enqueue_failed_whatsapp(db, recipient, message_type, attempts=0, **kw)
+    """Put a fresh outbound message in the queue. The daemon sends it (attempts starts at 0).
+
+    Returns True when the message is in the queue.
+    """
+    return enqueue_failed_whatsapp(db, recipient, message_type, attempts=0, **kw)
 
 
 def process_whatsapp_retry_queue(db, client: GowaClient, rt):
     """
-    Drains `whatsapp_retry_queue` safely one row at a time.
-    Isolates errors per row so one bad row never blocks the rest of the queue.
+    Sends at most ONE message from `whatsapp_retry_queue` per call, and only when at least
+    QUEUE_SEND_INTERVAL_SECONDS have passed since the previous queued message. The 60s daemon
+    tick calls this again while messages remain, so the queue drains at one message per minute.
+    Rows that failed before go to the back, so one bad row never blocks the rest of the queue.
     """
     with rt["lock"]:
         qlock = rt.setdefault("queue_lock", threading.Lock())
@@ -720,12 +729,19 @@ def process_whatsapp_retry_queue(db, client: GowaClient, rt):
     # Messages queued from now on set the flag again, so none are missed by this drain.
     with rt["lock"]:
         rt["queue_dirty"] = False
+        last_send_ts = rt.get("queue_last_send_ts", 0.0)
     failed = False
     unfinished = False
+    rate_limited = False
     try:
+        if time.time() - last_send_ts < QUEUE_SEND_INTERVAL_SECONDS:
+            rate_limited = True     # too soon after the previous message; a later tick sends
+            return
+
         try:
             q_df = db.fetch_dataframe(
-                "SELECT * FROM whatsapp_retry_queue WHERE attempts < 15 ORDER BY queue_id ASC LIMIT 25"
+                "SELECT * FROM whatsapp_retry_queue WHERE attempts < 15 "
+                "ORDER BY attempts ASC, queue_id ASC LIMIT 2"
             )
         except Exception as e:
             failed = True
@@ -734,7 +750,8 @@ def process_whatsapp_retry_queue(db, client: GowaClient, rt):
 
         if q_df.empty:
             return
-        unfinished = len(q_df) >= 25
+        unfinished = len(q_df) > 1
+        q_df = q_df.head(1)
 
         # Give Render up to 55s to wake up from cold start
         ok_awake, awake_msg = client.ensure_awake(max_wait_seconds=55)
@@ -759,6 +776,9 @@ def process_whatsapp_retry_queue(db, client: GowaClient, rt):
                     "UPDATE whatsapp_retry_queue SET attempts = attempts + 1 WHERE queue_id = %s",
                     (qid,),
                 )
+                # Start the one-minute gap now, whether or not this attempt succeeds.
+                with rt["lock"]:
+                    rt["queue_last_send_ts"] = time.time()
 
                 if mtype == "text":
                     ok, err = client.send_text(recipient, str(row.get("message_text") or ""), retries=1)
@@ -815,13 +835,11 @@ def process_whatsapp_retry_queue(db, client: GowaClient, rt):
             except Exception as row_err:
                 failed = True
                 _record_scheduler_error(db, rt, f"Row drain exception: {row_err}")
-
-            # Wait 3.5 seconds between messages so GOWA's WhatsApp socket never chokes on multi-message bursts
-            if idx < len(q_df) - 1:
-                time.sleep(3.5)
     finally:
         with rt["lock"]:
-            if failed:
+            if rate_limited:
+                rt["queue_dirty"] = True    # leave backoff state alone; just look again next tick
+            elif failed:
                 # Retry later instead of every minute, so a down GOWA server doesn't keep Neon awake.
                 level = rt["queue_backoff_level"]
                 delay = QUEUE_RETRY_BACKOFF_SECONDS[min(level, len(QUEUE_RETRY_BACKOFF_SECONDS) - 1)]
@@ -974,7 +992,8 @@ def trigger_post_grade_whatsapp(
 
     try:
         stu_df = db.fetch_dataframe(
-            "SELECT name, phone, phone_parent, group_number FROM students WHERE id = %s",
+            "SELECT name, phone, phone_parent, group_number, "
+            "COALESCE(suspended, FALSE) AS suspended FROM students WHERE id = %s",
             (str(student_id),),
         )
         if stu_df.empty:
@@ -986,6 +1005,9 @@ def trigger_post_grade_whatsapp(
         group_number = str(stu.get("group_number") or "N/A").strip()
         parent_phone = clean_wa_phone(stu.get("phone_parent"))
         student_phone = clean_wa_phone(stu.get("phone"))
+        if bool(stu.get("suspended")):
+            # Suspended: nothing goes to the student or the parent.
+            parent_phone = student_phone = None
     except Exception as e:
         with rt["lock"]:
             rt["last_grade_status"] = f"DB fetch error on grade save: {e}"
@@ -1491,7 +1513,8 @@ def send_group_master_reports_to_teacher(
     today_str: str | None = None,
 ) -> bool:
     students_df = db.fetch_dataframe(
-        "SELECT id, name FROM students WHERE TRIM(group_number) = %s ORDER BY name ASC",
+        "SELECT id, name FROM students WHERE TRIM(group_number) = %s "
+        "AND COALESCE(suspended, FALSE) = FALSE ORDER BY name ASC",
         (grp,),
     )
     if students_df.empty:
@@ -1610,7 +1633,8 @@ def send_6hr_unsubmitted_reminders(
         return True            # nothing to remind about; do NOT return False (it caused retries every minute)
 
     students_df = db.fetch_dataframe(
-        "SELECT id, name, phone, phone_parent FROM students WHERE TRIM(group_number) = %s",
+        "SELECT id, name, phone, phone_parent FROM students "
+        "WHERE TRIM(group_number) = %s AND COALESCE(suspended, FALSE) = FALSE",
         (grp,),
     )
     if students_df.empty:
@@ -1638,7 +1662,6 @@ def send_6hr_unsubmitted_reminders(
 
     today = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
     all_handled = True
-    consecutive_fail = 0
     for stu in unsubmitted_rows:
         sid = str(stu["id"])
         stu_name = str(stu["name"])
@@ -1659,19 +1682,102 @@ def send_6hr_unsubmitted_reminders(
             f"برجاء سرعة رفع الواجب على المنصة قبل موعد الحصة.\n\n"
             f"Mathematics Team – Eng. Mahmoud Adel"
         )
-        ok, err = client.send_text(stu_phone, reminder_msg)
-        if ok:
-            consecutive_fail = 0
-            time.sleep(4)
-        else:
+        # Goes through the outbound queue, which sends one message per minute. Sending the
+        # whole group directly a few seconds apart is the kind of burst that gets accounts banned.
+        queued_ok = enqueue_outbound(
+            db, stu_phone, "text", message_text=reminder_msg, student_id=sid, student_name=stu_name
+        )
+        if not queued_ok:
             if use_keys:
                 release_dispatch(db, key)   # only this student is retried next tick
             all_handled = False
-            consecutive_fail += 1
-            if consecutive_fail >= 3:
-                break          # GOWA is probably down; stop hammering, next tick resumes
 
     return all_handled
+
+
+# ---------------------------------------------------------------------------
+# Missing Homework / Quiz Notices to Parents (manual trigger)
+# ---------------------------------------------------------------------------
+def get_missing_work_for_group(db, grp: str, hw_id: int | None, qz_id: int | None) -> list[dict]:
+    """Active (not suspended) students in the group who have not submitted the homework
+    and/or have no score in the quiz. Pass None for hw_id / qz_id to leave that check out."""
+    students_df = db.fetch_dataframe(
+        "SELECT id, name, phone_parent FROM students "
+        "WHERE TRIM(group_number) = %s AND COALESCE(suspended, FALSE) = FALSE ORDER BY name ASC",
+        (grp,),
+    )
+    if students_df.empty:
+        return []
+
+    hw_done, qz_done = set(), set()
+    if hw_id:
+        hw_df = db.fetch_dataframe(
+            "SELECT student_id FROM homework_grades WHERE homework_id = %s "
+            "AND (correct_answers IS NOT NULL OR COALESCE(submitted, FALSE) = TRUE)",
+            (int(hw_id),),
+        )
+        hw_done = {str(s) for s in hw_df["student_id"]}
+    if qz_id:
+        qz_df = db.fetch_dataframe(
+            "SELECT student_id FROM quiz_grades WHERE quiz_id = %s AND score IS NOT NULL",
+            (int(qz_id),),
+        )
+        qz_done = {str(s) for s in qz_df["student_id"]}
+
+    missing = []
+    for _, stu in students_df.iterrows():
+        sid = str(stu["id"])
+        missing_hw = bool(hw_id) and sid not in hw_done
+        missing_qz = bool(qz_id) and sid not in qz_done
+        if missing_hw or missing_qz:
+            missing.append({
+                "id": sid,
+                "name": str(stu["name"]),
+                "parent_phone": clean_wa_phone(stu.get("phone_parent")),
+                "missing_hw": missing_hw,
+                "missing_qz": missing_qz,
+            })
+    return missing
+
+
+def queue_missing_work_parent_notices(
+    db, grp: str, hw_id: int | None, qz_id: int | None, hw_title: str | None, qz_title: str | None
+) -> tuple[int, int, int]:
+    """Queues one WhatsApp notice per parent whose child is missing the homework and/or quiz.
+
+    Returns (queued, skipped_no_parent_phone, skipped_already_notified_today). A parent is
+    notified at most once per day for the same student and the same missing items.
+    """
+    from portal.messages import build_missing_work_parent_message
+
+    today = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
+    queued = no_phone = already = 0
+    for m in get_missing_work_for_group(db, grp, hw_id, qz_id):
+        if not m["parent_phone"]:
+            no_phone += 1
+            continue
+        key = (
+            f"missing_{today}_hw{int(hw_id) if m['missing_hw'] else 0}"
+            f"_qz{int(qz_id) if m['missing_qz'] else 0}_stu{m['id']}"
+        )
+        if not claim_dispatch(db, key):
+            already += 1
+            continue
+        msg = build_missing_work_parent_message(
+            m["name"],
+            hw_title if m["missing_hw"] else None,
+            qz_title if m["missing_qz"] else None,
+        )
+        if enqueue_outbound(
+            db, m["parent_phone"], "text", message_text=msg, student_id=m["id"], student_name=m["name"]
+        ):
+            queued += 1
+        else:
+            release_dispatch(db, key)
+
+    if queued > 0:
+        trigger_queue_drain_async(db)
+    return queued, no_phone, already
 
 
 def start_background_automation_daemon(db):
@@ -1802,7 +1908,8 @@ class AutomatedMessagesView:
         ])
 
         students_df = self.db.fetch_dataframe(
-            "SELECT id, name, phone, phone_parent, group_number FROM students ORDER BY name ASC"
+            "SELECT id, name, phone, phone_parent, group_number FROM students "
+            "WHERE COALESCE(suspended, FALSE) = FALSE ORDER BY name ASC"
         )
         groups = sorted({
             str(g).strip()
@@ -2076,6 +2183,85 @@ class AutomatedMessagesView:
                             st.success(f"Started sending reminders in the background to unsubmitted students in Group {test_grp}!")
                     st.caption("Students already reminded today are skipped.")
 
+                st.divider()
+                st.markdown("#### 📣 Notify Parents of Missing Homework / Quiz")
+                st.caption(
+                    "Use this after the group's lecture has started. One click queues a WhatsApp notice to "
+                    "the parent of every student in the group who has not submitted the group's active "
+                    "homework and/or has no score in its active quiz. Messages go out one per minute, a "
+                    "parent is notified at most once per day for the same items, and suspended students "
+                    "are skipped."
+                )
+                mw_c1, mw_c2, mw_c3 = st.columns([1.4, 1, 1])
+                mw_grp = str(mw_c1.selectbox("Group", groups, key="mw_grp_sel")).strip()
+                mw_hw_on = mw_c2.checkbox("Include homework", value=True, key="mw_hw_on")
+                mw_qz_on = mw_c3.checkbox("Include quiz", value=True, key="mw_qz_on")
+
+                mw_hid, mw_qid, _, _ = get_effective_group_pace(
+                    configs_map.get(mw_grp, {}), default_latest_hw_id, default_latest_qz_id
+                )
+                mw_hid = mw_hid if (mw_hw_on and mw_hid in hw_options) else None
+                mw_qid = mw_qid if (mw_qz_on and mw_qid in qz_options) else None
+                mw_hw_title = hw_options[mw_hid] if mw_hid else None
+                mw_qz_title = qz_options[mw_qid] if mw_qid else None
+
+                if not mw_hid and not mw_qid:
+                    st.info("Nothing to check: tick homework and/or quiz, and make sure one exists for this group.")
+                else:
+                    mw_missing = get_missing_work_for_group(self.db, mw_grp, mw_hid, mw_qid)
+                    mw_with_phone = [m for m in mw_missing if m["parent_phone"]]
+                    mw_no_phone = len(mw_missing) - len(mw_with_phone)
+
+                    mw_lines = []
+                    if mw_hid:
+                        mw_lines.append(
+                            f"📘 Homework **{mw_hw_title}**: {sum(m['missing_hw'] for m in mw_missing)} not submitted"
+                        )
+                    if mw_qid:
+                        mw_lines.append(
+                            f"📝 Quiz **{mw_qz_title}**: {sum(m['missing_qz'] for m in mw_missing)} without a score"
+                        )
+                    st.markdown("  \n".join(mw_lines))
+                    if mw_no_phone:
+                        st.warning(f"{mw_no_phone} of these student(s) have no valid parent phone and will be skipped.")
+
+                    if mw_missing:
+                        with st.expander(f"👀 Preview the {len(mw_missing)} student(s)", expanded=False):
+                            st.dataframe(
+                                pd.DataFrame([
+                                    {
+                                        "ID": m["id"],
+                                        "Name": m["name"],
+                                        "Missing Homework": m["missing_hw"],
+                                        "Missing Quiz": m["missing_qz"],
+                                        "Parent Phone": m["parent_phone"] or "— none —",
+                                    }
+                                    for m in mw_missing
+                                ]),
+                                hide_index=True,
+                                use_container_width=True,
+                            )
+
+                    if st.button(
+                        f"📣 Send Missing-Work Notices to {len(mw_with_phone)} Parent(s) of Group {mw_grp}",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not mw_with_phone,
+                        key=f"btn_missing_work_{mw_grp}",
+                    ):
+                        mw_queued, mw_skipped_phone, mw_already = queue_missing_work_parent_notices(
+                            self.db, mw_grp, mw_hid, mw_qid, mw_hw_title, mw_qz_title
+                        )
+                        if mw_queued:
+                            st.success(
+                                f"Queued {mw_queued} notice(s). The bot sends them one per minute, so the last "
+                                f"one goes out in about {mw_queued} minute(s). You can close this page."
+                            )
+                        else:
+                            st.info("No new notices were queued.")
+                        if mw_already:
+                            st.caption(f"{mw_already} parent(s) were already notified today for the same items and were skipped.")
+
         # ===================================================================
         # TAB 2: MANUAL BROADCAST TAB
         # ===================================================================
@@ -2148,7 +2334,7 @@ class AutomatedMessagesView:
                             for jid in jids:
                                 queued += _enq(jid, custom_msg.strip())
                             st.success(
-                                f"Queued {queued} message(s). The bot sends them in the background, about 25 per minute. You can close this page."
+                                f"Queued {queued} message(s). The bot sends them in the background, one per minute. You can close this page."
                             )
                             if queued > 0:
                                 trigger_queue_drain_async(self.db)
@@ -2172,7 +2358,7 @@ class AutomatedMessagesView:
                                     queued += _enq(p_phone, personalized)
 
                             st.success(
-                                f"Queued {queued} message(s). The bot sends them in the background, about 25 per minute. You can close this page."
+                                f"Queued {queued} message(s). The bot sends them in the background, one per minute. You can close this page."
                             )
                             if queued > 0:
                                 trigger_queue_drain_async(self.db)
