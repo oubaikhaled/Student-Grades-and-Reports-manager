@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from portal.config import PAGE_SIZE
-from portal.data import load_chapters, load_homeworks, load_item_grades, load_quizzes, load_students, merge_grades
+from portal.data import load_active_students, load_chapters, load_homeworks, load_item_grades, load_quizzes, merge_grades
 from portal.messages import build_wa_messages
 from portal.reports import build_report_pdf
 from portal.utils import clean, fmt, set_flag
@@ -125,7 +125,7 @@ def render_whatsapp_broadcast(db):
         vid = None
     title = row["title"]
 
-    students_df = load_students(db)
+    students_df = load_active_students(db)
     if students_df.empty:
         st.warning("No students found in the database.")
         return

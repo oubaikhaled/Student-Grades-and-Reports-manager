@@ -200,6 +200,7 @@ class DatabaseManager:
                     c.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS group_number TEXT;")
                     c.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS password_hash TEXT;")
                     c.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS notes TEXT;")
+                    c.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS suspended BOOLEAN DEFAULT FALSE;")
                     c.execute("ALTER TABLE homeworks ADD COLUMN IF NOT EXISTS lesson_id INTEGER;")
                     c.execute("ALTER TABLE homeworks ADD COLUMN IF NOT EXISTS chapter_id INTEGER;")
                     c.execute("ALTER TABLE homeworks ADD COLUMN IF NOT EXISTS video_link TEXT;")

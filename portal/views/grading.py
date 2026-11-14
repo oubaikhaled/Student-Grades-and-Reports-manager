@@ -11,7 +11,7 @@ from portal.config import KINDS
 from portal.data import (
     load_item_grades,
     load_report_template,
-    load_students,
+    load_active_students,
     merge_grades,
     save_report_template,
 )
@@ -372,7 +372,7 @@ def grading_section(db, kind, item_id, item_title, max_score, saved_rubric=""):
                 st.session_state["flash"] = "Feedback report template updated!"
                 st.rerun()
 
-    students_df = load_students(db)
+    students_df = load_active_students(db)
     df = merge_grades(students_df, load_item_grades(db, kind, item_id))
     filtered, filter_group = filter_students(df, kind)
 
