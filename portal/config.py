@@ -12,6 +12,18 @@ MAX_TOTAL_UPLOAD_MB = 200    # all files in one homework submission together
 
 DEFAULT_DRIVE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyLOJdL4kViRmyqtjETxu6qjjVi98MaqymDvemG8mA6PPGGuhf9WR0dqDrh8sVa5VBTug/exec"
 
+# Pre-filled into the Feedback Report box when a student has no report yet.
+# Admins can change it per kind from the grading page (stored in bot_settings).
+DEFAULT_REPORT_TEMPLATE = (
+    "Notes on specific question :\n\n"
+    "wrong questions :\n\n"
+    "missing questions :\n\n"
+    "General Notes:"
+)
+
+# Added automatically at the top of the feedback report when a student scores 100%.
+FULL_MARK_CONGRATS = "Congratulations! You achieved the full mark (100%). Excellent work, keep it up!"
+
 KINDS = {
     "homework": {
         "table": "homework_grades", "item_col": "homework_id", "score_col": "correct_answers",

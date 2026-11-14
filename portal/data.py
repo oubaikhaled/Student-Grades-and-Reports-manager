@@ -1,7 +1,7 @@
 import streamlit as st
 
 from database import DatabaseManager
-from portal.config import CACHE_TTL, KINDS
+from portal.config import CACHE_TTL, DEFAULT_REPORT_TEMPLATE, KINDS
 
 
 @st.cache_resource(show_spinner=False)
@@ -87,6 +87,28 @@ def load_parent_grades(_db, kind, student_ids):
     return _db.fetch_dataframe(sql, (tuple(student_ids),))
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def load_report_template(_db, kind):
+    """Feedback report template for 'homework' or 'quiz'; the built-in one if none is saved."""
+    try:
+        val = _db.execute_scalar(
+            "SELECT setting_value FROM bot_settings WHERE setting_key = %s",
+            (f"report_template_{kind}",),
+        )
+    except Exception:
+        val = None
+    return str(val) if val is not None and str(val).strip() else DEFAULT_REPORT_TEMPLATE
+
+
+def save_report_template(db, kind, text):
+    """Saves the template for one kind. Blank text restores the built-in template."""
+    run_write(db, [(
+        "INSERT INTO bot_settings (setting_key, setting_value) VALUES (%s, %s) "
+        "ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value",
+        (f"report_template_{kind}", str(text or "").strip()),
+    )])
+
+
 def merge_grades(students_df, grades_df):
     out = students_df.copy()
     if grades_df.empty:
@@ -144,5 +166,6 @@ def invalidate_data_caches():
         load_chapters, load_homeworks, load_quizzes, load_students, load_item_grades,
         load_parent_students, load_parent_grades, build_report_pdf, get_cached_master_report,
         load_all_students_with_notes, load_student_profile_grades, build_cached_profile_pdf,
+        load_report_template,
     ):
         fn.clear()
