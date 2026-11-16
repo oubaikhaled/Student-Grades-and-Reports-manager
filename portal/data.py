@@ -12,6 +12,31 @@ def get_db():
     return db
 
 
+# Bump this whenever a statement is added to SCHEMA_MIGRATIONS.
+SCHEMA_VERSION = 2
+SCHEMA_MIGRATIONS = (
+    "ALTER TABLE students ADD COLUMN IF NOT EXISTS suspended BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE students ADD COLUMN IF NOT EXISTS warnings INTEGER DEFAULT 0",
+)
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_schema(_db, version=SCHEMA_VERSION):
+    """Applies column additions that newer code depends on, once per server process and version.
+
+    get_db() is cached for the life of the process, and Streamlit Cloud deploys new code
+    without restarting it, so init_db() does not run again after a deploy. This runs under its
+    own cache key instead: new code with a higher SCHEMA_VERSION applies its migrations on the
+    first page load. Errors are not swallowed, so a failed migration is visible immediately.
+    """
+    with _db.get_connection() as conn:
+        with conn.cursor() as c:
+            for statement in SCHEMA_MIGRATIONS:
+                c.execute(statement)
+        conn.commit()
+    return version
+
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_chapters(_db):
     return _db.fetch_dataframe("SELECT chapter_id, title FROM chapters ORDER BY chapter_id ASC")
@@ -35,14 +60,15 @@ def load_quizzes(_db):
 def load_students(_db):
     return _db.fetch_dataframe(
         "SELECT id, name, phone, phone_parent, group_number, "
-        "COALESCE(suspended, FALSE) AS suspended FROM students ORDER BY name ASC"
+        "COALESCE(suspended, FALSE) AS suspended, COALESCE(warnings, 0) AS warnings "
+        "FROM students ORDER BY name ASC"
     )
 
 
 def load_active_students(db):
     """Students who are not suspended: the list for grading rosters, reports and messaging."""
     df = load_students(db)
-    return df[~df["suspended"].astype(bool)].drop(columns="suspended").reset_index(drop=True)
+    return df[~df["suspended"].astype(bool)].drop(columns=["suspended", "warnings"]).reset_index(drop=True)
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)

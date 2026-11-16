@@ -24,6 +24,11 @@ DEFAULT_REPORT_TEMPLATE = (
 # Added automatically at the top of the feedback report when a student scores 100%.
 FULL_MARK_CONGRATS = "Congratulations! You achieved the full mark (100%). Excellent work, keep it up!"
 
+# A warning is given each time a missing-work notice is sent to the parent.
+# On reaching this many, the student is suspended automatically.
+MAX_WARNINGS = 3
+SUSPENDED_ACCOUNT_MESSAGE = "لقد تم ايقاف حسابك يرجى التواصل مع المدرس او المساعدين لحل المشكلة"
+
 KINDS = {
     "homework": {
         "table": "homework_grades", "item_col": "homework_id", "score_col": "correct_answers",
