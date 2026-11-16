@@ -2,7 +2,9 @@ import pandas as pd
 import psycopg2
 import streamlit as st
 
-from portal.data import load_students, run_write
+from portal.config import MAX_WARNINGS
+from portal.data import invalidate_data_caches, load_students, run_write
+from whatsapp_automation import give_student_warning
 
 
 def render_manage_students(db):
@@ -82,20 +84,69 @@ def render_manage_students(db):
         st.caption(
             "A suspended student keeps all grades, reports and notes, but is left out of grading rosters, "
             "group and master reports, WhatsApp broadcasts, reminders and missing-work notices, and no "
-            "grade messages are sent to the student or the parent. Reactivate at any time to bring "
-            "everything back."
+            "grade messages are sent to the student or the parent, and the student cannot submit homework. "
+            f"A student is also suspended automatically on reaching {MAX_WARNINGS} warnings. Reactivating "
+            "brings everything back and resets the warnings to 0."
         )
         toggle_id = st.selectbox("Select Student", list(labels.keys()),
                                  format_func=lambda i: labels[i], key="suspend_student_sel")
         if toggle_id:
             is_suspended = toggle_id in suspended_ids
+            cur_warnings = int(
+                students_df.loc[students_df["id"].astype(str) == toggle_id, "warnings"].iloc[0] or 0
+            )
+            st.markdown(f"**Warnings:** {cur_warnings} / {MAX_WARNINGS}")
+            if not is_suspended:
+                notify_parent = st.checkbox(
+                    "Send the warning message to the parent on WhatsApp",
+                    value=True,
+                    key=f"warn_notify_{toggle_id}",
+                    help="Untick to record the warning silently, without messaging the parent.",
+                )
+                w_add, w_remove, w_reset = st.columns(3)
+                if w_add.button("➕ Add Warning", key=f"btn_add_warn_{toggle_id}", use_container_width=True):
+                    res = give_student_warning(db, toggle_id, notify_parent=notify_parent)
+                    if res["ok"]:
+                        invalidate_data_caches()
+                        note = f"Warning {res['warnings']} of {MAX_WARNINGS} given to {res['name']}."
+                        if res["message_queued"]:
+                            note += " The parent will be notified on WhatsApp."
+                        if res["suspended"]:
+                            note += f" The student reached {MAX_WARNINGS} warnings and is now suspended."
+                        st.session_state["flash"] = note
+                        st.rerun()
+                    else:
+                        st.error(f"No warning was given. {res['error']}")
+                if w_remove.button("➖ Remove One Warning", key=f"btn_remove_warn_{toggle_id}",
+                                   use_container_width=True, disabled=cur_warnings <= 0):
+                    try:
+                        run_write(db, [(
+                            "UPDATE students SET warnings = GREATEST(COALESCE(warnings, 0) - 1, 0) WHERE id = %s",
+                            (toggle_id,),
+                        )])
+                        st.session_state["flash"] = f"One warning removed from {labels[toggle_id]}."
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to remove the warning. Error: {e}")
+                if w_reset.button("↩️ Reset Warnings to 0", key=f"btn_reset_warn_{toggle_id}",
+                                  use_container_width=True, disabled=cur_warnings <= 0):
+                    try:
+                        run_write(db, [("UPDATE students SET warnings = 0 WHERE id = %s", (toggle_id,))])
+                        st.session_state["flash"] = f"Warnings reset for {labels[toggle_id]}."
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to reset warnings. Error: {e}")
             if st.button(
                 "▶️ Reactivate Student" if is_suspended else "⏸️ Suspend Student",
                 type="primary" if is_suspended else "secondary",
                 key=f"btn_toggle_suspend_{toggle_id}",
             ):
                 try:
-                    ops = [("UPDATE students SET suspended = %s WHERE id = %s", (not is_suspended, toggle_id))]
+                    if is_suspended:
+                        # Reactivating starts the student again with a clean record.
+                        ops = [("UPDATE students SET suspended = FALSE, warnings = 0 WHERE id = %s", (toggle_id,))]
+                    else:
+                        ops = [("UPDATE students SET suspended = TRUE WHERE id = %s", (toggle_id,))]
                     if not is_suspended:
                         # Drop messages for this student that are still waiting in the outbound queue.
                         ops.append(("DELETE FROM whatsapp_retry_queue WHERE student_id = %s", (toggle_id,)))

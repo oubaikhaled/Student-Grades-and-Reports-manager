@@ -15,6 +15,7 @@ import requests
 import streamlit as st
 
 from pdf_utils import PDFGenerator
+from portal.config import MAX_WARNINGS
 
 DEFAULT_GOWA_URL = "https://gowa-d0mc.onrender.com"
 CAIRO_TZ = ZoneInfo("Africa/Cairo")
@@ -1698,11 +1699,26 @@ def send_6hr_unsubmitted_reminders(
 # ---------------------------------------------------------------------------
 # Missing Homework / Quiz Notices to Parents (manual trigger)
 # ---------------------------------------------------------------------------
+def _warning_item_keys(student_id: str, missing_hw: bool, missing_qz: bool,
+                       hw_id: int | None, qz_id: int | None, prefix: str = "warn") -> list[str]:
+    """Dispatch-log keys, one per missing item. 'warn' = warning given, 'excuse' = excused."""
+    keys = []
+    if missing_hw and hw_id:
+        keys.append(f"{prefix}_hw{int(hw_id)}_stu{student_id}")
+    if missing_qz and qz_id:
+        keys.append(f"{prefix}_qz{int(qz_id)}_stu{student_id}")
+    return keys
+
+
 def get_missing_work_for_group(db, grp: str, hw_id: int | None, qz_id: int | None) -> list[dict]:
     """Active (not suspended) students in the group who have not submitted the homework
-    and/or have no score in the quiz. Pass None for hw_id / qz_id to leave that check out."""
+    and/or have no score in the quiz. Pass None for hw_id / qz_id to leave that check out.
+
+    Each entry has a "status": "warned" (already warned for all of these items), "excused"
+    (excused for the rest), or "" (not handled yet).
+    """
     students_df = db.fetch_dataframe(
-        "SELECT id, name, phone_parent FROM students "
+        "SELECT id, name, phone_parent, COALESCE(warnings, 0) AS warnings FROM students "
         "WHERE TRIM(group_number) = %s AND COALESCE(suspended, FALSE) = FALSE ORDER BY name ASC",
         (grp,),
     )
@@ -1734,50 +1750,161 @@ def get_missing_work_for_group(db, grp: str, hw_id: int | None, qz_id: int | Non
                 "id": sid,
                 "name": str(stu["name"]),
                 "parent_phone": clean_wa_phone(stu.get("phone_parent")),
+                "warnings": int(stu.get("warnings") or 0),
                 "missing_hw": missing_hw,
                 "missing_qz": missing_qz,
+                "status": "",
             })
+
+    # One query to find who was already warned or excused for these items.
+    if missing:
+        all_keys = []
+        for m in missing:
+            all_keys += _warning_item_keys(m["id"], m["missing_hw"], m["missing_qz"], hw_id, qz_id, "warn")
+            all_keys += _warning_item_keys(m["id"], m["missing_hw"], m["missing_qz"], hw_id, qz_id, "excuse")
+        try:
+            log_df = db.fetch_dataframe(
+                "SELECT dispatch_key FROM automated_dispatch_log WHERE dispatch_key = ANY(%s)",
+                (all_keys,),
+            )
+            logged = {str(k) for k in log_df["dispatch_key"]}
+        except Exception as e:
+            print(f"[Warnings] Could not read earlier warnings: {e}")
+            logged = set()
+        for m in missing:
+            warn_keys = _warning_item_keys(m["id"], m["missing_hw"], m["missing_qz"], hw_id, qz_id, "warn")
+            excuse_keys = _warning_item_keys(m["id"], m["missing_hw"], m["missing_qz"], hw_id, qz_id, "excuse")
+            if all(k in logged for k in warn_keys):
+                m["status"] = "warned"
+            elif all(w in logged or e in logged for w, e in zip(warn_keys, excuse_keys)):
+                m["status"] = "excused"
     return missing
 
 
-def queue_missing_work_parent_notices(
-    db, grp: str, hw_id: int | None, qz_id: int | None, hw_title: str | None, qz_title: str | None
-) -> tuple[int, int, int]:
-    """Queues one WhatsApp notice per parent whose child is missing the homework and/or quiz.
+def give_student_warning(db, student_id: str, notify_parent: bool = True) -> dict:
+    """Adds one warning to a student, suspends them on reaching MAX_WARNINGS, and (optionally)
+    queues the warning message to the parent.
 
-    Returns (queued, skipped_no_parent_phone, skipped_already_notified_today). A parent is
-    notified at most once per day for the same student and the same missing items.
+    Returns {"ok", "warnings", "suspended", "name", "message_queued", "error"}. With
+    notify_parent=True the warning is only kept if the message could be queued, so a parent is
+    never left unaware of a warning; with notify_parent=False it is recorded silently.
     """
-    from portal.messages import build_missing_work_parent_message
+    from portal.config import MAX_WARNINGS
+    from portal.messages import build_warning_parent_message
 
-    today = datetime.datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
-    queued = no_phone = already = 0
+    result = {"ok": False, "warnings": 0, "suspended": False, "name": "", "message_queued": False, "error": ""}
+    sid = str(student_id)
+    try:
+        stu_df = db.fetch_dataframe(
+            "SELECT name, phone_parent, COALESCE(suspended, FALSE) AS suspended FROM students WHERE id = %s",
+            (sid,),
+        )
+    except Exception as e:
+        result["error"] = f"Could not read the student: {e}"
+        return result
+    if stu_df.empty:
+        result["error"] = "Student not found."
+        return result
+    result["name"] = str(stu_df.iloc[0]["name"])
+    if bool(stu_df.iloc[0]["suspended"]):
+        result["error"] = "The student is already suspended."
+        return result
+    parent_phone = clean_wa_phone(stu_df.iloc[0].get("phone_parent"))
+    if notify_parent and not parent_phone:
+        result["error"] = "No valid parent phone on file, so the warning message cannot be sent."
+        return result
+
+    try:
+        # One statement: add the warning and suspend on reaching the limit.
+        row = db.execute_query(
+            "UPDATE students SET warnings = COALESCE(warnings, 0) + 1, "
+            "suspended = COALESCE(suspended, FALSE) OR (COALESCE(warnings, 0) + 1 >= %s) "
+            "WHERE id = %s RETURNING warnings, suspended",
+            (MAX_WARNINGS, sid),
+            fetch=True,
+        )
+        new_count, is_suspended = int(row[0][0]), bool(row[0][1])
+    except Exception as e:
+        result["error"] = f"Could not record the warning: {e}"
+        return result
+
+    if notify_parent:
+        msg = build_warning_parent_message(result["name"], new_count, MAX_WARNINGS, now_suspended=is_suspended)
+        if not enqueue_outbound(
+            db, parent_phone, "text", message_text=msg, student_id=sid, student_name=result["name"]
+        ):
+            # The message could not be queued: take the warning back so it can be retried.
+            try:
+                db.execute_query(
+                    "UPDATE students SET warnings = GREATEST(COALESCE(warnings, 0) - 1, 0), "
+                    "suspended = CASE WHEN %s THEN FALSE ELSE suspended END WHERE id = %s",
+                    (is_suspended, sid),
+                )
+            except Exception as e:
+                print(f"[Warnings] Could not undo warning for student {sid}: {e}")
+            result["error"] = "The warning message could not be queued, so no warning was given."
+            return result
+        result["message_queued"] = True
+        trigger_queue_drain_async(db)
+
+    result.update(ok=True, warnings=new_count, suspended=is_suspended)
+    return result
+
+
+def queue_missing_work_parent_notices(
+    db, grp: str, hw_id: int | None, qz_id: int | None, hw_title: str | None, qz_title: str | None,
+    include_ids: set[str] | None = None,
+) -> tuple[int, int, int, list[str]]:
+    """Gives a warning to students in the group who are missing the homework and/or quiz, and
+    queues the warning message to each parent. A student who reaches MAX_WARNINGS is suspended.
+
+    include_ids limits this to the chosen students (None = everyone missing work).
+    Returns (warned, skipped_no_parent_phone, skipped_already_warned, names_suspended_now).
+
+    Rules:
+    - One warning per run per student, even when both the homework and the quiz are missing.
+    - A student is warned only once for the same homework or quiz, however often this runs.
+    - No parent phone means no message can be sent, so no warning is given either.
+    """
+    warned = no_phone = already = 0
+    suspended_now: list[str] = []
     for m in get_missing_work_for_group(db, grp, hw_id, qz_id):
+        if include_ids is not None and m["id"] not in include_ids:
+            continue
         if not m["parent_phone"]:
             no_phone += 1
             continue
-        key = (
-            f"missing_{today}_hw{int(hw_id) if m['missing_hw'] else 0}"
-            f"_qz{int(qz_id) if m['missing_qz'] else 0}_stu{m['id']}"
-        )
-        if not claim_dispatch(db, key):
+
+        # Claim each missing item; only items never warned about before count.
+        item_keys = _warning_item_keys(m["id"], m["missing_hw"], m["missing_qz"], hw_id, qz_id, "warn")
+        claimed = [k for k in item_keys if claim_dispatch(db, k)]
+        if not claimed:
             already += 1
             continue
-        msg = build_missing_work_parent_message(
-            m["name"],
-            hw_title if m["missing_hw"] else None,
-            qz_title if m["missing_qz"] else None,
-        )
-        if enqueue_outbound(
-            db, m["parent_phone"], "text", message_text=msg, student_id=m["id"], student_name=m["name"]
-        ):
-            queued += 1
-        else:
-            release_dispatch(db, key)
 
-    if queued > 0:
-        trigger_queue_drain_async(db)
-    return queued, no_phone, already
+        res = give_student_warning(db, m["id"], notify_parent=True)
+        if res["ok"]:
+            warned += 1
+            if res["suspended"]:
+                suspended_now.append(m["name"])
+        else:
+            print(f"[Warnings] Student {m['id']}: {res['error']}")
+            for k in claimed:
+                release_dispatch(db, k)
+
+    return warned, no_phone, already, suspended_now
+
+
+def excuse_students_from_warning(db, students: list[dict], hw_id: int | None, qz_id: int | None) -> int:
+    """Remembers that these students are excused for this homework / quiz, so they are not
+    ticked for a warning the next time the list is opened. Returns how many were recorded."""
+    count = 0
+    for m in students:
+        keys = _warning_item_keys(m["id"], m["missing_hw"], m["missing_qz"], hw_id, qz_id, "excuse")
+        for k in keys:
+            mark_dispatched(db, k)
+        count += 1 if keys else 0
+    return count
 
 
 def start_background_automation_daemon(db):
@@ -2184,83 +2311,138 @@ class AutomatedMessagesView:
                     st.caption("Students already reminded today are skipped.")
 
                 st.divider()
-                st.markdown("#### 📣 Notify Parents of Missing Homework / Quiz")
+                st.markdown("#### 📣 Warn Parents of Missing Homework / Quiz")
                 st.caption(
-                    "Use this after the group's lecture has started. One click queues a WhatsApp notice to "
-                    "the parent of every student in the group who has not submitted the group's active "
-                    "homework and/or has no score in its active quiz. Messages go out one per minute, a "
-                    "parent is notified at most once per day for the same items, and suspended students "
-                    "are skipped."
+                    "Use this after the group's lecture has started. Choose the group, the homework and the "
+                    "quiz, then untick anyone who is excused. One click gives a **warning** to every ticked "
+                    "student and queues the warning message to the parent (one per minute). "
+                    f"A student who reaches **{MAX_WARNINGS} warnings is suspended automatically**. A student "
+                    "is warned only once for the same homework or quiz, and gets one warning per click even "
+                    "when both are missing. Suspended students are not listed."
                 )
-                mw_c1, mw_c2, mw_c3 = st.columns([1.4, 1, 1])
-                mw_grp = str(mw_c1.selectbox("Group", groups, key="mw_grp_sel")).strip()
-                mw_hw_on = mw_c2.checkbox("Include homework", value=True, key="mw_hw_on")
-                mw_qz_on = mw_c3.checkbox("Include quiz", value=True, key="mw_qz_on")
+                mw_grp = str(st.selectbox("Group", groups, key="mw_grp_sel")).strip()
 
-                mw_hid, mw_qid, _, _ = get_effective_group_pace(
+                mw_def_hid, mw_def_qid, _, _ = get_effective_group_pace(
                     configs_map.get(mw_grp, {}), default_latest_hw_id, default_latest_qz_id
                 )
-                mw_hid = mw_hid if (mw_hw_on and mw_hid in hw_options) else None
-                mw_qid = mw_qid if (mw_qz_on and mw_qid in qz_options) else None
+                # 0 = leave that check out. The default is the group's active homework / quiz.
+                mw_hw_choices = [0] + [int(i) for i in hw_df["homework_id"]]
+                mw_qz_choices = [0] + [int(i) for i in qz_df["quiz_id"]]
+                mw_c1, mw_c2 = st.columns(2)
+                mw_hid = mw_c1.selectbox(
+                    "Homework to check",
+                    mw_hw_choices,
+                    index=mw_hw_choices.index(mw_def_hid) if mw_def_hid in mw_hw_choices else 0,
+                    format_func=lambda k: "— Don't check a homework —" if k == 0 else hw_options[k],
+                    key=f"mw_hw_sel_{mw_grp}",
+                )
+                mw_qid = mw_c2.selectbox(
+                    "Quiz to check",
+                    mw_qz_choices,
+                    index=mw_qz_choices.index(mw_def_qid) if mw_def_qid in mw_qz_choices else 0,
+                    format_func=lambda k: "— Don't check a quiz —" if k == 0 else qz_options[k],
+                    key=f"mw_qz_sel_{mw_grp}",
+                )
+                mw_hid = int(mw_hid) or None
+                mw_qid = int(mw_qid) or None
                 mw_hw_title = hw_options[mw_hid] if mw_hid else None
                 mw_qz_title = qz_options[mw_qid] if mw_qid else None
 
                 if not mw_hid and not mw_qid:
-                    st.info("Nothing to check: tick homework and/or quiz, and make sure one exists for this group.")
+                    st.info("Choose a homework and/or a quiz to check.")
                 else:
                     mw_missing = get_missing_work_for_group(self.db, mw_grp, mw_hid, mw_qid)
-                    mw_with_phone = [m for m in mw_missing if m["parent_phone"]]
-                    mw_no_phone = len(mw_missing) - len(mw_with_phone)
-
-                    mw_lines = []
-                    if mw_hid:
-                        mw_lines.append(
-                            f"📘 Homework **{mw_hw_title}**: {sum(m['missing_hw'] for m in mw_missing)} not submitted"
+                    if not mw_missing:
+                        st.success("Nobody in this group is missing the selected homework / quiz.")
+                    else:
+                        mw_status_label = {"warned": "Already warned", "excused": "Excused", "": ""}
+                        mw_table = pd.DataFrame([
+                            {
+                                # Ticked by default unless already handled or unreachable.
+                                "Warn": bool(m["parent_phone"]) and m["status"] == "",
+                                "ID": m["id"],
+                                "Name": m["name"],
+                                "Missing Homework": m["missing_hw"],
+                                "Missing Quiz": m["missing_qz"],
+                                "Warnings So Far": f"{m['warnings']} / {MAX_WARNINGS}",
+                                "Parent Phone": m["parent_phone"] or "— none —",
+                                "Status": mw_status_label.get(m["status"], ""),
+                            }
+                            for m in mw_missing
+                        ])
+                        st.markdown(
+                            f"**{len(mw_table)} student(s) missing work.** Untick **Warn** for anyone who is excused."
                         )
-                    if mw_qid:
-                        mw_lines.append(
-                            f"📝 Quiz **{mw_qz_title}**: {sum(m['missing_qz'] for m in mw_missing)} without a score"
+                        mw_edited = st.data_editor(
+                            mw_table,
+                            hide_index=True,
+                            use_container_width=True,
+                            disabled=[c for c in mw_table.columns if c != "Warn"],
+                            column_config={
+                                "Warn": st.column_config.CheckboxColumn(
+                                    "Warn", help="Ticked students get a warning and their parent gets the message."
+                                )
+                            },
+                            key=f"mw_editor_{mw_grp}_{mw_hid or 0}_{mw_qid or 0}",
                         )
-                    st.markdown("  \n".join(mw_lines))
-                    if mw_no_phone:
-                        st.warning(f"{mw_no_phone} of these student(s) have no valid parent phone and will be skipped.")
-
-                    if mw_missing:
-                        with st.expander(f"👀 Preview the {len(mw_missing)} student(s)", expanded=False):
-                            st.dataframe(
-                                pd.DataFrame([
-                                    {
-                                        "ID": m["id"],
-                                        "Name": m["name"],
-                                        "Missing Homework": m["missing_hw"],
-                                        "Missing Quiz": m["missing_qz"],
-                                        "Parent Phone": m["parent_phone"] or "— none —",
-                                    }
-                                    for m in mw_missing
-                                ]),
-                                hide_index=True,
-                                use_container_width=True,
+                        mw_ticked = {str(i) for i in mw_edited.loc[mw_edited["Warn"].astype(bool), "ID"]}
+                        mw_by_id = {m["id"]: m for m in mw_missing}
+                        mw_selected = {i for i in mw_ticked if mw_by_id[i]["parent_phone"]}
+                        mw_ticked_no_phone = len(mw_ticked) - len(mw_selected)
+                        # Unticked and not handled before = excused now.
+                        mw_newly_excused = [
+                            m for m in mw_missing
+                            if m["id"] not in mw_ticked and m["status"] == "" and m["parent_phone"]
+                        ]
+                        if mw_ticked_no_phone:
+                            st.warning(
+                                f"{mw_ticked_no_phone} ticked student(s) have no valid parent phone and will be skipped."
                             )
-
-                    if st.button(
-                        f"📣 Send Missing-Work Notices to {len(mw_with_phone)} Parent(s) of Group {mw_grp}",
-                        type="primary",
-                        use_container_width=True,
-                        disabled=not mw_with_phone,
-                        key=f"btn_missing_work_{mw_grp}",
-                    ):
-                        mw_queued, mw_skipped_phone, mw_already = queue_missing_work_parent_notices(
-                            self.db, mw_grp, mw_hid, mw_qid, mw_hw_title, mw_qz_title
+                        mw_remember = st.checkbox(
+                            "Remember unticked students as excused for this homework / quiz",
+                            value=True,
+                            key=f"mw_remember_{mw_grp}",
+                            help="They stay unticked the next time this list is opened. You can still tick them by hand.",
                         )
-                        if mw_queued:
-                            st.success(
-                                f"Queued {mw_queued} notice(s). The bot sends them one per minute, so the last "
-                                f"one goes out in about {mw_queued} minute(s). You can close this page."
-                            )
-                        else:
-                            st.info("No new notices were queued.")
-                        if mw_already:
-                            st.caption(f"{mw_already} parent(s) were already notified today for the same items and were skipped.")
+
+                        if st.button(
+                            f"📣 Give Warning & Notify {len(mw_selected)} Parent(s) of Group {mw_grp}",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not mw_selected and not (mw_remember and mw_newly_excused),
+                            key=f"btn_missing_work_{mw_grp}",
+                        ):
+                            mw_queued, mw_skipped_phone, mw_already, mw_suspended = (0, 0, 0, [])
+                            if mw_selected:
+                                mw_queued, mw_skipped_phone, mw_already, mw_suspended = queue_missing_work_parent_notices(
+                                    self.db, mw_grp, mw_hid, mw_qid, mw_hw_title, mw_qz_title,
+                                    include_ids=mw_selected,
+                                )
+                            mw_excused_cnt = 0
+                            if mw_remember and mw_newly_excused:
+                                mw_excused_cnt = excuse_students_from_warning(
+                                    self.db, mw_newly_excused, mw_hid, mw_qid
+                                )
+                            # Warning counts and suspensions changed: refresh the cached student lists.
+                            from portal.data import invalidate_data_caches
+                            invalidate_data_caches()
+
+                            mw_parts = []
+                            if mw_queued:
+                                mw_parts.append(
+                                    f"Gave {mw_queued} warning(s); the messages go out one per minute "
+                                    f"(about {mw_queued} minute(s) in total)."
+                                )
+                            if mw_excused_cnt:
+                                mw_parts.append(f"{mw_excused_cnt} student(s) recorded as excused.")
+                            if mw_already:
+                                mw_parts.append(f"{mw_already} already warned for the same homework/quiz and skipped.")
+                            if mw_suspended:
+                                mw_parts.append(
+                                    f"⏸️ Reached {MAX_WARNINGS} warnings and now suspended: {', '.join(mw_suspended)}."
+                                )
+                            st.session_state["flash"] = " ".join(mw_parts) or "No new warnings were given."
+                            st.rerun()
 
         # ===================================================================
         # TAB 2: MANUAL BROADCAST TAB

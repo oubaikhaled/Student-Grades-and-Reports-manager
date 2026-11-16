@@ -3,22 +3,19 @@ import emoji
 from portal.utils import fmt
 
 
-def build_missing_work_parent_message(name, hw_title=None, qz_title=None):
-    """One notice to the parent listing the homework and/or quiz the student has not done."""
-    lines = []
-    if hw_title:
-        lines.append(f"لم يقم بأداء واجب : {hw_title}")
-    if qz_title:
-        lines.append(f"لم يقم بأداء امتحان : {qz_title}")
-    return emoji.emojize(
-        ":bar_chart: متابعة الواجبات والاختبارات\n\n"
-        "نحيط حضرتكم علمًا بأن\n"
-        f"الطالب: {name}\n"
-        + "\n".join(lines)
-        + "\n\n"
-        "برجاء الالتزام بحضور وأداء الواجبات والاختبارات في المواعيد المحددة، ومتابعة جميع التقييمات أولًا بأول.\n\n"
-        "Mathematics Team – Mahmoud Adel"
+def build_warning_parent_message(name, warning_number, max_warnings, now_suspended=False):
+    """Warning sent to the parent when the student has not submitted a homework or quiz on time."""
+    msg = (
+        f"اهلا بك يا ولي الامر الكريم لقد حصل ابنك الطالب {name} على انذار {warning_number} من اصل {max_warnings} "
+        "لعدم تسليمة الواجب او الامتحان في المعاد المناسب بدون عذر يرجى متابعة الطالب حتى لا يتم ايقاف حسابة "
+        "بالكامل ونشكركم شكرا جزيلا على تعاونكم "
     )
+    lines = [msg]
+    if now_suspended:
+        lines.append("تم ايقاف حساب الطالب، يرجى التواصل مع المدرس او المساعدين لحل المشكلة")
+    lines.append("(ملحوظة:هذه الرسالة تلقائية والاخطاء قد تحدث)")
+    lines.append("team Mr. Mahmoud Adel")
+    return chr(10).join(lines)
 
 
 def build_wa_messages(kind, name, title, score, total):

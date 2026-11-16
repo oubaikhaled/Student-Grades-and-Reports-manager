@@ -1,7 +1,7 @@
 import streamlit as st
 
 from auth import AuthManager
-from portal.data import get_db
+from portal.data import ensure_schema, get_db
 from portal.views.admin import render_admin_portal
 from portal.views.parent import render_parent_portal
 from portal.views.public import render_admin_login, render_public_login
@@ -21,6 +21,7 @@ st.set_page_config(
 class GradePortalApp:
     def __init__(self):
         self.db = get_db()
+        ensure_schema(self.db)
         self.auth = AuthManager()
         start_background_automation_daemon(self.db)
 

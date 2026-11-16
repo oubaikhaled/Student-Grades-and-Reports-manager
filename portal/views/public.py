@@ -5,7 +5,12 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from portal.config import MAX_PHOTO_MB, MAX_TOTAL_UPLOAD_MB, get_drive_script_url
+from portal.config import (
+    MAX_PHOTO_MB,
+    MAX_TOTAL_UPLOAD_MB,
+    SUSPENDED_ACCOUNT_MESSAGE,
+    get_drive_script_url,
+)
 from portal.data import load_homeworks, load_students, run_write
 from portal.grades import mark_homework_submitted
 from portal.images import convert_uploads_to_pdf_bytes, upload_preview
@@ -70,6 +75,7 @@ def render_public_login(db, auth):
             student_name = ""
             profile_complete = False
             is_verified = False
+            account_suspended = False
 
             def _is_missing(val):
                 if val is None or pd.isna(val):
@@ -114,6 +120,13 @@ def render_public_login(db, auth):
                             st.error(
                                 "❌ Verification failed: The phone number entered does not match the Parent Phone Number on file for this ID."
                             )
+
+                        # Only after the phone check passes, so a stranger typing an ID
+                        # cannot learn that the account is suspended.
+                        if is_verified and bool(stu_row.get("suspended", False)):
+                            is_verified = False
+                            account_suspended = True
+                            st.error(f"⛔ {SUSPENDED_ACCOUNT_MESSAGE}")
 
                         if is_verified:
                             missing_fields = []
@@ -260,6 +273,8 @@ def render_public_login(db, auth):
                     st.error("⚠️ Please select the **Homework** from dropdown 1️⃣ at the top first.")
                 elif not student_id or not verify_phone:
                     st.error("⚠️ Please enter both your **Student ID** and **Parent Phone Number** above.")
+                elif account_suspended:
+                    st.error(f"⛔ {SUSPENDED_ACCOUNT_MESSAGE}")
                 elif not is_verified:
                     st.error("⚠️ Your Student ID and Parent Phone Number could not be verified.")
                 elif not profile_complete:
