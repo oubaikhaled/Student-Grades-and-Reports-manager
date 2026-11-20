@@ -1117,7 +1117,7 @@ def send_morning_schedule_to_teacher(
     meetings_df = db.fetch_dataframe(
         """
         SELECT m.meeting_id, TRIM(m.group_number) AS group_number, m.day_of_week, m.meeting_time,
-               COALESCE(c.latest_hw_id, (SELECT MAX(homework_id) FROM homeworks)) AS latest_hw_id,
+               COALESCE(c.latest_hw_id, (SELECT MAX(homework_id) FROM homeworks WHERE COALESCE(is_special, FALSE) = FALSE)) AS latest_hw_id,
                COALESCE(c.latest_quiz_id, (SELECT MAX(quiz_id) FROM quizzes)) AS latest_quiz_id
         FROM group_meeting_times m
         LEFT JOIN group_automation_config c ON TRIM(m.group_number) = TRIM(c.group_number)
@@ -1417,7 +1417,7 @@ def run_scheduled_checks_once(db):
                         
                         # Find next sequential Homework ID
                         if pd.notna(cur_hw):
-                            next_hw = db.execute_scalar("SELECT MIN(homework_id) FROM homeworks WHERE homework_id > %s", (int(cur_hw),))
+                            next_hw = db.execute_scalar("SELECT MIN(homework_id) FROM homeworks WHERE homework_id > %s AND COALESCE(is_special, FALSE) = FALSE", (int(cur_hw),))
                             if next_hw:
                                 new_hw = int(next_hw)
                                 updated = True
@@ -1443,7 +1443,7 @@ def run_scheduled_checks_once(db):
     meetings_df = db.fetch_dataframe(
         """
         SELECT m.meeting_id, TRIM(m.group_number) AS group_number, m.day_of_week, m.meeting_time,
-               COALESCE(c.latest_hw_id, (SELECT MAX(homework_id) FROM homeworks)) AS latest_hw_id,
+               COALESCE(c.latest_hw_id, (SELECT MAX(homework_id) FROM homeworks WHERE COALESCE(is_special, FALSE) = FALSE)) AS latest_hw_id,
                COALESCE(c.latest_quiz_id, (SELECT MAX(quiz_id) FROM quizzes)) AS latest_quiz_id,
                c.wa_group_jid
         FROM group_meeting_times m
@@ -2044,7 +2044,8 @@ class AutomatedMessagesView:
             if str(g).strip()
         }) if not students_df.empty else []
 
-        hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions FROM homeworks ORDER BY homework_id DESC")
+        hw_df = self.db.fetch_dataframe("SELECT homework_id, title, total_questions FROM homeworks "
+            "WHERE COALESCE(is_special, FALSE) = FALSE ORDER BY homework_id DESC")
         qz_df = self.db.fetch_dataframe("SELECT quiz_id, title, max_score FROM quizzes ORDER BY quiz_id DESC")
 
         # Determine the global latest Homework and Quiz IDs (for automatic fallback)

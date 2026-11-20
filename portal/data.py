@@ -13,10 +13,11 @@ def get_db():
 
 
 # Bump this whenever a statement is added to SCHEMA_MIGRATIONS.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA_MIGRATIONS = (
     "ALTER TABLE students ADD COLUMN IF NOT EXISTS suspended BOOLEAN DEFAULT FALSE",
     "ALTER TABLE students ADD COLUMN IF NOT EXISTS warnings INTEGER DEFAULT 0",
+    "ALTER TABLE homeworks ADD COLUMN IF NOT EXISTS is_special BOOLEAN DEFAULT FALSE",
 )
 
 
@@ -45,7 +46,8 @@ def load_chapters(_db):
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_homeworks(_db):
     return _db.fetch_dataframe(
-        "SELECT homework_id, title, total_questions, video_link, chapter_id, rubric FROM homeworks ORDER BY homework_id DESC"
+        "SELECT homework_id, title, total_questions, video_link, chapter_id, rubric, "
+        "COALESCE(is_special, FALSE) AS is_special FROM homeworks ORDER BY homework_id DESC"
     )
 
 
@@ -106,6 +108,7 @@ def load_parent_grades(_db, kind, student_ids):
                    g.percentage AS "Percentage", g.report AS "Report"
             FROM homework_grades g JOIN homeworks h ON g.homework_id = h.homework_id
             WHERE g.student_id IN %s AND g.correct_answers IS NOT NULL
+              AND COALESCE(h.is_special, FALSE) = FALSE
             ORDER BY h.homework_id DESC
         """
     else:

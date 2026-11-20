@@ -49,13 +49,18 @@ def render_public_login(db, auth):
         if hw_df.empty:
             st.info("No active homeworks available for submission.")
         else:
+            # Raw titles: they name the Drive file and folder, so the label stays out of them.
             hw_options = {row["homework_id"]: f"{row['title']}" for _, row in hw_df.iterrows()}
+            hw_labels = {
+                row["homework_id"]: (f"⭐ Special — {row['title']}" if bool(row.get("is_special")) else f"{row['title']}")
+                for _, row in hw_df.iterrows()
+            }
             selected_hw_id = st.selectbox(
                 "1️⃣ Select Homework *",
                 options=list(hw_options.keys()),
                 index=None,
                 placeholder="Choose the homework you want to submit...",
-                format_func=lambda x: hw_options[x],
+                format_func=lambda x: hw_labels[x],
                 key="student_hw_sel",
             )
             selected_hw_title = hw_options[selected_hw_id] if selected_hw_id is not None else ""
