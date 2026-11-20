@@ -21,6 +21,7 @@ def load_student_profile_grades(_db, stu_id: str):
         FROM homework_grades hg
         JOIN homeworks h ON hg.homework_id = h.homework_id
         WHERE hg.student_id = %s AND hg.correct_answers IS NOT NULL
+          AND COALESCE(h.is_special, FALSE) = FALSE
         ORDER BY h.homework_id ASC
         """,
         (stu_id,),

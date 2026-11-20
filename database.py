@@ -206,6 +206,7 @@ class DatabaseManager:
                     c.execute("ALTER TABLE homeworks ADD COLUMN IF NOT EXISTS chapter_id INTEGER;")
                     c.execute("ALTER TABLE homeworks ADD COLUMN IF NOT EXISTS video_link TEXT;")
                     c.execute("ALTER TABLE homeworks ADD COLUMN IF NOT EXISTS rubric TEXT;")
+                    c.execute("ALTER TABLE homeworks ADD COLUMN IF NOT EXISTS is_special BOOLEAN DEFAULT FALSE;")
                     c.execute("ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS lesson_id INTEGER;")
                     c.execute("ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS chapter_id INTEGER;")
                 except Exception:

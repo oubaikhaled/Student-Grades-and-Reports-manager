@@ -39,6 +39,12 @@ def render_manage_homeworks(db):
 
         hw_df = load_homeworks(db)
         ch_titles = dict(zip(ch_df["chapter_id"], ch_df["title"]))
+        special_ids = (
+            {int(i) for i in hw_df.loc[hw_df["is_special"].astype(bool), "homework_id"]} if not hw_df.empty else set()
+        )
+
+        def hw_label(i):
+            return f"⭐ Special — {hw_titles[i]}" if int(i) in special_ids else hw_titles[i]
 
         with st.expander("🛠️ Add or Delete Homework Assignments", expanded=False):
             with st.form("add_homework_form"):
@@ -47,6 +53,16 @@ def render_manage_homeworks(db):
                 title = st.text_input("Homework Title")
                 total_q = st.number_input("Total Questions (Max Score)", min_value=1, step=1)
                 video_link = st.text_input("Homework Video Link (Optional)", placeholder="https://youtube.com/...")
+                is_special = st.checkbox(
+                    "⭐ Special submission (outside the homework sequence)",
+                    value=False,
+                    help=(
+                        "Students submit and you grade it like any homework, and the parent still gets the "
+                        "grade + PDF on WhatsApp. It never becomes a group's current homework, never triggers "
+                        "reminders or warnings, and is left out of averages, charts, the student profile and "
+                        "the parent portal."
+                    ),
+                )
                 rubric = st.text_area(
                     "AI Grading Answer Key / Rubric (Optional)",
                     placeholder="Paste the model answers here so AI can auto-grade with one click (e.g., Q1: B (-1), Q2: C (4), Q3: dy/dx = 2x + 1)...",
@@ -58,8 +74,9 @@ def render_manage_homeworks(db):
                         clean_link = video_link.strip() or None
                         clean_rubric = rubric.strip() or None
                         run_write(db, [(
-                            "INSERT INTO homeworks (title, total_questions, video_link, chapter_id, rubric) VALUES (%s, %s, %s, %s, %s)",
-                            (title.strip(), int(total_q), clean_link, int(ch_id), clean_rubric),
+                            "INSERT INTO homeworks (title, total_questions, video_link, chapter_id, rubric, is_special) "
+                            "VALUES (%s, %s, %s, %s, %s, %s)",
+                            (title.strip(), int(total_q), clean_link, int(ch_id), clean_rubric, bool(is_special)),
                         )])
                         st.session_state["flash"] = f"Homework '{title.strip()}' created!"
                         st.rerun()
@@ -70,7 +87,7 @@ def render_manage_homeworks(db):
                 st.divider()
                 hw_titles = dict(zip(hw_df["homework_id"], hw_df["title"]))
                 del_id = st.selectbox("Select Homework to Delete", list(hw_titles.keys()),
-                                      format_func=lambda i: hw_titles[i], key="del_hw_sel")
+                                      format_func=hw_label, key="del_hw_sel")
                 if st.button("🚨 Delete Selected Homework", key="btn_del_hw"):
                     run_write(db, [
                         ("DELETE FROM homework_grades WHERE homework_id = %s", (int(del_id),)),
@@ -86,7 +103,7 @@ def render_manage_homeworks(db):
         st.subheader("📊 Select Assignment to Grade")
         hw_titles = dict(zip(hw_df["homework_id"], hw_df["title"]))
         hw_id = int(st.selectbox("Current Homework", list(hw_titles.keys()),
-                                 format_func=lambda i: hw_titles[i], key="sel_hw_grade"))
+                                 format_func=hw_label, key="sel_hw_grade"))
         hw_row = hw_df[hw_df["homework_id"] == hw_id].iloc[0]
         saved_rubric = str(hw_row["rubric"]).strip() if "rubric" in hw_row and pd.notna(hw_row["rubric"]) else ""
 
@@ -104,6 +121,29 @@ def render_manage_homeworks(db):
                     ])
                     st.session_state["flash"] = "Answer Key updated!"
                     st.rerun()
+
+        with st.expander("⭐ Special Submission Setting", expanded=False):
+            hw_is_special = hw_id in special_ids
+            st.caption(
+                "A special submission is graded like any homework and the parent still gets the grade + PDF, "
+                "but it stays outside the homework sequence: it is never a group's current homework, never "
+                "triggers reminders or warnings, and is left out of averages, charts, the student profile and "
+                "the parent portal. Switching it changes only where it counts; grades are kept."
+            )
+            st.markdown(f"**This homework is currently:** {'⭐ Special' if hw_is_special else 'Regular'}")
+            if st.button(
+                "Make it a Regular Homework" if hw_is_special else "⭐ Make it a Special Submission",
+                key=f"btn_toggle_special_{hw_id}",
+            ):
+                run_write(db, [(
+                    "UPDATE homeworks SET is_special = %s WHERE homework_id = %s", (not hw_is_special, hw_id)
+                )])
+                st.session_state["flash"] = (
+                    f"'{hw_row['title']}' is now a regular homework."
+                    if hw_is_special
+                    else f"'{hw_row['title']}' is now a special submission."
+                )
+                st.rerun()
 
         grading_section(db, 
             "homework",
